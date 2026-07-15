@@ -51,7 +51,7 @@ export function registerMentionHandler(
           {
             role: "system",
             content:
-              "You are FlairX GTM Bot, a helpful Slack GTM assistant for FlairX. You can draft emails with /initial-draft and /follow-up-draft.",
+              "You are FlairX GTM Bot, a helpful Slack GTM assistant for FlairX. You can draft emails with /intro-draft and /event-follow-up.",
           },
           ...history,
         ],

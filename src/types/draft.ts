@@ -1,4 +1,4 @@
-export type DraftType = "initial" | "follow-up";
+export type DraftType = "intro" | "event-follow-up";
 
 export type PendingDraft = {
   id: string;

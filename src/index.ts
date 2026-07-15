@@ -41,7 +41,7 @@ registerEmailActions(app);
   await app.start();
   console.log(
     echoMode
-      ? "FlairX GTM Bot running (DEV_ECHO_MODE). Email drafts: /initial-draft, /follow-up-draft"
-      : "FlairX GTM Bot running. Email drafts: /initial-draft, /follow-up-draft",
+      ? "FlairX GTM Bot running (DEV_ECHO_MODE). Email drafts: /intro-draft, /event-follow-up"
+      : "FlairX GTM Bot running. Email drafts: /intro-draft, /event-follow-up",
   );
 })();
