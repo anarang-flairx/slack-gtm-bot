@@ -10,8 +10,8 @@ import { saveDraft } from "../lib/draftStore.js";
 import type { DraftType } from "../types/draft.js";
 
 const TEMPLATE_FILES: Record<DraftType, string> = {
-  initial: "initial-draft.md",
-  "follow-up": "follow-up-draft.md",
+  intro: "intro-draft.md",
+  "event-follow-up": "event-follow-up.md",
 };
 
 function truncate(text: string, max = 2800): string {
@@ -30,7 +30,7 @@ function buildPreviewBlocks(
   draftId: string,
 ): KnownBlock[] {
   const commandLabel =
-    draftType === "initial" ? "/initial-draft" : "/follow-up-draft";
+    draftType === "intro" ? "/intro-draft" : "/event-follow-up";
 
   return [
     {
@@ -91,7 +91,7 @@ async function handleDraftCommand(
     await client.chat.postEphemeral({
       channel: channelId,
       user: userId,
-      text: "Please provide a contact name. Example: `/initial-draft Jane Doe`",
+      text: "Please provide a contact name. Example: `/intro-draft Jane Doe`",
     });
     return;
   }
@@ -146,12 +146,12 @@ async function handleDraftCommand(
 }
 
 export function registerDraftCommands(app: App): void {
-  app.command("/initial-draft", async ({ command, ack, client }) => {
+  app.command("/intro-draft", async ({ command, ack, client }) => {
     await ack();
 
     try {
       await handleDraftCommand(
-        "initial",
+        "intro",
         command.text.trim(),
         command.user_id,
         command.channel_id,
@@ -169,12 +169,12 @@ export function registerDraftCommands(app: App): void {
     }
   });
 
-  app.command("/follow-up-draft", async ({ command, ack, client }) => {
+  app.command("/event-follow-up", async ({ command, ack, client }) => {
     await ack();
 
     try {
       await handleDraftCommand(
-        "follow-up",
+        "event-follow-up",
         command.text.trim(),
         command.user_id,
         command.channel_id,
