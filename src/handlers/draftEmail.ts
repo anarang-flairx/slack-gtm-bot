@@ -2,17 +2,14 @@ import type { KnownBlock } from "@slack/types";
 import type { App } from "@slack/bolt";
 import {
   findContactContext,
-  toTemplateContext,
   type HubSpotContactContext,
 } from "../integrations/hubspot.js";
+import { createDraftByContactId, TEMPLATE_FILES } from "../lib/createDraft.js";
 import { fillTemplate, loadTemplate } from "../lib/templateEngine.js";
+import { getResourceUrlContext } from "../lib/resourceUrls.js";
 import { saveDraft } from "../lib/draftStore.js";
+import { toTemplateContext } from "../integrations/hubspot.js";
 import type { DraftType } from "../types/draft.js";
-
-const TEMPLATE_FILES: Record<DraftType, string> = {
-  intro: "intro-draft.md",
-  "event-follow-up": "event-follow-up.md",
-};
 
 function truncate(text: string, max = 2800): string {
   if (text.length <= max) {
@@ -114,8 +111,10 @@ async function handleDraftCommand(
     return;
   }
 
-  const template = loadTemplate(TEMPLATE_FILES[draftType]);
-  const filled = fillTemplate(template, toTemplateContext(result));
+  const filled = fillTemplate(loadTemplate(TEMPLATE_FILES[draftType]), {
+    ...toTemplateContext(result),
+    ...getResourceUrlContext(),
+  });
 
   const draft = saveDraft({
     type: draftType,
@@ -210,3 +209,5 @@ export function registerDraftCommands(app: App): void {
   app.command("/event-follow-up", eventFollowUpHandler);
   app.command("/event-follow-up-draft", eventFollowUpHandler);
 }
+
+export { createDraftByContactId };

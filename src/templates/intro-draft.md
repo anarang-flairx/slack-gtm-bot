@@ -28,9 +28,9 @@ FlairX Interview Orchestrator automatically collects candidate availability, syn
 
 **Helpful Resources**
 
-- Sample AI Interview Feedback Report: [AI Interview Report](PLACEHOLDER-URL)
-- Sample Expert Human Interview Feedback Report: [Expert Human Interview Report](PLACEHOLDER-URL)
-- Candidate Comparison Report: A detailed comparison for reference - [Gen AI Candidate Comparison Report](PLACEHOLDER-URL)
+- Sample AI Interview Feedback Report: [AI Interview Report]({ai_interview_report_url})
+- Sample Expert Human Interview Feedback Report: [Expert Human Interview Report]({expert_interview_report_url})
+- Candidate Comparison Report: A detailed comparison for reference - [Gen AI Candidate Comparison Report]({candidate_comparison_report_url})
 
 Looking forward to hearing from you.
 

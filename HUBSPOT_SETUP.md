@@ -11,10 +11,20 @@ Flare requires this setup to exist in HubSpot before launch (PRD sections 7.1 an
    - `crm.objects.companies.read` / `crm.objects.companies.write`
    - `crm.objects.deals.read` / `crm.objects.deals.write`
    - `crm.schemas.deals.read` (pipelines)
-   - `crm.objects.owners.read`
+   - `crm.objects.owners.read` (optional — may not appear on Service Keys)
+   - `crm.objects.tasks.read` (for `/digest` overdue tasks)
 4. Copy the service key into `HUBSPOT_ACCESS_TOKEN` in `.env`.
 
 `HUBSPOT_ACCESS_TOKEN` holds the service key — use it as a Bearer token in API requests, same as a legacy private-app token.
+
+For digest HubSpot record links, also set in `.env`:
+
+```bash
+HUBSPOT_PORTAL_ID=your-portal-id
+HUBSPOT_APP_HOST=app-na2.hubspot.com
+```
+
+Find the portal ID in any HubSpot URL (`/contacts/{portalId}/...`).
 
 ## 2. Configure the 8-stage sales pipeline
 

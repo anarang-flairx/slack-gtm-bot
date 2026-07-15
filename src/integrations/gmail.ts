@@ -20,20 +20,38 @@ function getOAuthClient() {
   return oauth2Client;
 }
 
+import { markdownToHtml, markdownToPlainText } from "../lib/markdownToHtml.js";
+
 function buildMimeMessage(to: string, subject: string, body: string): string {
   const from = process.env.GMAIL_SENDER_EMAIL;
   if (!from) {
     throw new Error("Missing GMAIL_SENDER_EMAIL in .env");
   }
 
+  const boundary = "flare_gtm_boundary";
+  const plainBody = markdownToPlainText(body);
+  const htmlBody = markdownToHtml(body);
+
   const message = [
     `From: ${from}`,
     `To: ${to}`,
     `Subject: ${subject}`,
     "MIME-Version: 1.0",
-    "Content-Type: text/plain; charset=utf-8",
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
     "",
-    body,
+    `--${boundary}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "Content-Transfer-Encoding: 7bit",
+    "",
+    plainBody,
+    "",
+    `--${boundary}`,
+    "Content-Type: text/html; charset=utf-8",
+    "Content-Transfer-Encoding: 7bit",
+    "",
+    htmlBody,
+    "",
+    `--${boundary}--`,
   ].join("\r\n");
 
   return Buffer.from(message)
