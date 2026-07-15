@@ -145,6 +145,19 @@ async function handleDraftCommand(
   });
 }
 
+async function runEventFollowUpCommand(
+  command: { text: string; user_id: string; channel_id: string },
+  client: App["client"],
+): Promise<void> {
+  await handleDraftCommand(
+    "event-follow-up",
+    command.text.trim(),
+    command.user_id,
+    command.channel_id,
+    client,
+  );
+}
+
 export function registerDraftCommands(app: App): void {
   app.command("/intro-draft", async ({ command, ack, client }) => {
     await ack();
@@ -169,17 +182,19 @@ export function registerDraftCommands(app: App): void {
     }
   });
 
-  app.command("/event-follow-up", async ({ command, ack, client }) => {
+  const eventFollowUpHandler = async ({
+    command,
+    ack,
+    client,
+  }: {
+    command: { text: string; user_id: string; channel_id: string };
+    ack: () => Promise<void>;
+    client: App["client"];
+  }) => {
     await ack();
 
     try {
-      await handleDraftCommand(
-        "event-follow-up",
-        command.text.trim(),
-        command.user_id,
-        command.channel_id,
-        client,
-      );
+      await runEventFollowUpCommand(command, client);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Failed to create draft";
@@ -190,5 +205,8 @@ export function registerDraftCommands(app: App): void {
         text: message,
       });
     }
-  });
+  };
+
+  app.command("/event-follow-up", eventFollowUpHandler);
+  app.command("/event-follow-up-draft", eventFollowUpHandler);
 }
