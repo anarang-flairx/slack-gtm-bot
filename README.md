@@ -20,7 +20,7 @@ FlairX GTM Bot connects field activity, deal follow-ups, and pipeline data into 
 |---|---|---|
 | **Basic chat** | `@mention` the bot for a conversation in-thread | ✅ Phase 0 |
 | **Badge scan → HubSpot** | Photo → OCR → Apollo enrichment → confirmation card → CRM records | 🔜 Phase 1 |
-| **Reminders & digest** | Daily CEO digest, stale deals, `/leads` commands | 🔜 Phase 2 |
+| **Reminders & digest** | `/digest` posts pipeline + stalled deals + late follow-ups | ✅ Phase 2 (manual) |
 | **Commitment capture** | Forward WhatsApp/LinkedIn to Slack → HubSpot task + nudge | 🔜 Phase 2 |
 | **Email drafting** | Stage-aware drafts → Gmail Drafts (bot never sends) | 🔜 Phase 3 |
 | **Pipeline Q&A** | Natural-language HubSpot queries + recurring reports | 🔜 Phase 4 |
@@ -34,9 +34,27 @@ FlairX GTM Bot connects field activity, deal follow-ups, and pipeline data into 
 
 ### Reminders & commitments (Phase 2)
 
-- Daily digest DM (overdue follow-ups, stale deals, closing soon, commitments due)
-- Slash commands: `/leads due`, `/leads stale`, `/leads digest`, `/leads remind`
+- **`/digest`** — on-demand GTM daily summary posted to `DIGEST_CHANNEL`
+  - Pipeline snapshot (open deals, raw + weighted totals)
+  - Stalled deals by stage quiet thresholds
+  - Contacts owed a follow-up (Attempted / Connected) with **Draft follow-up** buttons
+  - Overdue HubSpot tasks (when present)
+- Slash commands: `/leads due`, `/leads stale`, `/leads remind` (later)
 - Forward WhatsApp/LinkedIn messages → parsed commitment → HubSpot note + task + scheduled nudge
+
+### Daily digest setup
+
+1. Register slash command `/digest` in Slack app settings (scope `commands`) and reinstall
+2. Invite the bot to your digest channel (e.g. `#gtm-daily`)
+3. Copy the channel ID into `.env` as `DIGEST_CHANNEL`
+4. Set `HUBSPOT_PORTAL_ID` and `HUBSPOT_APP_HOST` for record links
+5. Run `npm run dev`, then in Slack:
+
+```text
+/digest
+```
+
+Click **Draft follow-up** on a contact row to create a Gmail draft from `event-follow-up.md`.
 
 ### Email drafting (Phase 3)
 
@@ -71,9 +89,10 @@ FlairX GTM Bot connects field activity, deal follow-ups, and pipeline data into 
 
 1. Create an app at [api.slack.com](https://api.slack.com/apps)
 2. Enable **Socket Mode** and create an app-level token (`connections:write`)
-3. Add bot scopes: `app_mentions:read`, `chat:write`, `channels:history`, `groups:history`
+3. Add bot scopes: `app_mentions:read`, `chat:write`, `channels:history`, `groups:history`, `commands`
 4. Subscribe to bot event: `app_mention`
-5. Install to workspace
+5. Create slash commands: `/intro-draft`, `/event-follow-up`, `/digest`
+6. Install to workspace
 
 ### Run locally
 

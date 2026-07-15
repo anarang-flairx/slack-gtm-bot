@@ -2,17 +2,14 @@ import type { KnownBlock } from "@slack/types";
 import type { App } from "@slack/bolt";
 import {
   findContactContext,
-  toTemplateContext,
   type HubSpotContactContext,
 } from "../integrations/hubspot.js";
+import { createDraftByContactId, TEMPLATE_FILES } from "../lib/createDraft.js";
 import { fillTemplate, loadTemplate } from "../lib/templateEngine.js";
+import { getResourceUrlContext } from "../lib/resourceUrls.js";
 import { saveDraft } from "../lib/draftStore.js";
+import { toTemplateContext } from "../integrations/hubspot.js";
 import type { DraftType } from "../types/draft.js";
-
-const TEMPLATE_FILES: Record<DraftType, string> = {
-  intro: "intro-draft.md",
-  "event-follow-up": "event-follow-up.md",
-};
 
 function truncate(text: string, max = 2800): string {
   if (text.length <= max) {
@@ -114,8 +111,10 @@ async function handleDraftCommand(
     return;
   }
 
-  const template = loadTemplate(TEMPLATE_FILES[draftType]);
-  const filled = fillTemplate(template, toTemplateContext(result));
+  const filled = fillTemplate(loadTemplate(TEMPLATE_FILES[draftType]), {
+    ...toTemplateContext(result),
+    ...getResourceUrlContext(),
+  });
 
   const draft = saveDraft({
     type: draftType,
@@ -145,6 +144,19 @@ async function handleDraftCommand(
   });
 }
 
+async function runEventFollowUpCommand(
+  command: { text: string; user_id: string; channel_id: string },
+  client: App["client"],
+): Promise<void> {
+  await handleDraftCommand(
+    "event-follow-up",
+    command.text.trim(),
+    command.user_id,
+    command.channel_id,
+    client,
+  );
+}
+
 export function registerDraftCommands(app: App): void {
   app.command("/intro-draft", async ({ command, ack, client }) => {
     await ack();
@@ -169,17 +181,19 @@ export function registerDraftCommands(app: App): void {
     }
   });
 
-  app.command("/event-follow-up", async ({ command, ack, client }) => {
+  const eventFollowUpHandler = async ({
+    command,
+    ack,
+    client,
+  }: {
+    command: { text: string; user_id: string; channel_id: string };
+    ack: () => Promise<void>;
+    client: App["client"];
+  }) => {
     await ack();
 
     try {
-      await handleDraftCommand(
-        "event-follow-up",
-        command.text.trim(),
-        command.user_id,
-        command.channel_id,
-        client,
-      );
+      await runEventFollowUpCommand(command, client);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Failed to create draft";
@@ -190,5 +204,10 @@ export function registerDraftCommands(app: App): void {
         text: message,
       });
     }
-  });
+  };
+
+  app.command("/event-follow-up", eventFollowUpHandler);
+  app.command("/event-follow-up-draft", eventFollowUpHandler);
 }
+
+export { createDraftByContactId };

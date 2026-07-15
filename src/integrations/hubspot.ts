@@ -8,39 +8,80 @@ function getToken(): string {
   return token;
 }
 
-async function hubspotFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${HUBSPOT_BASE}${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${getToken()}`,
-      "Content-Type": "application/json",
-      ...init?.headers,
-    },
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`HubSpot API error ${response.status}: ${text}`);
-  }
-
-  return response.json() as Promise<T>;
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function hubspotFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const retries = [1000, 4000, 10000];
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= retries.length; attempt++) {
+    const response = await fetch(`${HUBSPOT_BASE}${path}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${getToken()}`,
+        "Content-Type": "application/json",
+        ...init?.headers,
+      },
+    });
+
+    if (response.status === 429 && attempt < retries.length) {
+      await sleep(retries[attempt]);
+      continue;
+    }
+
+    if (!response.ok) {
+      const text = await response.text();
+      lastError = new Error(`HubSpot API error ${response.status}: ${text}`);
+      throw lastError;
+    }
+
+    return response.json() as Promise<T>;
+  }
+
+  throw lastError ?? new Error("HubSpot request failed after retries");
+}
+
+export type HubSpotSearchResult = {
+  id: string;
+  properties: Record<string, string | null>;
+  createdAt?: string;
+};
+
 type HubSpotSearchResponse = {
-  results: Array<{ id: string; properties: Record<string, string | null> }>;
+  results: HubSpotSearchResult[];
+  paging?: { next?: { after: string } };
 };
 
 type HubSpotAssociationResponse = {
   results: Array<{ toObjectId: string }>;
 };
 
-type HubSpotPipeline = {
+export type PipelineStage = {
   id: string;
-  stages: Array<{ id: string; label: string }>;
+  label: string;
+  displayOrder: number;
+  probability: number;
+};
+
+export type PipelineMeta = {
+  id: string;
+  stages: PipelineStage[];
+  stageById: Map<string, PipelineStage>;
+  stageByLabel: Map<string, PipelineStage>;
 };
 
 type HubSpotPipelinesResponse = {
-  results: HubSpotPipeline[];
+  results: Array<{
+    id: string;
+    stages: Array<{
+      id: string;
+      label: string;
+      displayOrder: number;
+      metadata?: { probability?: string };
+    }>;
+  }>;
 };
 
 export type HubSpotContactContext = {
@@ -57,11 +98,12 @@ export type HubSpotContactContext = {
   leadSource: string;
 };
 
-let stageLabelCache: Map<string, string> | null = null;
+let pipelineCache: PipelineMeta | null = null;
+let leadStatusCache: Map<string, string> | null = null;
 
-async function getStageLabels(): Promise<Map<string, string>> {
-  if (stageLabelCache) {
-    return stageLabelCache;
+export async function getPipelineMeta(): Promise<PipelineMeta> {
+  if (pipelineCache) {
+    return pipelineCache;
   }
 
   const data = await hubspotFetch<HubSpotPipelinesResponse>(
@@ -77,11 +119,108 @@ async function getStageLabels(): Promise<Map<string, string>> {
     throw new Error("No HubSpot deal pipeline found");
   }
 
-  stageLabelCache = new Map(
+  const stages: PipelineStage[] = pipeline.stages
+    .map((stage) => ({
+      id: stage.id,
+      label: stage.label,
+      displayOrder: stage.displayOrder,
+      probability: Number(stage.metadata?.probability ?? 0),
+    }))
+    .sort((a, b) => a.displayOrder - b.displayOrder);
+
+  pipelineCache = {
+    id: pipeline.id,
+    stages,
+    stageById: new Map(stages.map((s) => [s.id, s])),
+    stageByLabel: new Map(stages.map((s) => [s.label.toLowerCase(), s])),
+  };
+
+  return pipelineCache;
+}
+
+async function getStageLabels(): Promise<Map<string, string>> {
+  const pipeline = await getPipelineMeta();
+  return new Map(
     pipeline.stages.map((stage) => [stage.id, stage.label]),
   );
+}
 
-  return stageLabelCache;
+export async function getLeadStatusMap(): Promise<Map<string, string>> {
+  if (leadStatusCache) {
+    return leadStatusCache;
+  }
+
+  const data = await hubspotFetch<{
+    options?: Array<{ label: string; value: string }>;
+  }>("/crm/v3/properties/contacts/hs_lead_status");
+
+  leadStatusCache = new Map(
+    (data.options ?? []).map((option) => [
+      option.label.toLowerCase(),
+      option.value,
+    ]),
+  );
+
+  return leadStatusCache;
+}
+
+export async function searchObjects(
+  objectType: "contacts" | "deals" | "tasks",
+  body: Record<string, unknown>,
+): Promise<HubSpotSearchResult[]> {
+  const results: HubSpotSearchResult[] = [];
+  let after: string | undefined;
+
+  do {
+    const payload = {
+      ...body,
+      limit: 100,
+      ...(after ? { after } : {}),
+    };
+
+    const page = await hubspotFetch<HubSpotSearchResponse>(
+      `/crm/v3/objects/${objectType}/search`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
+
+    results.push(...page.results);
+    after = page.paging?.next?.after;
+  } while (after);
+
+  return results;
+}
+
+export async function batchReadCompanies(
+  ids: string[],
+): Promise<Map<string, string>> {
+  const names = new Map<string, string>();
+  if (ids.length === 0) {
+    return names;
+  }
+
+  const uniqueIds = [...new Set(ids)];
+
+  for (let i = 0; i < uniqueIds.length; i += 100) {
+    const chunk = uniqueIds.slice(i, i + 100);
+    const data = await hubspotFetch<{
+      results: Array<{ id: string; properties: { name?: string | null } }>;
+    }>("/crm/v3/objects/companies/batch/read", {
+      method: "POST",
+      body: JSON.stringify({
+        properties: ["name"],
+        inputs: chunk.map((id) => ({ id })),
+      }),
+    });
+
+    for (const company of data.results) {
+      names.set(company.id, company.properties.name?.trim() ?? "");
+    }
+  }
+
+  return names;
 }
 
 function parseContactName(input: string): {
@@ -158,10 +297,23 @@ export async function findContactContext(
   return buildContactContext(search.results[0]);
 }
 
-async function buildContactContext(contact: {
-  id: string;
-  properties: Record<string, string | null>;
-}): Promise<HubSpotContactContext> {
+export async function getContactContextById(
+  contactId: string,
+): Promise<HubSpotContactContext> {
+  const contact = await hubspotFetch<HubSpotSearchResult>(
+    `/crm/v3/objects/contacts/${contactId}?properties=firstname,lastname,email,jobtitle,company`,
+  );
+
+  return buildContactContext(contact, { allowMissingEvent: true });
+}
+
+async function buildContactContext(
+  contact: {
+    id: string;
+    properties: Record<string, string | null>;
+  },
+  options?: { allowMissingEvent?: boolean },
+): Promise<HubSpotContactContext> {
   const props = contact.properties;
   const email = props.email?.trim();
 
@@ -175,16 +327,33 @@ async function buildContactContext(contact: {
     `/crm/v4/objects/contacts/${contact.id}/associations/deals`,
   );
 
-  if (dealAssociations.results.length === 0) {
+  let dealId = "";
+  let dealName = "";
+  let dealStage = "";
+  let leadSource = "";
+
+  if (dealAssociations.results.length > 0) {
+    dealId = dealAssociations.results[0].toObjectId;
+    const deal = await hubspotFetch<{
+      properties: Record<string, string | null>;
+    }>(
+      `/crm/v3/objects/deals/${dealId}?properties=dealname,dealstage,lead_source`,
+    );
+
+    const stageLabels = await getStageLabels();
+    const dealStageId = deal.properties.dealstage ?? "";
+    dealName = deal.properties.dealname?.trim() ?? "";
+    dealStage = stageLabels.get(dealStageId) ?? dealStageId;
+    leadSource = deal.properties.lead_source?.trim() ?? "";
+  } else if (!options?.allowMissingEvent) {
     throw new Error(
       `Contact ${props.firstname ?? ""} ${props.lastname ?? ""} has no associated deals`,
     );
   }
 
-  const dealId = dealAssociations.results[0].toObjectId;
-  const deal = await hubspotFetch<{
-    properties: Record<string, string | null>;
-  }>(`/crm/v3/objects/deals/${dealId}?properties=dealname,dealstage,lead_source`);
+  if (!leadSource) {
+    leadSource = options?.allowMissingEvent ? "⟨event⟩" : "the event";
+  }
 
   const companyAssociations = await hubspotFetch<HubSpotAssociationResponse>(
     `/crm/v4/objects/contacts/${contact.id}/associations/companies`,
@@ -201,10 +370,6 @@ async function buildContactContext(contact: {
     companyName = company.properties.name?.trim() ?? companyName;
   }
 
-  const stageLabels = await getStageLabels();
-  const dealStageId = deal.properties.dealstage ?? "";
-  const dealStage = stageLabels.get(dealStageId) ?? dealStageId;
-
   const firstName = props.firstname?.trim() ?? "";
   const lastName = props.lastname?.trim() ?? "";
 
@@ -217,9 +382,9 @@ async function buildContactContext(contact: {
     jobTitle: props.jobtitle?.trim() ?? "",
     companyName,
     dealId,
-    dealName: deal.properties.dealname?.trim() ?? "",
+    dealName,
     dealStage,
-    leadSource: deal.properties.lead_source?.trim() ?? "the event",
+    leadSource,
   };
 }
 

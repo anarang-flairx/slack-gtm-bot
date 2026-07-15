@@ -1,6 +1,8 @@
 import "dotenv/config";
 import { App } from "@slack/bolt";
 import OpenAI from "openai";
+import { registerDigestCommand } from "./handlers/digest.js";
+import { registerDigestActions } from "./handlers/digestActions.js";
 import { registerDraftCommands } from "./handlers/draftEmail.js";
 import { registerEmailActions } from "./handlers/emailActions.js";
 import { registerMentionHandler } from "./handlers/mention.js";
@@ -36,12 +38,14 @@ const openai = echoMode
 registerMentionHandler(app, echoMode, openai);
 registerDraftCommands(app);
 registerEmailActions(app);
+registerDigestCommand(app);
+registerDigestActions(app);
 
 (async () => {
   await app.start();
   console.log(
     echoMode
-      ? "FlairX GTM Bot running (DEV_ECHO_MODE). Email drafts: /intro-draft, /event-follow-up"
-      : "FlairX GTM Bot running. Email drafts: /intro-draft, /event-follow-up",
+      ? "FlairX GTM Bot running (DEV_ECHO_MODE). Commands: /intro-draft, /event-follow-up, /digest"
+      : "FlairX GTM Bot running. Commands: /intro-draft, /event-follow-up, /digest",
   );
 })();
