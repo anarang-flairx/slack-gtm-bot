@@ -287,7 +287,7 @@ export async function findContactContext(
     throw new Error(`No HubSpot contact matching "${contactName}"`);
   }
 
-  if (search.results.length > 1 && lastName.length === 0) {
+  if (search.results.length > 1) {
     const contexts = await Promise.all(
       search.results.map((contact) => buildContactContext(contact)),
     );

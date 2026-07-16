@@ -1,7 +1,9 @@
 import type { App } from "@slack/bolt";
-import { createGmailDraft } from "../integrations/gmail.js";
 import { createDraftByContactId } from "../lib/createDraft.js";
 import type { DraftType } from "../types/draft.js";
+import { buildPreviewBlocks } from "./draftEmail.js";
+
+const DRAFT_TYPES = new Set<DraftType>(["intro", "event-follow-up"]);
 
 export function registerDigestActions(app: App): void {
   app.action("draft_followup", async ({ ack, body, action, client }) => {
@@ -32,6 +34,10 @@ export function registerDigestActions(app: App): void {
       }
 
       const template = (payload.template ?? "event-follow-up") as DraftType;
+      if (!DRAFT_TYPES.has(template)) {
+        throw new Error(`Unknown template: ${template}`);
+      }
+
       const preview = await createDraftByContactId(
         payload.contact_id,
         template,
@@ -39,16 +45,18 @@ export function registerDigestActions(app: App): void {
         channelId,
       );
 
-      await createGmailDraft(
-        preview.draft.to,
-        preview.draft.subject,
-        preview.draft.body,
-      );
-
       await client.chat.postMessage({
         channel: channelId,
         thread_ts: messageTs,
-        text: `✍️ Draft created for *${preview.context.fullName}* (${preview.draft.to}) — open Gmail → Drafts.`,
+        text: `Email draft ready for ${preview.context.fullName}`,
+        blocks: buildPreviewBlocks(
+          template,
+          preview.context,
+          preview.draft.to,
+          preview.draft.subject,
+          preview.draft.body,
+          preview.draft.id,
+        ),
       });
     } catch (error) {
       const message =

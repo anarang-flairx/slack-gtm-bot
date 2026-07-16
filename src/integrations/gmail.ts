@@ -1,4 +1,5 @@
 import { google } from "googleapis";
+import { markdownToHtml, markdownToPlainText } from "../lib/markdownToHtml.js";
 
 function getOAuthClient() {
   const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -20,7 +21,25 @@ function getOAuthClient() {
   return oauth2Client;
 }
 
-import { markdownToHtml, markdownToPlainText } from "../lib/markdownToHtml.js";
+/** Strip CR/LF so HubSpot values cannot inject MIME headers. */
+function sanitizeHeaderValue(value: string): string {
+  return value.replace(/[\r\n]+/g, " ").trim();
+}
+
+/** RFC 2047 encode a header when it contains non-ASCII characters. */
+function encodeHeader(value: string): string {
+  const safe = sanitizeHeaderValue(value);
+  if (/^[\x20-\x7E]*$/.test(safe)) {
+    return safe;
+  }
+  return `=?UTF-8?B?${Buffer.from(safe, "utf8").toString("base64")}?=`;
+}
+
+function encodeBase64Body(content: string): string {
+  return Buffer.from(content, "utf8")
+    .toString("base64")
+    .replace(/.{76}/g, "$&\r\n");
+}
 
 function buildMimeMessage(to: string, subject: string, body: string): string {
   const from = process.env.GMAIL_SENDER_EMAIL;
@@ -33,23 +52,23 @@ function buildMimeMessage(to: string, subject: string, body: string): string {
   const htmlBody = markdownToHtml(body);
 
   const message = [
-    `From: ${from}`,
-    `To: ${to}`,
-    `Subject: ${subject}`,
+    `From: ${sanitizeHeaderValue(from)}`,
+    `To: ${sanitizeHeaderValue(to)}`,
+    `Subject: ${encodeHeader(subject)}`,
     "MIME-Version: 1.0",
     `Content-Type: multipart/alternative; boundary="${boundary}"`,
     "",
     `--${boundary}`,
     "Content-Type: text/plain; charset=utf-8",
-    "Content-Transfer-Encoding: 7bit",
+    "Content-Transfer-Encoding: base64",
     "",
-    plainBody,
+    encodeBase64Body(plainBody),
     "",
     `--${boundary}`,
     "Content-Type: text/html; charset=utf-8",
-    "Content-Transfer-Encoding: 7bit",
+    "Content-Transfer-Encoding: base64",
     "",
-    htmlBody,
+    encodeBase64Body(htmlBody),
     "",
     `--${boundary}--`,
   ].join("\r\n");
@@ -68,14 +87,13 @@ export async function createGmailDraft(
 ): Promise<void> {
   const auth = getOAuthClient();
   const gmail = google.gmail({ version: "v1", auth });
-  const senderEmail = process.env.GMAIL_SENDER_EMAIL;
 
-  if (!senderEmail) {
+  if (!process.env.GMAIL_SENDER_EMAIL) {
     throw new Error("Missing GMAIL_SENDER_EMAIL in .env");
   }
 
   await gmail.users.drafts.create({
-    userId: senderEmail,
+    userId: "me",
     requestBody: {
       message: {
         raw: buildMimeMessage(to, subject, body),

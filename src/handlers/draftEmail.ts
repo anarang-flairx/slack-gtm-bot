@@ -18,7 +18,7 @@ function truncate(text: string, max = 2800): string {
   return `${text.slice(0, max)}\n\n...(truncated in preview)`;
 }
 
-function buildPreviewBlocks(
+export function buildPreviewBlocks(
   draftType: DraftType,
   context: HubSpotContactContext,
   to: string,
