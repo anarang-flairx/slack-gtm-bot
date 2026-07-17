@@ -49,7 +49,7 @@ export function formatDigestDate(now = new Date()): string {
 }
 
 export function hubspotRecordUrl(
-  objectType: "contact" | "deal",
+  objectType: "contact" | "deal" | "company",
   id: string,
 ): string {
   const portalId = process.env.HUBSPOT_PORTAL_ID;
@@ -59,7 +59,8 @@ export function hubspotRecordUrl(
     return `https://${host}`;
   }
 
-  const typeId = objectType === "contact" ? "0-1" : "0-3";
+  const typeId =
+    objectType === "contact" ? "0-1" : objectType === "company" ? "0-2" : "0-3";
   return `https://${host}/contacts/${portalId}/record/${typeId}/${id}`;
 }
 

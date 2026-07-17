@@ -6,6 +6,7 @@ import { registerDigestActions } from "./handlers/digestActions.js";
 import { registerDraftCommands } from "./handlers/draftEmail.js";
 import { registerEmailActions } from "./handlers/emailActions.js";
 import { registerMentionHandler } from "./handlers/mention.js";
+import { registerUpdateNotesCommand } from "./handlers/updateNotes.js";
 
 const echoMode = process.env.DEV_ECHO_MODE === "true";
 
@@ -38,6 +39,7 @@ const openai = echoMode
 registerMentionHandler(app, echoMode, openai);
 registerDraftCommands(app);
 registerEmailActions(app);
+registerUpdateNotesCommand(app);
 registerDigestCommand(app);
 registerDigestActions(app);
 
@@ -45,7 +47,7 @@ registerDigestActions(app);
   await app.start();
   console.log(
     echoMode
-      ? "FlairX GTM Bot running (DEV_ECHO_MODE). Commands: /intro-draft, /event-follow-up, /digest"
-      : "FlairX GTM Bot running. Commands: /intro-draft, /event-follow-up, /digest",
+      ? "FlairX GTM Bot running (DEV_ECHO_MODE). Commands: /intro-draft, /event-follow-up, /update-notes, /digest"
+      : "FlairX GTM Bot running. Commands: /intro-draft, /event-follow-up, /update-notes, /digest",
   );
 })();

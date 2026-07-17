@@ -5,11 +5,44 @@ import {
   searchObjects,
 } from "../integrations/hubspot.js";
 import {
+  contactActivityDateProperty,
+  dealActivityDateProperty,
+} from "../lib/noteProperties.js";
+import {
   daysAgoMs,
   daysSince,
   envInt,
   startOfTodayMs,
 } from "./format.js";
+
+/** Quiet if date is older than threshold, OR the date property is unset. */
+function quietDateFilterGroups(
+  baseFilters: Array<Record<string, unknown>>,
+  dateProperty: string,
+  olderThanMs: number,
+): Array<{ filters: Array<Record<string, unknown>> }> {
+  return [
+    {
+      filters: [
+        ...baseFilters,
+        {
+          propertyName: dateProperty,
+          operator: "LT",
+          value: String(olderThanMs),
+        },
+      ],
+    },
+    {
+      filters: [
+        ...baseFilters,
+        {
+          propertyName: dateProperty,
+          operator: "NOT_HAS_PROPERTY",
+        },
+      ],
+    },
+  ];
+}
 
 export type OpenDeal = {
   id: string;
@@ -91,13 +124,14 @@ export async function queryOpenDeals(): Promise<PipelineSnapshot> {
       "dealstage",
       "closedate",
       "hs_lastmodifieddate",
-      "notes_last_updated",
+      dealActivityDateProperty(),
       "hubspot_owner_id",
     ],
     sorts: [{ propertyName: "amount", direction: "DESCENDING" }],
   });
 
   const todayStart = startOfTodayMs();
+  const activityDateProp = dealActivityDateProperty();
 
   const deals: OpenDeal[] = results.map((deal) => {
     const stageId = deal.properties.dealstage ?? "";
@@ -109,7 +143,7 @@ export async function queryOpenDeals(): Promise<PipelineSnapshot> {
       stageLabel: pipeline.stageById.get(stageId)?.label ?? stageId,
       closeDate: deal.properties.closedate ?? null,
       lastModified: parseMs(deal.properties.hs_lastmodifieddate),
-      notesLastUpdated: parseMs(deal.properties.notes_last_updated),
+      notesLastUpdated: parseMs(deal.properties[activityDateProp]),
       createdAt: deal.createdAt ? Date.parse(deal.createdAt) : null,
     };
   });
@@ -171,34 +205,33 @@ export async function queryStalledDeals(): Promise<StalledDeal[]> {
     .map((label) => pipeline.stageByLabel.get(label.toLowerCase())?.id)
     .filter((id): id is string => Boolean(id));
 
+  const activityDateProp = dealActivityDateProperty();
   const filterGroups: Array<{ filters: Array<Record<string, unknown>> }> = [];
 
   if (lateStageIds.length > 0) {
-    filterGroups.push({
-      filters: [
-        { propertyName: "hs_is_closed", operator: "EQ", value: "false" },
-        { propertyName: "dealstage", operator: "IN", values: lateStageIds },
-        {
-          propertyName: "notes_last_updated",
-          operator: "LT",
-          value: String(daysAgoMs(lateDays, now)),
-        },
-      ],
-    });
+    filterGroups.push(
+      ...quietDateFilterGroups(
+        [
+          { propertyName: "hs_is_closed", operator: "EQ", value: "false" },
+          { propertyName: "dealstage", operator: "IN", values: lateStageIds },
+        ],
+        activityDateProp,
+        daysAgoMs(lateDays, now),
+      ),
+    );
   }
 
   if (earlyStageIds.length > 0) {
-    filterGroups.push({
-      filters: [
-        { propertyName: "hs_is_closed", operator: "EQ", value: "false" },
-        { propertyName: "dealstage", operator: "IN", values: earlyStageIds },
-        {
-          propertyName: "notes_last_updated",
-          operator: "LT",
-          value: String(daysAgoMs(earlyDays, now)),
-        },
-      ],
-    });
+    filterGroups.push(
+      ...quietDateFilterGroups(
+        [
+          { propertyName: "hs_is_closed", operator: "EQ", value: "false" },
+          { propertyName: "dealstage", operator: "IN", values: earlyStageIds },
+        ],
+        activityDateProp,
+        daysAgoMs(earlyDays, now),
+      ),
+    );
   }
 
   if (filterGroups.length === 0) {
@@ -211,7 +244,7 @@ export async function queryStalledDeals(): Promise<StalledDeal[]> {
       "dealname",
       "amount",
       "dealstage",
-      "notes_last_updated",
+      activityDateProp,
       "hubspot_owner_id",
       "closedate",
       "hs_lastmodifieddate",
@@ -221,7 +254,7 @@ export async function queryStalledDeals(): Promise<StalledDeal[]> {
   return results
     .map((deal) => {
       const stageId = deal.properties.dealstage ?? "";
-      const notesLastUpdated = parseMs(deal.properties.notes_last_updated);
+      const notesLastUpdated = parseMs(deal.properties[activityDateProp]);
       const createdAt = deal.createdAt ? Date.parse(deal.createdAt) : null;
       const lastModified = parseMs(deal.properties.hs_lastmodifieddate);
       const quietFrom = notesLastUpdated ?? createdAt ?? lastModified;
@@ -279,30 +312,27 @@ export async function queryFollowUpContacts(): Promise<FollowUpContact[]> {
     daysOverdue: number;
   }> = [];
 
+  const activityDateProp = contactActivityDateProperty();
+
   for (const bucket of buckets) {
     const results = await searchObjects("contacts", {
-      filterGroups: [
-        {
-          filters: [
-            {
-              propertyName: "hs_lead_status",
-              operator: "EQ",
-              value: bucket.value,
-            },
-            {
-              propertyName: "notes_last_updated",
-              operator: "LT",
-              value: String(daysAgoMs(bucket.days, now)),
-            },
-          ],
-        },
-      ],
+      filterGroups: quietDateFilterGroups(
+        [
+          {
+            propertyName: "hs_lead_status",
+            operator: "EQ",
+            value: bucket.value,
+          },
+        ],
+        activityDateProp,
+        daysAgoMs(bucket.days, now),
+      ),
       properties: [
         "firstname",
         "lastname",
         "email",
         "hs_lead_status",
-        "notes_last_updated",
+        activityDateProp,
         "associatedcompanyid",
       ],
     });
@@ -315,16 +345,18 @@ export async function queryFollowUpContacts(): Promise<FollowUpContact[]> {
         companyIds.push(companyId);
       }
 
+      const lastContact = parseMs(contact.properties[activityDateProp]);
+      const createdAt = contact.createdAt
+        ? Date.parse(contact.createdAt)
+        : null;
+
       rows.push({
         id: contact.id,
         name: `${first} ${last}`.trim() || "Unknown contact",
         email: contact.properties.email?.trim() ?? "",
         companyId,
         leadStatusLabel: bucket.label,
-        daysOverdue: daysSince(
-          parseMs(contact.properties.notes_last_updated),
-          now,
-        ),
+        daysOverdue: daysSince(lastContact ?? createdAt, now),
       });
     }
   }

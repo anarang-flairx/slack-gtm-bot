@@ -54,7 +54,16 @@ FlairX GTM Bot connects field activity, deal follow-ups, and pipeline data into 
 /digest
 ```
 
-Click **Draft follow-up** on a contact row to create a Gmail draft from `event-follow-up.md`.
+Click **Draft follow-up** on a contact row to preview → approve a Gmail draft from `event-follow-up.md`.
+
+Log activity from Slack (appends a dated line + sets the activity date):
+
+```text
+/update-notes Acme Corp — called; demo next week
+/update-notes Jane Doe — LinkedIn reply, will intro TA
+```
+
+Matches contacts, deals, or companies. Uses custom fields: contact `outreach_notes` / `last_contact_date`, deal `deal_notes` / `notes_last_updated`, company `company_notes` / `notes_last_updated`.
 
 ### Email drafting (Phase 3)
 
@@ -91,7 +100,7 @@ Click **Draft follow-up** on a contact row to create a Gmail draft from `event-f
 2. Enable **Socket Mode** and create an app-level token (`connections:write`)
 3. Add bot scopes: `app_mentions:read`, `chat:write`, `channels:history`, `groups:history`, `commands`
 4. Subscribe to bot event: `app_mention`
-5. Create slash commands: `/intro-draft`, `/event-follow-up`, `/digest`
+5. Create slash commands: `/intro-draft`, `/event-follow-up`, `/update-notes`, `/digest`
 6. Install to workspace
 
 ### Run locally
