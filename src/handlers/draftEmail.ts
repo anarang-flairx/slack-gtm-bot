@@ -10,6 +10,7 @@ import { getResourceUrlContext } from "../lib/resourceUrls.js";
 import { saveDraft } from "../lib/draftStore.js";
 import { toTemplateContext } from "../integrations/hubspot.js";
 import type { DraftType } from "../types/draft.js";
+import { postPublic } from "../lib/slackPost.js";
 
 function truncate(text: string, max = 2800): string {
   if (text.length <= max) {
@@ -85,11 +86,11 @@ async function handleDraftCommand(
   client: App["client"],
 ): Promise<void> {
   if (!contactName) {
-    await client.chat.postEphemeral({
-      channel: channelId,
-      user: userId,
-      text: "Please provide a contact name. Example: `/intro-draft Jane Doe`",
-    });
+    await postPublic(
+      client,
+      channelId,
+      "Please provide a contact name. Example: `/intro-draft Jane Doe`",
+    );
     return;
   }
 
@@ -103,11 +104,11 @@ async function handleDraftCommand(
       )
       .join("\n");
 
-    await client.chat.postEphemeral({
-      channel: channelId,
-      user: userId,
-      text: `Multiple contacts matched "${contactName}". Be more specific:\n${options}`,
-    });
+    await postPublic(
+      client,
+      channelId,
+      `Multiple contacts matched "${contactName}". Be more specific:\n${options}`,
+    );
     return;
   }
 
@@ -130,10 +131,11 @@ async function handleDraftCommand(
     channelId,
   });
 
-  await client.chat.postMessage({
-    channel: channelId,
-    text: `Email draft ready for ${result.fullName}`,
-    blocks: buildPreviewBlocks(
+  await postPublic(
+    client,
+    channelId,
+    `Email draft ready for ${result.fullName}`,
+    buildPreviewBlocks(
       draftType,
       result,
       result.email,
@@ -141,7 +143,7 @@ async function handleDraftCommand(
       filled.body,
       draft.id,
     ),
-  });
+  );
 }
 
 async function runEventFollowUpCommand(
@@ -173,11 +175,7 @@ export function registerDraftCommands(app: App): void {
       const message =
         error instanceof Error ? error.message : "Failed to create draft";
 
-      await client.chat.postEphemeral({
-        channel: command.channel_id,
-        user: command.user_id,
-        text: message,
-      });
+      await postPublic(client, command.channel_id, message);
     }
   });
 
@@ -198,11 +196,7 @@ export function registerDraftCommands(app: App): void {
       const message =
         error instanceof Error ? error.message : "Failed to create draft";
 
-      await client.chat.postEphemeral({
-        channel: command.channel_id,
-        user: command.user_id,
-        text: message,
-      });
+      await postPublic(client, command.channel_id, message);
     }
   };
 

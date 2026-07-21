@@ -69,6 +69,12 @@ export function parseUpdateNotesText(
   return null;
 }
 
+export async function resolveNoteRecord(
+  name: string,
+): Promise<NoteRecordMatch | NoteRecordMatch[]> {
+  return findNoteRecords(name);
+}
+
 export async function appendNotesToRecord(
   match: NoteRecordMatch,
   note: string,
@@ -85,16 +91,4 @@ export async function appendNotesToRecord(
   });
 
   return match;
-}
-
-export async function resolveAndAppendNotes(
-  name: string,
-  note: string,
-): Promise<NoteRecordMatch | NoteRecordMatch[]> {
-  const result = await findNoteRecords(name);
-  if (Array.isArray(result)) {
-    return result;
-  }
-  await appendNotesToRecord(result, note);
-  return result;
 }

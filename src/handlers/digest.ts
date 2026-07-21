@@ -1,16 +1,13 @@
 import type { App } from "@slack/bolt";
 import { buildDailyDigest } from "../digest/buildDailyDigest.js";
+import { postPublic } from "../lib/slackPost.js";
 
 export function registerDigestCommand(app: App): void {
   app.command("/digest", async ({ command, ack, client }) => {
     await ack();
 
     try {
-      await client.chat.postEphemeral({
-        channel: command.channel_id,
-        user: command.user_id,
-        text: "Building digest…",
-      });
+      await postPublic(client, command.channel_id, "Building digest…");
 
       const digest = await buildDailyDigest();
 
@@ -20,20 +17,16 @@ export function registerDigestCommand(app: App): void {
         blocks: digest.blocks,
       });
 
-      await client.chat.postEphemeral({
-        channel: command.channel_id,
-        user: command.user_id,
-        text: `Posted digest to <#${digest.channelId}>.`,
-      });
+      await postPublic(
+        client,
+        command.channel_id,
+        `Posted digest to <#${digest.channelId}>.`,
+      );
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Failed to build digest";
 
-      await client.chat.postEphemeral({
-        channel: command.channel_id,
-        user: command.user_id,
-        text: message,
-      });
+      await postPublic(client, command.channel_id, message);
     }
   });
 }

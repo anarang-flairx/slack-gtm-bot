@@ -1,3 +1,10 @@
+import {
+  appendDatedNote,
+  companyActivityDateProperty,
+  companyNotesProperty,
+  contactNotesProperty,
+} from "../lib/noteProperties.js";
+
 const HUBSPOT_BASE = "https://api.hubapi.com";
 
 function getToken(): string {
@@ -562,3 +569,292 @@ export async function findNoteRecords(
   }
   return matches;
 }
+
+export type CompanyStatusDeal = {
+  id: string;
+  name: string;
+  stage: string;
+  amount: string | null;
+  closeDate: string | null;
+};
+
+export type CompanyStatusContact = {
+  id: string;
+  name: string;
+  email: string;
+  jobTitle: string;
+  leadStatus: string;
+};
+
+export type CompanyStatus = {
+  id: string;
+  name: string;
+  domain: string;
+  notes: string;
+  activityDate: string | null;
+  deals: CompanyStatusDeal[];
+  contacts: CompanyStatusContact[];
+};
+
+export async function findCompaniesByName(
+  companyName: string,
+): Promise<Array<{ id: string; name: string; domain: string }>> {
+  const query = companyName.trim();
+  if (!query) {
+    return [];
+  }
+
+  const search = await hubspotFetch<HubSpotSearchResponse>(
+    "/crm/v3/objects/companies/search",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        filterGroups: [
+          {
+            filters: [
+              {
+                propertyName: "name",
+                operator: "CONTAINS_TOKEN",
+                value: query,
+              },
+            ],
+          },
+        ],
+        properties: ["name", "domain"],
+        limit: 5,
+      }),
+    },
+  );
+
+  return search.results.map((company) => ({
+    id: company.id,
+    name: company.properties.name?.trim() || "Untitled company",
+    domain: company.properties.domain?.trim() ?? "",
+  }));
+}
+
+export async function getCompanyStatus(
+  companyId: string,
+): Promise<CompanyStatus> {
+  const notesProp = companyNotesProperty();
+  const activityProp = companyActivityDateProperty();
+
+  const company = await hubspotFetch<{
+    id: string;
+    properties: Record<string, string | null>;
+  }>(
+    `/crm/v3/objects/companies/${companyId}?properties=name,domain,${encodeURIComponent(notesProp)},${encodeURIComponent(activityProp)}`,
+  );
+
+  const [dealAssociations, contactAssociations] = await Promise.all([
+    hubspotFetch<HubSpotAssociationResponse>(
+      `/crm/v4/objects/companies/${companyId}/associations/deals`,
+    ),
+    hubspotFetch<HubSpotAssociationResponse>(
+      `/crm/v4/objects/companies/${companyId}/associations/contacts`,
+    ),
+  ]);
+
+  const dealIds = dealAssociations.results.map((r) => r.toObjectId);
+  const contactIds = contactAssociations.results.map((r) => r.toObjectId);
+  const stageLabels = await getStageLabels().catch(() => new Map());
+
+  const deals: CompanyStatusDeal[] = [];
+  for (let i = 0; i < dealIds.length; i += 100) {
+    const chunk = dealIds.slice(i, i + 100);
+    if (chunk.length === 0) {
+      break;
+    }
+    const data = await hubspotFetch<{
+      results: Array<{ id: string; properties: Record<string, string | null> }>;
+    }>("/crm/v3/objects/deals/batch/read", {
+      method: "POST",
+      body: JSON.stringify({
+        properties: ["dealname", "dealstage", "amount", "closedate"],
+        inputs: chunk.map((id) => ({ id })),
+      }),
+    });
+
+    for (const deal of data.results) {
+      const stageId = deal.properties.dealstage ?? "";
+      deals.push({
+        id: deal.id,
+        name: deal.properties.dealname?.trim() || "Untitled deal",
+        stage: stageLabels.get(stageId) || stageId || "—",
+        amount: deal.properties.amount?.trim() || null,
+        closeDate: deal.properties.closedate?.trim() || null,
+      });
+    }
+  }
+
+  const contacts: CompanyStatusContact[] = [];
+  for (let i = 0; i < contactIds.length; i += 100) {
+    const chunk = contactIds.slice(i, i + 100);
+    if (chunk.length === 0) {
+      break;
+    }
+    const data = await hubspotFetch<{
+      results: Array<{ id: string; properties: Record<string, string | null> }>;
+    }>("/crm/v3/objects/contacts/batch/read", {
+      method: "POST",
+      body: JSON.stringify({
+        properties: [
+          "firstname",
+          "lastname",
+          "email",
+          "jobtitle",
+          "hs_lead_status",
+        ],
+        inputs: chunk.map((id) => ({ id })),
+      }),
+    });
+
+    for (const contact of data.results) {
+      const first = contact.properties.firstname?.trim() ?? "";
+      const last = contact.properties.lastname?.trim() ?? "";
+      contacts.push({
+        id: contact.id,
+        name: `${first} ${last}`.trim() || "Unknown contact",
+        email: contact.properties.email?.trim() ?? "",
+        jobTitle: contact.properties.jobtitle?.trim() ?? "",
+        leadStatus: contact.properties.hs_lead_status?.trim() ?? "",
+      });
+    }
+  }
+
+  return {
+    id: company.id,
+    name: company.properties.name?.trim() || "Untitled company",
+    domain: company.properties.domain?.trim() ?? "",
+    notes: company.properties[notesProp]?.trim() ?? "",
+    activityDate: company.properties[activityProp]?.trim() || null,
+    deals,
+    contacts,
+  };
+}
+
+export async function createCrmObject(
+  objectType: "contacts" | "companies" | "deals",
+  properties: Record<string, string>,
+): Promise<{ id: string }> {
+  const data = await hubspotFetch<{ id: string }>(
+    `/crm/v3/objects/${objectType}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ properties }),
+    },
+  );
+  return { id: data.id };
+}
+
+export async function associateDefault(
+  fromType: "contacts" | "companies" | "deals",
+  fromId: string,
+  toType: "contacts" | "companies" | "deals",
+  toId: string,
+): Promise<void> {
+  await hubspotFetch(
+    `/crm/v4/objects/${fromType}/${fromId}/associations/default/${toType}/${toId}`,
+    { method: "PUT" },
+  );
+}
+
+export type CreateProspectInput = {
+  firstName: string;
+  lastName: string;
+  companyName?: string;
+  email?: string;
+  phone?: string;
+  mobile?: string;
+  title?: string;
+  source?: string;
+  notes?: string;
+  linkedin?: string;
+};
+
+export type CreateProspectResult = {
+  contactId: string;
+  dealId: string;
+  companyId: string | null;
+  contactName: string;
+  dealName: string;
+  companyName: string | null;
+  stageLabel: string;
+};
+
+export async function createProspect(
+  input: CreateProspectInput,
+): Promise<CreateProspectResult> {
+  const pipeline = await getPipelineMeta();
+  const prospecting =
+    pipeline.stageByLabel.get("prospecting") ?? pipeline.stages[0];
+
+  if (!prospecting) {
+    throw new Error("No Prospecting stage found in HubSpot deal pipeline");
+  }
+
+  const contactName = `${input.firstName} ${input.lastName}`.trim();
+  const dealName = input.companyName
+    ? `${input.companyName} — ${contactName}`
+    : contactName;
+
+  const contactProperties: Record<string, string> = {
+    firstname: input.firstName,
+    ...(input.lastName ? { lastname: input.lastName } : {}),
+    ...(input.companyName ? { company: input.companyName } : {}),
+    ...(input.email ? { email: input.email } : {}),
+    ...(input.phone ? { phone: input.phone } : {}),
+    ...(input.mobile ? { mobilephone: input.mobile } : {}),
+    ...(input.title ? { jobtitle: input.title } : {}),
+    ...(input.linkedin ? { hs_linkedin_url: input.linkedin } : {}),
+  };
+
+  if (input.notes) {
+    contactProperties[contactNotesProperty()] = appendDatedNote("", input.notes);
+  }
+
+  const contact = await createCrmObject("contacts", contactProperties);
+
+  let companyId: string | null = null;
+  if (input.companyName) {
+    const existing = await findCompaniesByName(input.companyName);
+    const exact = existing.find(
+      (c) => c.name.toLowerCase() === input.companyName!.toLowerCase(),
+    );
+    if (exact) {
+      companyId = exact.id;
+    } else {
+      const company = await createCrmObject("companies", {
+        name: input.companyName,
+      });
+      companyId = company.id;
+    }
+  }
+
+  const dealProperties: Record<string, string> = {
+    dealname: dealName,
+    dealstage: prospecting.id,
+    pipeline: pipeline.id,
+    ...(input.source ? { lead_source: input.source } : {}),
+  };
+
+  const deal = await createCrmObject("deals", dealProperties);
+
+  await associateDefault("contacts", contact.id, "deals", deal.id);
+  if (companyId) {
+    await associateDefault("contacts", contact.id, "companies", companyId);
+    await associateDefault("companies", companyId, "deals", deal.id);
+  }
+
+  return {
+    contactId: contact.id,
+    dealId: deal.id,
+    companyId,
+    contactName,
+    dealName,
+    companyName: input.companyName ?? null,
+    stageLabel: prospecting.label,
+  };
+}
+
+export { parseContactName };

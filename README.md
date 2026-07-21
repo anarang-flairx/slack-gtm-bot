@@ -20,6 +20,8 @@ FlairX GTM Bot connects field activity, deal follow-ups, and pipeline data into 
 |---|---|---|
 | **Basic chat** | `@mention` the bot for a conversation in-thread | ✅ Phase 0 |
 | **Badge scan → HubSpot** | Photo → OCR → Apollo enrichment → confirmation card → CRM records | 🔜 Phase 1 |
+| **Add prospect** | `/add-prospect` → preview → contact + deal in Prospecting | ✅ |
+| **Company status** | `/current-status` shows deals, contacts, and notes for a company | ✅ |
 | **Reminders & digest** | `/digest` posts pipeline + stalled deals + late follow-ups | ✅ Phase 2 (manual) |
 | **Commitment capture** | Forward WhatsApp/LinkedIn to Slack → HubSpot task + nudge | 🔜 Phase 2 |
 | **Email drafting** | Stage-aware drafts → Gmail Drafts (bot never sends) | 🔜 Phase 3 |
@@ -56,7 +58,7 @@ FlairX GTM Bot connects field activity, deal follow-ups, and pipeline data into 
 
 Click **Draft follow-up** on a contact row to preview → approve a Gmail draft from `event-follow-up.md`.
 
-Log activity from Slack (appends a dated line + sets the activity date):
+Log activity from Slack (preview → Approve / Discard, then appends a dated line + sets the activity date):
 
 ```text
 /update-notes Acme Corp — called; demo next week
@@ -64,6 +66,24 @@ Log activity from Slack (appends a dated line + sets the activity date):
 ```
 
 Matches contacts, deals, or companies. Uses custom fields: contact `outreach_notes` / `last_contact_date`, deal `deal_notes` / `notes_last_updated`, company `company_notes` / `notes_last_updated`.
+
+Check a company’s pipeline status (posted in-channel for everyone):
+
+```text
+/current-status Acme Corp
+```
+
+Add a prospect (preview → Approve creates contact + deal in **Prospecting**; optional company with `@`). Extra fields go after `|` as `key=value` (quote multi-word values):
+
+```text
+/add-prospect Jane Doe
+/add-prospect Jane Doe @ Acme Corp
+/add-prospect Jane Doe @ Acme | email=jane@acme.com phone=555-0100 title="VP Talent" source="SHRM 2026" notes="Met at booth"
+```
+
+Supported fields: `email`, `phone`, `mobile`, `title`, `source` (deal lead source), `notes`, `linkedin`.
+
+Slash command replies (usage, errors, previews, status) are **channel-visible** so the whole team can see them — not ephemeral.
 
 ### Email drafting (Phase 3)
 
@@ -100,8 +120,10 @@ Matches contacts, deals, or companies. Uses custom fields: contact `outreach_not
 2. Enable **Socket Mode** and create an app-level token (`connections:write`)
 3. Add bot scopes: `app_mentions:read`, `chat:write`, `channels:history`, `groups:history`, `commands`
 4. Subscribe to bot event: `app_mention`
-5. Create slash commands: `/intro-draft`, `/event-follow-up`, `/update-notes`, `/digest`
+5. Create slash commands: `/intro-draft`, `/event-follow-up`, `/update-notes`, `/digest`, `/current-status`, `/add-prospect`
 6. Install to workspace
+
+Slash command request URLs are unused in Socket Mode — create each command with a short description; the bot receives them over the socket.
 
 ### Run locally
 
