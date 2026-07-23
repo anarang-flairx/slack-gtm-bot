@@ -18,7 +18,7 @@ export type ParsedProspect = {
   fields: ProspectFields;
 };
 
-const FIELD_ALIASES: Record<string, keyof ProspectFields> = {
+const FIELD_ALIASES: Record<string, keyof ProspectFields | "company"> = {
   email: "email",
   e: "email",
   phone: "phone",
@@ -34,10 +34,44 @@ const FIELD_ALIASES: Record<string, keyof ProspectFields> = {
   note: "notes",
   linkedin: "linkedin",
   li: "linkedin",
+  company: "company",
+  co: "company",
+  org: "company",
 };
 
 const FIELD_KEY_PATTERN =
-  /\b(email|e|phone|tel|mobile|title|jobtitle|job|source|lead_source|event|notes|note|linkedin|li)\s*=/gi;
+  /\b(email|e|phone|tel|mobile|title|jobtitle|job|source|lead_source|event|notes|note|linkedin|li|company|co|org)\s*=/gi;
+
+/**
+ * Slack rewrites `@google` / `@ google` in slash commands into mention tokens
+ * like `<@U123|google>`, whose inner `|` breaks naive parsing. Decode those
+ * back to plain text before we split identity vs fields.
+ */
+export function normalizeSlackCommandText(text: string): string {
+  return text
+    .replace(
+      /<@([UW][A-Z0-9]+)(?:\|([^>]+))?>/gi,
+      (_m, _id: string, label?: string) =>
+        label?.trim() ? `@ ${label.trim()}` : "",
+    )
+    .replace(
+      /<!subteam\^[A-Z0-9]+\|@?([^>]+)>/gi,
+      (_m, label: string) => `@ ${label.trim()}`,
+    )
+    .replace(/<!([^|>]+)(?:\|([^>]+))?>/g, (_m, _t: string, label?: string) =>
+      label?.trim() ? label.trim() : "",
+    )
+    .replace(
+      /<mailto:([^|>]+)(?:\|([^>]+))?>/gi,
+      (_m, email: string, label?: string) => label?.trim() || email.trim(),
+    )
+    .replace(
+      /<(https?:\/\/[^|>]+)(?:\|([^>]+))?>/gi,
+      (_m, url: string, label?: string) => label?.trim() || url.trim(),
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function stripQuotes(value: string): string {
   const trimmed = value.trim();
@@ -50,12 +84,44 @@ function stripQuotes(value: string): string {
   return trimmed;
 }
 
+function splitIdentityAndFields(raw: string): {
+  identityPart: string;
+  fieldPart: string;
+} {
+  // Prefer ` | ` so pipes inside decoded text are less ambiguous.
+  const spaced = raw.search(/\s\|\s/);
+  if (spaced >= 0) {
+    return {
+      identityPart: raw.slice(0, spaced).trim(),
+      fieldPart: raw.slice(spaced + 1).replace(/^\|/, "").trim(),
+    };
+  }
+
+  // Else: first `|` that starts a known field key.
+  FIELD_KEY_PATTERN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = FIELD_KEY_PATTERN.exec(raw)) !== null) {
+    const before = raw.slice(0, match.index);
+    const pipeIdx = before.lastIndexOf("|");
+    if (pipeIdx >= 0) {
+      return {
+        identityPart: raw.slice(0, pipeIdx).trim(),
+        fieldPart: raw.slice(pipeIdx + 1).trim(),
+      };
+    }
+  }
+
+  return { identityPart: raw.trim(), fieldPart: "" };
+}
+
 function parseFieldSegment(segment: string): {
   fields: ProspectFields;
+  companyName?: string;
   unknownKeys: string[];
 } {
   const fields: ProspectFields = {};
   const unknownKeys: string[] = [];
+  let companyName: string | undefined;
   const matches = [...segment.matchAll(FIELD_KEY_PATTERN)];
 
   if (matches.length === 0) {
@@ -77,7 +143,9 @@ function parseFieldSegment(segment: string): {
     const canonical = FIELD_ALIASES[rawKey];
     const valueStart = (match.index ?? 0) + match[0].length;
     const valueEnd =
-      i + 1 < matches.length ? (matches[i + 1].index ?? segment.length) : segment.length;
+      i + 1 < matches.length
+        ? (matches[i + 1].index ?? segment.length)
+        : segment.length;
     const value = stripQuotes(segment.slice(valueStart, valueEnd));
 
     if (!canonical) {
@@ -85,12 +153,50 @@ function parseFieldSegment(segment: string): {
       continue;
     }
 
-    if (value) {
+    if (!value) {
+      continue;
+    }
+
+    if (canonical === "company") {
+      companyName = value;
+    } else {
       fields[canonical] = value;
     }
   }
 
-  return { fields, unknownKeys };
+  return { fields, ...(companyName ? { companyName } : {}), unknownKeys };
+}
+
+function splitPersonAndCompany(identityPart: string): {
+  personPart: string;
+  companyName?: string;
+} {
+  // `Jane Doe @ Acme` or `Jane Doe @Acme` (Slack often drops the space after @)
+  const atMatch = identityPart.match(/^(.+?)\s+@\s*(.+)$/i);
+  if (atMatch) {
+    return {
+      personPart: atMatch[1].trim(),
+      companyName: atMatch[2].trim() || undefined,
+    };
+  }
+
+  const atWordMatch = identityPart.match(/^(.+?)\s+at\s+(.+)$/i);
+  if (atWordMatch) {
+    return {
+      personPart: atWordMatch[1].trim(),
+      companyName: atWordMatch[2].trim() || undefined,
+    };
+  }
+
+  const commaMatch = identityPart.match(/^(.+?),\s*(.+)$/);
+  if (commaMatch) {
+    return {
+      personPart: commaMatch[1].trim(),
+      companyName: commaMatch[2].trim() || undefined,
+    };
+  }
+
+  return { personPart: identityPart };
 }
 
 /**
@@ -99,53 +205,38 @@ function parseFieldSegment(segment: string): {
  * Examples:
  * - Jane Doe
  * - Jane Doe @ Acme
+ * - Jane Doe @Acme
  * - Jane Doe @ Acme | email=jane@acme.com phone=555-1234
- * - Jane Doe | email=jane@x.com title="VP Talent" source="SHRM 2026"
+ * - Jane Doe | company=Acme email=jane@x.com title="VP Talent"
  */
 export function parseProspectText(text: string): ParsedProspect | null {
-  const raw = text.trim();
+  const raw = normalizeSlackCommandText(text);
   if (!raw) {
     return null;
   }
 
-  const pipeIndex = raw.indexOf("|");
-  const identityPart = (pipeIndex >= 0 ? raw.slice(0, pipeIndex) : raw).trim();
-  const fieldPart = pipeIndex >= 0 ? raw.slice(pipeIndex + 1).trim() : "";
-
+  const { identityPart, fieldPart } = splitIdentityAndFields(raw);
   if (!identityPart) {
     return null;
   }
 
-  let personPart = identityPart;
-  let companyName: string | undefined;
-
-  const atMatch = identityPart.match(/^(.+?)\s+@\s+(.+)$/i);
-  const atWordMatch = identityPart.match(/^(.+?)\s+at\s+(.+)$/i);
-  const commaMatch = identityPart.match(/^(.+?),\s*(.+)$/);
-
-  if (atMatch) {
-    personPart = atMatch[1].trim();
-    companyName = atMatch[2].trim();
-  } else if (atWordMatch) {
-    personPart = atWordMatch[1].trim();
-    companyName = atWordMatch[2].trim();
-  } else if (commaMatch) {
-    personPart = commaMatch[1].trim();
-    companyName = commaMatch[2].trim();
-  }
-
+  let { personPart, companyName } = splitPersonAndCompany(identityPart);
   if (!personPart) {
     return null;
   }
 
-  const { fields, unknownKeys } = fieldPart
+  const parsedFields = fieldPart
     ? parseFieldSegment(fieldPart)
-    : { fields: {}, unknownKeys: [] };
+    : { fields: {} as ProspectFields, unknownKeys: [] as string[] };
 
-  if (unknownKeys.length > 0) {
+  if (parsedFields.unknownKeys.length > 0) {
     throw new Error(
-      `Unrecognized prospect fields: ${unknownKeys.join(", ")}. Use email, phone, mobile, title, source, notes, linkedin (key=value after |).`,
+      `Unrecognized prospect fields: ${parsedFields.unknownKeys.join(", ")}. Use email, phone, mobile, title, source, notes, linkedin, company (key=value after |).`,
     );
+  }
+
+  if (parsedFields.companyName) {
+    companyName = parsedFields.companyName;
   }
 
   const { firstName, lastName } = parseContactName(personPart);
@@ -156,7 +247,7 @@ export function parseProspectText(text: string): ParsedProspect | null {
     lastName,
     ...(companyName ? { companyName } : {}),
     displayName,
-    fields,
+    fields: parsedFields.fields,
   };
 }
 
@@ -173,4 +264,6 @@ export function formatProspectFields(fields: ProspectFields): string {
 }
 
 export const PROSPECT_USAGE =
-  "Usage: `/add-prospect Jane Doe @ Acme | email=jane@acme.com phone=555-0100 title=\"VP Talent\" source=\"SHRM 2026\"`\nSupported fields after `|`: email, phone, mobile, title, source, notes, linkedin";
+  "Usage: `/add-prospect Jane Doe @ Acme | email=jane@acme.com phone=555-0100`\n" +
+  "Tip: Slack may autocomplete `@Acme` as a mention — prefer `at Acme` or `| company=Acme`.\n" +
+  "Supported fields after `|`: email, phone, mobile, title, source, notes, linkedin, company";
