@@ -1,12 +1,14 @@
 import type { App } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
-import { createGmailDraft } from "../integrations/gmail.js";
+import { hubspotRecordUrl } from "../digest/format.js";
+import { updateDealStage } from "../integrations/hubspot.js";
 import {
-  beginDraftAction,
-  completeDraftAction,
-  releaseDraftAction,
-  takeDraft,
-} from "../lib/draftStore.js";
+  beginStageMoveAction,
+  completeStageMoveAction,
+  releaseStageMoveAction,
+  takeStageMove,
+} from "../lib/stageMoveStore.js";
+import { appendNotesToRecord } from "../lib/updateNotes.js";
 import { postThread } from "../lib/slackPost.js";
 
 function actionContext(body: {
@@ -26,7 +28,7 @@ function actionContext(body: {
   };
 }
 
-async function replaceDraftMessage(
+async function replaceMessage(
   client: App["client"],
   channelId: string | undefined,
   messageTs: string | undefined,
@@ -40,17 +42,12 @@ async function replaceDraftMessage(
     channel: channelId,
     ts: messageTs,
     text,
-    blocks: [
-      {
-        type: "section",
-        text: { type: "mrkdwn", text },
-      },
-    ],
+    blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
   });
 }
 
-export function registerEmailActions(app: App): void {
-  app.action("approve_email_draft", async ({ ack, body, action, client }) => {
+export function registerStageMoveActions(app: App): void {
+  app.action("approve_stage_move", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -58,8 +55,8 @@ export function registerEmailActions(app: App): void {
     }
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
-    const draftId = action.value;
-    const result = beginDraftAction(draftId, userId);
+    const pendingId = action.value;
+    const result = beginStageMoveAction(pendingId, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -67,7 +64,7 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This draft expired. Mention me again to prepare the draft.",
+          "This stage move expired. Mention me again to move the deal.",
         );
       }
       return;
@@ -79,37 +76,45 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who created this draft can approve or discard it.",
+          "Only the person who requested this move can approve or discard it.",
         );
       }
       return;
     }
 
-    const draft = result.draft;
+    const pending = result.pending;
 
     try {
-      await createGmailDraft(draft.to, draft.subject, draft.body);
-      completeDraftAction(draftId);
+      await updateDealStage(pending.dealId, pending.targetStageId);
+      await appendNotesToRecord(
+        {
+          type: "deal",
+          id: pending.dealId,
+          name: pending.dealName,
+          detail: "",
+        },
+        `Moved to ${pending.targetStageLabel}`,
+      );
+      completeStageMoveAction(pendingId);
 
-      const successText = `Gmail draft created for *${draft.contactName}* (${draft.to}). Open Gmail → Drafts to review and send.`;
-      await replaceDraftMessage(client, channelId, messageTs, successText);
+      const url = hubspotRecordUrl("deal", pending.dealId);
+      const successText = `Moved deal <${url}|${pending.dealName}> to *${pending.targetStageLabel}*.`;
+      await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
         await postThread(client, channelId, threadTs, successText);
       }
     } catch (error) {
-      releaseDraftAction(draftId);
-
+      releaseStageMoveAction(pendingId);
       const message =
-        error instanceof Error ? error.message : "Failed to create Gmail draft";
-
+        error instanceof Error ? error.message : "Failed to move deal stage";
       if (channelId) {
         await postThread(client, channelId, threadTs, message);
       }
     }
   });
 
-  app.action("discard_email_draft", async ({ ack, body, action, client }) => {
+  app.action("discard_stage_move", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -117,7 +122,7 @@ export function registerEmailActions(app: App): void {
     }
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
-    const result = takeDraft(action.value, userId);
+    const result = takeStageMove(action.value, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -125,7 +130,7 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This draft already expired or was discarded.",
+          "This stage move already expired or was discarded.",
         );
       }
       return;
@@ -137,14 +142,14 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who created this draft can approve or discard it.",
+          "Only the person who requested this move can approve or discard it.",
         );
       }
       return;
     }
 
-    const discardText = `Draft for *${result.draft.contactName}* discarded.`;
-    await replaceDraftMessage(client, channelId, messageTs, discardText);
+    const discardText = `Stage move for *${result.pending.dealName}* discarded.`;
+    await replaceMessage(client, channelId, messageTs, discardText);
 
     if (channelId && !messageTs) {
       await postThread(client, channelId, threadTs, discardText);

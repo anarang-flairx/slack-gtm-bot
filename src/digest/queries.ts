@@ -2,6 +2,7 @@ import {
   batchReadCompanies,
   getLeadStatusMap,
   getPipelineMeta,
+  latestNoteTimestampMs,
   searchObjects,
 } from "../integrations/hubspot.js";
 import {
@@ -251,27 +252,58 @@ export async function queryStalledDeals(): Promise<StalledDeal[]> {
     ],
   });
 
-  return results
-    .map((deal) => {
-      const stageId = deal.properties.dealstage ?? "";
-      const notesLastUpdated = parseMs(deal.properties[activityDateProp]);
-      const createdAt = deal.createdAt ? Date.parse(deal.createdAt) : null;
-      const lastModified = parseMs(deal.properties.hs_lastmodifieddate);
-      const quietFrom = notesLastUpdated ?? createdAt ?? lastModified;
+  const stalled: StalledDeal[] = results.map((deal) => {
+    const stageId = deal.properties.dealstage ?? "";
+    const notesLastUpdated = parseMs(deal.properties[activityDateProp]);
+    const createdAt = deal.createdAt ? Date.parse(deal.createdAt) : null;
+    const lastModified = parseMs(deal.properties.hs_lastmodifieddate);
+    const quietFrom = notesLastUpdated ?? createdAt ?? lastModified;
 
+    return {
+      id: deal.id,
+      name: deal.properties.dealname?.trim() || "Untitled deal",
+      amount: parseAmount(deal.properties.amount),
+      stageId,
+      stageLabel: pipeline.stageById.get(stageId)?.label ?? stageId,
+      closeDate: deal.properties.closedate ?? null,
+      lastModified,
+      notesLastUpdated,
+      createdAt,
+      daysQuiet: daysSince(quietFrom, now),
+    };
+  });
+
+  // Native HubSpot notes (e.g. written from Codex/HubSpot MCP) also count as
+  // recent activity, so re-check each stalled candidate against its latest note
+  // and drop any that are no longer quiet past their stage threshold.
+  const lateStageSet = new Set(lateStageIds);
+  const enriched = await Promise.all(
+    stalled.map(async (deal) => {
+      const nativeMs = await latestNoteTimestampMs("deals", deal.id).catch(
+        () => null,
+      );
+      if (!nativeMs) {
+        return deal;
+      }
+      const quietFrom = Math.max(
+        deal.notesLastUpdated ?? 0,
+        nativeMs,
+        deal.createdAt ?? 0,
+        deal.lastModified ?? 0,
+      );
       return {
-        id: deal.id,
-        name: deal.properties.dealname?.trim() || "Untitled deal",
-        amount: parseAmount(deal.properties.amount),
-        stageId,
-        stageLabel: pipeline.stageById.get(stageId)?.label ?? stageId,
-        closeDate: deal.properties.closedate ?? null,
-        lastModified,
-        notesLastUpdated,
-        createdAt,
+        ...deal,
+        notesLastUpdated: Math.max(deal.notesLastUpdated ?? 0, nativeMs),
         daysQuiet: daysSince(quietFrom, now),
       };
-    })
+    }),
+  );
+
+  return enriched
+    .filter(
+      (deal) =>
+        deal.daysQuiet >= (lateStageSet.has(deal.stageId) ? lateDays : earlyDays),
+    )
     .sort((a, b) => b.daysQuiet - a.daysQuiet);
 }
 
@@ -310,6 +342,7 @@ export async function queryFollowUpContacts(): Promise<FollowUpContact[]> {
     companyId: string;
     leadStatusLabel: string;
     daysOverdue: number;
+    lastActivityMs: number | null;
   }> = [];
 
   const activityDateProp = contactActivityDateProperty();
@@ -357,23 +390,41 @@ export async function queryFollowUpContacts(): Promise<FollowUpContact[]> {
         companyId,
         leadStatusLabel: bucket.label,
         daysOverdue: daysSince(lastContact ?? createdAt, now),
+        lastActivityMs: lastContact ?? createdAt,
       });
     }
   }
 
   const companyNames = await batchReadCompanies(companyIds);
+  const bucketDays = new Map(buckets.map((b) => [b.label, b.days]));
 
-  return rows
-    .map((row) => ({
-      id: row.id,
-      name: row.name,
-      email: row.email,
-      companyName: row.companyId
-        ? companyNames.get(row.companyId) ?? ""
-        : "",
-      leadStatusLabel: row.leadStatusLabel,
-      daysOverdue: row.daysOverdue,
-    }))
+  const enriched = await Promise.all(
+    rows.map(async (row) => {
+      const base = {
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        companyName: row.companyId ? companyNames.get(row.companyId) ?? "" : "",
+        leadStatusLabel: row.leadStatusLabel,
+        daysOverdue: row.daysOverdue,
+      };
+
+      const nativeMs = await latestNoteTimestampMs("contacts", row.id).catch(
+        () => null,
+      );
+      if (!nativeMs) {
+        return base;
+      }
+      const effective = Math.max(row.lastActivityMs ?? 0, nativeMs);
+      return { ...base, daysOverdue: daysSince(effective, now) };
+    }),
+  );
+
+  return enriched
+    .filter(
+      (row) =>
+        row.daysOverdue >= (bucketDays.get(row.leadStatusLabel) ?? 0),
+    )
     .sort((a, b) => b.daysOverdue - a.daysOverdue);
 }
 

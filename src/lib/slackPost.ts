@@ -14,3 +14,19 @@ export async function postPublic(
     ...(blocks ? { blocks } : {}),
   });
 }
+
+/** Post a message into a thread (falls back to channel root when no thread). */
+export async function postThread(
+  client: App["client"],
+  channelId: string,
+  threadTs: string | undefined,
+  text: string,
+  blocks?: KnownBlock[],
+): Promise<void> {
+  await client.chat.postMessage({
+    channel: channelId,
+    ...(threadTs ? { thread_ts: threadTs } : {}),
+    text,
+    ...(blocks ? { blocks } : {}),
+  });
+}

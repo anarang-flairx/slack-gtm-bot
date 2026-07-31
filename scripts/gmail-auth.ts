@@ -30,10 +30,16 @@ function escapeHtml(text: string): string {
 const authUrl = oauth2Client.generateAuthUrl({
   access_type: "offline",
   prompt: "consent",
-  scope: ["https://www.googleapis.com/auth/gmail.compose"],
+  scope: [
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.readonly",
+  ],
   state: oauthState,
 });
 
+console.log(
+  "\nThis grants Gmail compose (drafts) + read-only (inbox) access.\n",
+);
 console.log("\n1. Open this URL in your browser and sign in as the CEO Gmail account:\n");
 console.log(authUrl);
 console.log(

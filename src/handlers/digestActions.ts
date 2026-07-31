@@ -1,7 +1,7 @@
 import type { App } from "@slack/bolt";
 import { createDraftByContactId } from "../lib/createDraft.js";
 import type { DraftType } from "../types/draft.js";
-import { buildPreviewBlocks } from "./draftEmail.js";
+import { buildEmailDraftPreviewBlocks } from "../lib/previews.js";
 
 const DRAFT_TYPES = new Set<DraftType>(["intro", "event-follow-up"]);
 
@@ -43,13 +43,14 @@ export function registerDigestActions(app: App): void {
         template,
         userId,
         channelId,
+        messageTs,
       );
 
       await client.chat.postMessage({
         channel: channelId,
         thread_ts: messageTs,
         text: `Email draft ready for ${preview.context.fullName}`,
-        blocks: buildPreviewBlocks(
+        blocks: buildEmailDraftPreviewBlocks(
           template,
           preview.context,
           preview.draft.to,

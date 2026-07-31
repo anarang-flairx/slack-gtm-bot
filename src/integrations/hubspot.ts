@@ -445,6 +445,122 @@ export async function updateObjectProperties(
   });
 }
 
+/** Update a deal's pipeline stage by internal stage id. */
+export async function updateDealStage(
+  dealId: string,
+  stageId: string,
+): Promise<void> {
+  await updateObjectProperties("deals", dealId, { dealstage: stageId });
+}
+
+export type NoteEngagement = {
+  id: string;
+  body: string;
+  timestampMs: number | null;
+};
+
+function stripHtml(value: string | null | undefined): string {
+  if (!value) {
+    return "";
+  }
+  return value
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Fetch the most recent native HubSpot note engagements associated with a
+ * record. These are the notes the CEO's Codex/HubSpot-MCP session writes, so
+ * reading them keeps the Slack bot's view consistent with that surface.
+ */
+export async function getRecentNotes(
+  objectType: "contacts" | "companies" | "deals",
+  id: string,
+  limit = 5,
+): Promise<NoteEngagement[]> {
+  const associations = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/${objectType}/${id}/associations/notes`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+
+  const noteIds = associations.results.map((r) => r.toObjectId);
+  if (noteIds.length === 0) {
+    return [];
+  }
+
+  const notes: NoteEngagement[] = [];
+  for (let i = 0; i < noteIds.length; i += 100) {
+    const chunk = noteIds.slice(i, i + 100);
+    const data = await hubspotFetch<{
+      results: Array<{ id: string; properties: Record<string, string | null> }>;
+    }>("/crm/v3/objects/notes/batch/read", {
+      method: "POST",
+      body: JSON.stringify({
+        properties: ["hs_note_body", "hs_timestamp"],
+        inputs: chunk.map((noteId) => ({ id: noteId })),
+      }),
+    });
+
+    for (const note of data.results) {
+      const rawTimestamp = note.properties.hs_timestamp;
+      const timestampMs = rawTimestamp
+        ? Number.isFinite(Number(rawTimestamp))
+          ? Number(rawTimestamp)
+          : Date.parse(rawTimestamp) || null
+        : null;
+      notes.push({
+        id: note.id,
+        body: stripHtml(note.properties.hs_note_body),
+        timestampMs,
+      });
+    }
+  }
+
+  return notes
+    .sort((a, b) => (b.timestampMs ?? 0) - (a.timestampMs ?? 0))
+    .slice(0, limit);
+}
+
+/** Latest native note timestamp (ms) for a record, or null. */
+export async function latestNoteTimestampMs(
+  objectType: "contacts" | "companies" | "deals",
+  id: string,
+): Promise<number | null> {
+  const notes = await getRecentNotes(objectType, id, 1).catch(() => []);
+  return notes[0]?.timestampMs ?? null;
+}
+
+/** Return the company associated with a contact, if any. */
+export async function getAssociatedCompany(
+  contactId: string,
+): Promise<{ id: string; name: string } | null> {
+  const associations = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/contacts/${contactId}/associations/companies`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+
+  if (associations.results.length === 0) {
+    return null;
+  }
+
+  const companyId = associations.results[0].toObjectId;
+  const company = await hubspotFetch<{
+    properties: Record<string, string | null>;
+  }>(`/crm/v3/objects/companies/${companyId}?properties=name`);
+
+  return {
+    id: companyId,
+    name: company.properties.name?.trim() || "Untitled company",
+  };
+}
+
 async function searchNoteMatchesByName(
   name: string,
 ): Promise<NoteRecordMatch[]> {
@@ -592,6 +708,8 @@ export type CompanyStatus = {
   domain: string;
   notes: string;
   activityDate: string | null;
+  nativeNotes: NoteEngagement[];
+  lastActivity: string | null;
   deals: CompanyStatusDeal[];
   contacts: CompanyStatusContact[];
 };
@@ -633,6 +751,53 @@ export async function findCompaniesByName(
   }));
 }
 
+export async function findContactsByName(
+  name: string,
+): Promise<Array<{ id: string; name: string; email: string; company: string }>> {
+  const query = name.trim();
+  if (!query) {
+    return [];
+  }
+
+  const { firstName, lastName } = parseContactName(query);
+  const filters =
+    lastName.length > 0
+      ? [
+          { propertyName: "firstname", operator: "EQ", value: firstName },
+          { propertyName: "lastname", operator: "EQ", value: lastName },
+        ]
+      : [
+          {
+            propertyName: "firstname",
+            operator: "CONTAINS_TOKEN",
+            value: firstName,
+          },
+        ];
+
+  const search = await hubspotFetch<HubSpotSearchResponse>(
+    "/crm/v3/objects/contacts/search",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        filterGroups: [{ filters }],
+        properties: ["firstname", "lastname", "email", "company"],
+        limit: 5,
+      }),
+    },
+  );
+
+  return search.results.map((contact) => {
+    const first = contact.properties.firstname?.trim() ?? "";
+    const last = contact.properties.lastname?.trim() ?? "";
+    return {
+      id: contact.id,
+      name: `${first} ${last}`.trim() || "Unknown contact",
+      email: contact.properties.email?.trim() ?? "",
+      company: contact.properties.company?.trim() ?? "",
+    };
+  });
+}
+
 export async function getCompanyStatus(
   companyId: string,
 ): Promise<CompanyStatus> {
@@ -646,14 +811,16 @@ export async function getCompanyStatus(
     `/crm/v3/objects/companies/${companyId}?properties=name,domain,${encodeURIComponent(notesProp)},${encodeURIComponent(activityProp)}`,
   );
 
-  const [dealAssociations, contactAssociations] = await Promise.all([
-    hubspotFetch<HubSpotAssociationResponse>(
-      `/crm/v4/objects/companies/${companyId}/associations/deals`,
-    ),
-    hubspotFetch<HubSpotAssociationResponse>(
-      `/crm/v4/objects/companies/${companyId}/associations/contacts`,
-    ),
-  ]);
+  const [dealAssociations, contactAssociations, nativeNotes] =
+    await Promise.all([
+      hubspotFetch<HubSpotAssociationResponse>(
+        `/crm/v4/objects/companies/${companyId}/associations/deals`,
+      ),
+      hubspotFetch<HubSpotAssociationResponse>(
+        `/crm/v4/objects/companies/${companyId}/associations/contacts`,
+      ),
+      getRecentNotes("companies", companyId).catch(() => []),
+    ]);
 
   const dealIds = dealAssociations.results.map((r) => r.toObjectId);
   const contactIds = contactAssociations.results.map((r) => r.toObjectId);
@@ -722,12 +889,29 @@ export async function getCompanyStatus(
     }
   }
 
+  const customActivityDate = company.properties[activityProp]?.trim() || null;
+  const latestNativeNoteMs = nativeNotes[0]?.timestampMs ?? null;
+  const customActivityMs = customActivityDate
+    ? Date.parse(customActivityDate) || null
+    : null;
+
+  const lastActivityMs = Math.max(
+    latestNativeNoteMs ?? 0,
+    customActivityMs ?? 0,
+  );
+  const lastActivity =
+    lastActivityMs > 0
+      ? new Date(lastActivityMs).toISOString().slice(0, 10)
+      : customActivityDate;
+
   return {
     id: company.id,
     name: company.properties.name?.trim() || "Untitled company",
     domain: company.properties.domain?.trim() ?? "",
     notes: company.properties[notesProp]?.trim() ?? "",
-    activityDate: company.properties[activityProp]?.trim() || null,
+    activityDate: customActivityDate,
+    nativeNotes,
+    lastActivity,
     deals,
     contacts,
   };
@@ -855,6 +1039,103 @@ export async function createProspect(
     companyName: input.companyName ?? null,
     stageLabel: prospecting.label,
   };
+}
+
+export type DealForStageMove = {
+  id: string;
+  name: string;
+  currentStageId: string;
+  currentStageLabel: string;
+};
+
+/**
+ * Resolve candidate deals for a stage move, by company name and/or deal name.
+ * Returns ambiguous company matches so the caller can ask for clarification.
+ */
+export async function resolveDealsForStageMove(opts: {
+  companyName?: string;
+  dealName?: string;
+}): Promise<{
+  ambiguousCompanies?: Array<{ id: string; name: string; domain: string }>;
+  deals: DealForStageMove[];
+}> {
+  const stageLabels = await getStageLabels().catch(() => new Map());
+  const toDeal = (
+    id: string,
+    name: string,
+    stageId: string,
+  ): DealForStageMove => ({
+    id,
+    name,
+    currentStageId: stageId,
+    currentStageLabel: stageLabels.get(stageId) || stageId || "—",
+  });
+
+  if (opts.companyName) {
+    const companies = await findCompaniesByName(opts.companyName);
+    if (companies.length === 0) {
+      return { deals: [] };
+    }
+    if (companies.length > 1) {
+      return { ambiguousCompanies: companies, deals: [] };
+    }
+
+    const status = await getCompanyStatus(companies[0].id);
+    let deals = status.deals.map((deal) =>
+      toDeal(
+        deal.id,
+        deal.name,
+        // getCompanyStatus already resolved stage to a label; re-resolve id
+        [...stageLabels.entries()].find(([, label]) => label === deal.stage)?.[0] ??
+          deal.stage,
+      ),
+    );
+
+    if (opts.dealName) {
+      const needle = opts.dealName.toLowerCase();
+      deals = deals.filter((deal) =>
+        deal.name.toLowerCase().includes(needle),
+      );
+    }
+
+    return { deals };
+  }
+
+  if (opts.dealName) {
+    const search = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/deals/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: [
+            {
+              filters: [
+                {
+                  propertyName: "dealname",
+                  operator: "CONTAINS_TOKEN",
+                  value: opts.dealName,
+                },
+              ],
+            },
+          ],
+          properties: ["dealname", "dealstage"],
+          limit: 10,
+        }),
+      },
+    );
+
+    return {
+      deals: search.results.map((deal) =>
+        toDeal(
+          deal.id,
+          deal.properties.dealname?.trim() || "Untitled deal",
+          deal.properties.dealstage ?? "",
+        ),
+      ),
+    };
+  }
+
+  return { deals: [] };
 }
 
 export { parseContactName };

@@ -13,6 +13,7 @@ export type PendingDraft = {
   dealStage: string;
   createdBy: string;
   channelId: string;
+  threadTs?: string;
   createdAt: number;
 };
 

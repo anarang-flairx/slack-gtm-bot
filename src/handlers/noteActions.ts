@@ -9,17 +9,21 @@ import {
   takeNoteUpdate,
 } from "../lib/noteUpdateStore.js";
 import { appendNotesToRecord } from "../lib/updateNotes.js";
-import { postPublic } from "../lib/slackPost.js";
+import { postThread } from "../lib/slackPost.js";
 
 function actionContext(body: {
   type: string;
   channel?: { id?: string };
-  message?: { ts?: string; blocks?: KnownBlock[] };
+  message?: { ts?: string; thread_ts?: string; blocks?: KnownBlock[] };
   user: { id: string };
 }) {
   return {
     channelId: body.type === "block_actions" ? body.channel?.id : undefined,
     messageTs: body.type === "block_actions" ? body.message?.ts : undefined,
+    threadTs:
+      body.type === "block_actions"
+        ? (body.message?.thread_ts ?? body.message?.ts)
+        : undefined,
     userId: body.user.id,
   };
 }
@@ -55,16 +59,17 @@ export function registerNoteActions(app: App): void {
       return;
     }
 
-    const { channelId, messageTs, userId } = actionContext(body);
+    const { channelId, messageTs, threadTs, userId } = actionContext(body);
     const pendingId = action.value;
     const result = beginNoteUpdateAction(pendingId, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
-        await postPublic(
+        await postThread(
           client,
           channelId,
-          "This notes update expired. Run `/update-notes` again.",
+          threadTs,
+          "This notes update expired. Mention me again to update the note.",
         );
       }
       return;
@@ -72,9 +77,10 @@ export function registerNoteActions(app: App): void {
 
     if (result.status === "forbidden") {
       if (channelId) {
-        await postPublic(
+        await postThread(
           client,
           channelId,
+          threadTs,
           "Only the person who created this update can approve or discard it.",
         );
       }
@@ -98,10 +104,7 @@ export function registerNoteActions(app: App): void {
       await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
-        await client.chat.postMessage({
-          channel: channelId,
-          text: successText,
-        });
+        await postThread(client, channelId, threadTs, successText);
       }
     } catch (error) {
       releaseNoteUpdateAction(pendingId);
@@ -110,7 +113,7 @@ export function registerNoteActions(app: App): void {
         error instanceof Error ? error.message : "Failed to update notes";
 
       if (channelId) {
-        await postPublic(client, channelId, message);
+        await postThread(client, channelId, threadTs, message);
       }
     }
   });
@@ -122,14 +125,15 @@ export function registerNoteActions(app: App): void {
       return;
     }
 
-    const { channelId, messageTs, userId } = actionContext(body);
+    const { channelId, messageTs, threadTs, userId } = actionContext(body);
     const result = takeNoteUpdate(action.value, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
-        await postPublic(
+        await postThread(
           client,
           channelId,
+          threadTs,
           "This notes update already expired or was discarded.",
         );
       }
@@ -138,9 +142,10 @@ export function registerNoteActions(app: App): void {
 
     if (result.status === "forbidden") {
       if (channelId) {
-        await postPublic(
+        await postThread(
           client,
           channelId,
+          threadTs,
           "Only the person who created this update can approve or discard it.",
         );
       }
@@ -151,10 +156,7 @@ export function registerNoteActions(app: App): void {
     await replaceMessage(client, channelId, messageTs, discardText);
 
     if (channelId && !messageTs) {
-      await client.chat.postMessage({
-        channel: channelId,
-        text: discardText,
-      });
+      await postThread(client, channelId, threadTs, discardText);
     }
   });
 }

@@ -9,6 +9,7 @@ export type PendingProspect = {
   fields: ProspectFields;
   createdBy: string;
   channelId: string;
+  threadTs?: string;
   createdAt: number;
 };
 

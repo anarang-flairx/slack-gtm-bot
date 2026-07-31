@@ -9,6 +9,7 @@ export type PendingNoteUpdate = {
   note: string;
   createdBy: string;
   channelId: string;
+  threadTs?: string;
   createdAt: number;
 };
 

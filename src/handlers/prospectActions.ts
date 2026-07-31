@@ -8,17 +8,21 @@ import {
   releaseProspectAction,
   takeProspect,
 } from "../lib/prospectStore.js";
-import { postPublic } from "../lib/slackPost.js";
+import { postThread } from "../lib/slackPost.js";
 
 function actionContext(body: {
   type: string;
   channel?: { id?: string };
-  message?: { ts?: string; blocks?: KnownBlock[] };
+  message?: { ts?: string; thread_ts?: string; blocks?: KnownBlock[] };
   user: { id: string };
 }) {
   return {
     channelId: body.type === "block_actions" ? body.channel?.id : undefined,
     messageTs: body.type === "block_actions" ? body.message?.ts : undefined,
+    threadTs:
+      body.type === "block_actions"
+        ? (body.message?.thread_ts ?? body.message?.ts)
+        : undefined,
     userId: body.user.id,
   };
 }
@@ -54,16 +58,17 @@ export function registerProspectActions(app: App): void {
       return;
     }
 
-    const { channelId, messageTs, userId } = actionContext(body);
+    const { channelId, messageTs, threadTs, userId } = actionContext(body);
     const pendingId = action.value;
     const result = beginProspectAction(pendingId, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
-        await postPublic(
+        await postThread(
           client,
           channelId,
-          "This prospect preview expired. Run `/add-prospect` again.",
+          threadTs,
+          "This prospect preview expired. Mention me again to add the prospect.",
         );
       }
       return;
@@ -71,9 +76,10 @@ export function registerProspectActions(app: App): void {
 
     if (result.status === "forbidden") {
       if (channelId) {
-        await postPublic(
+        await postThread(
           client,
           channelId,
+          threadTs,
           "Only the person who created this prospect can approve or discard it.",
         );
       }
@@ -101,7 +107,7 @@ export function registerProspectActions(app: App): void {
       await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
-        await postPublic(client, channelId, successText);
+        await postThread(client, channelId, threadTs, successText);
       }
     } catch (error) {
       releaseProspectAction(pendingId);
@@ -110,7 +116,7 @@ export function registerProspectActions(app: App): void {
         error instanceof Error ? error.message : "Failed to create prospect";
 
       if (channelId) {
-        await postPublic(client, channelId, message);
+        await postThread(client, channelId, threadTs, message);
       }
     }
   });
@@ -122,14 +128,15 @@ export function registerProspectActions(app: App): void {
       return;
     }
 
-    const { channelId, messageTs, userId } = actionContext(body);
+    const { channelId, messageTs, threadTs, userId } = actionContext(body);
     const result = takeProspect(action.value, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
-        await postPublic(
+        await postThread(
           client,
           channelId,
+          threadTs,
           "This prospect preview already expired or was discarded.",
         );
       }
@@ -138,9 +145,10 @@ export function registerProspectActions(app: App): void {
 
     if (result.status === "forbidden") {
       if (channelId) {
-        await postPublic(
+        await postThread(
           client,
           channelId,
+          threadTs,
           "Only the person who created this prospect can approve or discard it.",
         );
       }
@@ -151,7 +159,7 @@ export function registerProspectActions(app: App): void {
     await replaceMessage(client, channelId, messageTs, discardText);
 
     if (channelId && !messageTs) {
-      await postPublic(client, channelId, discardText);
+      await postThread(client, channelId, threadTs, discardText);
     }
   });
 }
