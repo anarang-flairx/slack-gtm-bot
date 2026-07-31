@@ -2,8 +2,6 @@
 
 Slack bot for FlairX's go-to-market team. Mention the bot in Slack — it does the work and replies in-thread with links to created records.
 
-Turns badges into HubSpot leads, tracks follow-ups, captures WhatsApp/LinkedIn msgs, drafts Gmail follow-ups, and answers pipeline questions.
-
 ## Problem
 
 FlairX's GTM motion is conference-heavy and high-touch. Three bottlenecks slow it down:
