@@ -37,7 +37,7 @@ import type { DraftType } from "../types/draft.js";
 export type ToolContext = {
   client: App["client"];
   channel: string;
-  threadTs: string;
+  threadTs?: string;
   userId: string;
 };
 
@@ -48,7 +48,7 @@ async function postCard(
 ): Promise<void> {
   await ctx.client.chat.postMessage({
     channel: ctx.channel,
-    thread_ts: ctx.threadTs,
+    ...(ctx.threadTs ? { thread_ts: ctx.threadTs } : {}),
     text,
     blocks,
   });

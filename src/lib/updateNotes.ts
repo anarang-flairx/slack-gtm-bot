@@ -85,10 +85,25 @@ export async function appendNotesToRecord(
   const current = await getObjectProperties(objectType, match.id, [notesProp]);
   const nextNotes = appendDatedNote(current[notesProp], note);
 
-  await updateObjectProperties(objectType, match.id, {
-    [notesProp]: nextNotes,
-    [dateProp]: todayDatePropertyValue(),
-  });
+  try {
+    await updateObjectProperties(objectType, match.id, {
+      [notesProp]: nextNotes,
+      [dateProp]: todayDatePropertyValue(),
+    });
+  } catch (error) {
+    // Some portals map the activity-date env var to a read-only HubSpot
+    // built-in (e.g. notes_last_updated). In that case, still append the note.
+    if (
+      error instanceof Error &&
+      /READ_ONLY_VALUE|read only property/i.test(error.message)
+    ) {
+      await updateObjectProperties(objectType, match.id, {
+        [notesProp]: nextNotes,
+      });
+    } else {
+      throw error;
+    }
+  }
 
   return match;
 }

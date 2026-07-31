@@ -52,27 +52,30 @@ export function registerMentionHandler(
     }
 
     const channel = event.channel;
-    const threadTs = event.thread_ts ?? event.ts;
-    const conversationKey = `${channel}:${threadTs}`;
+    // Only thread when the mention is already inside a thread; otherwise reply
+    // as a normal channel message.
+    const replyThreadTs = event.thread_ts;
+    const conversationKey = `${channel}:${event.thread_ts ?? event.ts}`;
     const userMessage = stripBotMention(event.text);
     const userId = event.user ?? "";
 
+    const post = (text: string) =>
+      client.chat.postMessage({
+        channel,
+        ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
+        text,
+      });
+
     try {
       if (!userMessage) {
-        await client.chat.postMessage({
-          channel,
-          thread_ts: threadTs,
-          text: "Hey! Mention me with a request, e.g. `@FlairX GTM Bot add a note to Acme Corp — demoed today` or `who hasn't replied to my emails this week?`",
-        });
+        await post(
+          "Hey! Mention me with a request, e.g. `@FlairX GTM Bot add a note to Acme Corp — demoed today` or `who hasn't replied to my emails this week?`",
+        );
         return;
       }
 
       if (echoMode) {
-        await client.chat.postMessage({
-          channel,
-          thread_ts: threadTs,
-          text: `Echo: ${userMessage}`,
-        });
+        await post(`Echo: ${userMessage}`);
         return;
       }
 
@@ -84,7 +87,12 @@ export function registerMentionHandler(
         ...history,
       ];
 
-      const ctx: ToolContext = { client, channel, threadTs, userId };
+      const ctx: ToolContext = {
+        client,
+        channel,
+        ...(replyThreadTs ? { threadTs: replyThreadTs } : {}),
+        userId,
+      };
       let reply = "";
 
       for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
@@ -148,19 +156,13 @@ export function registerMentionHandler(
       }
       conversations.set(conversationKey, history);
 
-      await client.chat.postMessage({
-        channel,
-        thread_ts: threadTs,
-        text: reply,
-      });
+      await post(reply);
     } catch (error) {
       console.error("[mention] failed:", error);
       try {
-        await client.chat.postMessage({
-          channel,
-          thread_ts: threadTs,
-          text: "Sorry, I hit an error handling that mention. Please try again.",
-        });
+        await post(
+          "Sorry, I hit an error handling that mention. Please try again.",
+        );
       } catch (postError) {
         console.error("[mention] failed to post error reply:", postError);
       }
