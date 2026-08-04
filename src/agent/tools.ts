@@ -8,6 +8,7 @@ import {
   getAssociatedCompany,
   getCompanyStatus,
   getLeadStatusMap,
+  getObjectProperties,
   getPipelineMeta,
   findNoteRecords,
   resolveDealsForStageMove,
@@ -20,15 +21,19 @@ import {
 import { buildDailyDigest } from "../digest/buildDailyDigest.js";
 import { createDraftByContactId } from "../lib/createDraft.js";
 import { saveDraft } from "../lib/draftStore.js";
+import { savePendingLeadStatus } from "../lib/leadStatusStore.js";
 import { savePendingNoteUpdate } from "../lib/noteUpdateStore.js";
 import { savePendingProspect } from "../lib/prospectStore.js";
+import { savePendingReminder } from "../lib/reminderStore.js";
 import { savePendingStageMove } from "../lib/stageMoveStore.js";
 import {
   buildCompanyStatusBlocks,
   buildCustomEmailDraftPreviewBlocks,
   buildEmailDraftPreviewBlocks,
+  buildLeadStatusPreviewBlocks,
   buildNoteUpdatePreviewBlocks,
   buildProspectPreviewBlocks,
+  buildReminderPreviewBlocks,
   buildStageMovePreviewBlocks,
 } from "../lib/previews.js";
 import type { ProspectFields } from "../lib/parseProspect.js";
@@ -71,6 +76,30 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       description:
         "List the HubSpot contact lead status options (e.g. New, Attempted, Connected). Use to answer questions about lead stages.",
       parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_lead_status",
+      description:
+        "Change a contact's HubSpot lead status (e.g. to Connected). Lead status is a CONTACT property. Posts an approval card; the status only changes after approval. If multiple contacts match the name, the tool returns a numbered list — show it to the user, ask them to reply with the number, then call this tool again with the chosen contact_id.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Contact name" },
+          status: {
+            type: "string",
+            description: "Target lead status label, e.g. 'Connected'",
+          },
+          contact_id: {
+            type: "string",
+            description:
+              "HubSpot contact id to disambiguate when the name matched multiple contacts (from a prior numbered list). Optional.",
+          },
+        },
+        required: ["name", "status"],
+      },
     },
   },
   {
@@ -218,6 +247,32 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "schedule_follow_up",
+      description:
+        "Set a follow-up reminder for a contact, company, or deal in N days. Posts an approval card; on approve it creates a HubSpot task due then AND schedules a Slack nudge. Use for 'remind me to follow up with X in N days'.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "Contact, company, or deal name",
+          },
+          days: {
+            type: "number",
+            description: "Days from now until the reminder (e.g. 2)",
+          },
+          note: {
+            type: "string",
+            description: "Optional context for the reminder",
+          },
+        },
+        required: ["name", "days"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "list_unanswered_emails",
       description:
         "List sent Gmail threads where the CEO sent the last message and no reply has arrived within `days`. Use to find people who need a follow-up.",
@@ -301,6 +356,78 @@ async function runUpdateNotes(
   );
 
   return `Posted an approval card to append a note to ${result.type} "${result.name}". Waiting for the user to Approve or Discard.`;
+}
+
+async function runUpdateLeadStatus(
+  ctx: ToolContext,
+  name: string,
+  status: string,
+  contactId: string,
+): Promise<string> {
+  const statusLabel = status.trim();
+  if (!statusLabel) {
+    return "Missing target lead status.";
+  }
+
+  const statusMap = await getLeadStatusMap();
+  const statusValue = statusMap.get(statusLabel.toLowerCase());
+  if (!statusValue) {
+    const valid = Array.from(statusMap.keys()).join(", ");
+    return `"${statusLabel}" is not a valid lead status. Valid options: ${valid}.`;
+  }
+
+  let contact: { id: string; name: string; email: string } | undefined;
+
+  if (contactId) {
+    const props = await getObjectProperties("contacts", contactId, [
+      "firstname",
+      "lastname",
+      "email",
+    ]);
+    const fullName =
+      `${props.firstname ?? ""} ${props.lastname ?? ""}`.trim() ||
+      "Unknown contact";
+    contact = { id: contactId, name: fullName, email: props.email ?? "" };
+  } else {
+    const matches = await findContactsByName(name);
+    if (matches.length === 0) {
+      return `No contact found named "${name}".`;
+    }
+    if (matches.length > 1) {
+      const options = matches
+        .map(
+          (m, i) =>
+            `${i + 1}. ${m.name}${m.email ? ` — ${m.email}` : " — (no email)"}${m.company ? ` @ ${m.company}` : ""} (contact_id: ${m.id})`,
+        )
+        .join("\n");
+      return `Multiple contacts match "${name}". Show the user this NUMBERED list (do not show the contact_id) and ask them to reply with just the number. When they pick one, call update_lead_status again with that contact_id and status "${statusLabel}". Do not ask for any other confirmation.\n${options}`;
+    }
+    contact = matches[0];
+  }
+
+  const pending = savePendingLeadStatus({
+    contactId: contact.id,
+    contactName: contact.name,
+    contactEmail: contact.email,
+    statusLabel,
+    statusValue,
+    createdBy: ctx.userId,
+    channelId: ctx.channel,
+    ...(ctx.threadTs ? { threadTs: ctx.threadTs } : {}),
+  });
+
+  await postCard(
+    ctx,
+    `Lead status update ready for ${contact.name}`,
+    buildLeadStatusPreviewBlocks(
+      contact.name,
+      contact.email,
+      statusLabel,
+      pending.id,
+    ),
+  );
+
+  return `Posted an approval card to set ${contact.name}'s lead status to "${statusLabel}". Waiting for the user to Approve or Discard.`;
 }
 
 async function runAddProspect(
@@ -520,6 +647,54 @@ async function runDraftCustomEmail(
   return `Posted an approval card for a custom email to ${to}. Waiting for the user to Approve or Discard.`;
 }
 
+async function runScheduleFollowUp(
+  ctx: ToolContext,
+  name: string,
+  days: number,
+  note: string,
+): Promise<string> {
+  const result = await findNoteRecords(name);
+  if (Array.isArray(result)) {
+    const options = result.map(formatMatch).join("\n");
+    return `Multiple records matched "${name}". Ask the user which one:\n${options}`;
+  }
+
+  const safeDays = Number.isFinite(days) && days > 0 ? Math.round(days) : 1;
+  const dueMs = Date.now() + safeDays * 86_400_000;
+  const dueLabel = new Date(dueMs).toLocaleDateString("en-US", {
+    timeZone: "America/Los_Angeles",
+    month: "short",
+    day: "numeric",
+  });
+
+  const pending = savePendingReminder({
+    recordType: result.type,
+    recordId: result.id,
+    recordName: result.name,
+    note,
+    days: safeDays,
+    dueMs,
+    createdBy: ctx.userId,
+    channelId: ctx.channel,
+    ...(ctx.threadTs ? { threadTs: ctx.threadTs } : {}),
+  });
+
+  await postCard(
+    ctx,
+    `Reminder ready for ${result.name}`,
+    buildReminderPreviewBlocks(
+      result.name,
+      result.type,
+      dueLabel,
+      safeDays,
+      note,
+      pending.id,
+    ),
+  );
+
+  return `Posted an approval card to remind about ${result.type} "${result.name}" in ${safeDays} day(s) (due ${dueLabel}). Waiting for the user to Approve or Discard.`;
+}
+
 async function runSummarizeEmailToNotes(
   ctx: ToolContext,
   contactName: string,
@@ -666,11 +841,27 @@ export async function executeTool(
         String(args.note ?? ""),
       );
 
+    case "update_lead_status":
+      return runUpdateLeadStatus(
+        ctx,
+        String(args.name ?? ""),
+        String(args.status ?? ""),
+        args.contact_id ? String(args.contact_id) : "",
+      );
+
     case "add_prospect":
       return runAddProspect(ctx, args);
 
     case "move_deal_stage":
       return runMoveDealStage(ctx, args);
+
+    case "schedule_follow_up":
+      return runScheduleFollowUp(
+        ctx,
+        String(args.name ?? ""),
+        typeof args.days === "number" ? args.days : Number(args.days ?? 0),
+        args.note ? String(args.note) : "",
+      );
 
     case "draft_email":
       return runDraftEmail(

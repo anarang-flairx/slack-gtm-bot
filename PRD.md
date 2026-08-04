@@ -92,6 +92,40 @@ Everyone else in the Slack workspace who benefits from ambient pipeline visibili
 - Multiple badges in one photo → Flare posts one confirmation card per person detected.
 - Batch mode: multiple photos in one message are processed as a queue with one card each.
 
+#### 3.1.1 Implementation on the current bot (no-Apollo path)
+
+The bot today is mention-driven and gates every write behind an Approve/Discard card (the same pattern used for `add_prospect`, note updates, and reminders). Badge scan slots into that architecture without Apollo:
+
+**What it will be able to do:**
+
+1. **Intake** — the user `@`-mentions the bot in a channel and attaches one or more badge/business-card photos, optionally with context: `@Flare met these at SaaStr 2026, all want demos`. The bot reads `event.files` (today it only reads `event.text`, so this is the core new work) and keeps only image files.
+2. **Download** — each image is fetched from Slack's `url_private` using the bot token. Requires the **`files:read`** scope (Slack app reinstall).
+3. **Vision OCR** — images are sent to the vision-capable model (`gpt-4.1`) with a structured JSON schema requesting: full name, job title, company, email, phone, location, plus a per-field confidence. **Multiple people in a single photo** are returned as separate entries.
+4. **Per-badge preview** — for each detected person the bot reuses the `add_prospect` flow and posts one **Approve/Discard card**, pre-filled with the OCR'd fields, the **lead source** (conference name parsed from the message), and the context note. Low-confidence or missing fields (e.g. no printed email) are flagged on the card for the user to fill in.
+5. **On approve (full prospect)** — creates **contact + company + a deal in the Prospecting stage** (deduping against existing records), stamps lead source, logs the context note, and replies with links to the created records.
+
+**Deltas from the full 3.1 vision:** no Apollo enrichment in this path, so fields are limited to what's printed on the badge plus what the user adds — company size, industry, ATS, and verified/waterfalled email are **not** auto-filled yet. Apollo enrichment (step 3 of the full flow) remains a later add that plugs in between OCR and the preview card. Everything else — dedupe, one-card-per-badge, batch queue, record links — is achievable on the current stack.
+
+**New pieces required:** `files:read` scope; file-download + base64 helper; a `scan_badges` path in the mention handler (image branch); a vision extraction call with a JSON schema; and reuse of the existing prospect store + preview card, one per detected person.
+
+#### 3.1.2 Build vs. buy — HubSpot mobile business-card scanner
+
+HubSpot's mobile app includes a built-in business-card scanner that OCRs a card and creates a contact. It's worth weighing against the bot path:
+
+| Dimension | HubSpot mobile scanner | Flare badge scan (this bot) |
+|---|---|---|
+| Build effort | Zero — already exists | Requires the work in 3.1.1 |
+| What it creates | **Contact only** | **Full prospect: contact + company + deal (Prospecting)** |
+| Lead source / context note | Manual afterward | Parsed from the Slack message, set on approve |
+| Multiple badges in one photo | No (one card at a time) | Yes (one preview card each) |
+| Batch capture | One at a time in the app | Drop many photos in one Slack message |
+| Where you do it | On the phone, in the moment | Anytime, from Slack (desktop or mobile) |
+| Team visibility / approval | Private to the scanning user | Team-visible card with Approve/Discard |
+| Dedupe against your pipeline | Basic | Tuned to your objects/associations |
+| Enrichment | None (native) | None today; Apollo is a planned add |
+
+**Recommendation:** the HubSpot scanner is a perfectly good **zero-effort stopgap** for solo, contact-only capture and as an **offline fallback** at a booth with no signal. But it stops at a contact — it won't create the company, the Prospecting deal, the lead source, or the context note, and it isn't team-visible. Since the stated need is **full prospect** creation with review, the Slack-bot path (3.1.1) is the better primary flow, with the HubSpot scanner kept as a manual fallback. The two can coexist.
+
 ### 3.2 Follow-up Reminders and Daily Digest
 
 **User story:** *As the CEO, I want a daily summary of deals needing my attention and targeted nudges for specific commitments, so nothing falls through the cracks even when my calendar is full.*

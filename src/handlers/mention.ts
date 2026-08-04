@@ -5,9 +5,12 @@ import { executeTool, toolDefinitions, type ToolContext } from "../agent/tools.j
 type StoredMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
 const conversations = new Map<string, StoredMessage[]>();
-const MAX_HISTORY_MESSAGES = 20;
+const MAX_HISTORY_MESSAGES = 10;
 const MAX_TOOL_ITERATIONS = 8;
 const MODEL = process.env.OPENAI_MODEL ?? "gpt-4.1";
+// Short confirmations/answers ("yes", "the first one") route to a cheaper model.
+const CHEAP_MODEL = process.env.OPENAI_CHEAP_MODEL ?? "gpt-4.1-mini";
+const TRIVIAL_REPLY_MAX_WORDS = 6;
 
 const SYSTEM_PROMPT = `You are FlairX GTM Bot, a go-to-market assistant that lives in Slack for FlairX (an AI interview platform). The team mentions you in plain English and you take GTM actions in HubSpot and Gmail.
 
@@ -15,19 +18,67 @@ You can:
 - Answer questions about the sales pipeline stages and contact lead statuses.
 - Look up records and post a company status card (deals, contacts, notes, last activity).
 - Add a dated note to a contact, company, or deal (this also refreshes the last-activity date).
+- Change a contact's lead status (e.g. to Connected).
 - Add a new prospect (contact + optional company + a deal in Prospecting).
 - Move a deal to a different pipeline stage.
+- Set a follow-up reminder in N days (creates a HubSpot task + a scheduled Slack nudge).
 - Draft templated or custom emails into Gmail Drafts, and find sent emails that have not been replied to.
 - Summarize an email thread into notes on the matching contact and its company.
 
 Rules:
+- A single request can require multiple actions — call each relevant tool. For example, "update notes for Acme — demoed today, and remind me to follow up in 2 days" should call both update_notes and schedule_follow_up, producing two approval cards.
 - Every action that writes to HubSpot or Gmail posts an approval card with Approve/Discard buttons. You never complete a write yourself; after calling a write tool, tell the user you posted a preview for them to approve. Do not claim a record was created, moved, or drafted — only that a preview is ready.
 - The bot never sends email; drafts are saved to Gmail Drafts for a human to send.
-- When a tool reports multiple matches, ask the user a short clarifying question listing the options. Do not guess.
+- The approval card IS the confirmation step. Never ask the user to verbally confirm an action before you post its card (do not say "just to confirm" or "shall I proceed?"). As soon as you know what to do, call the tool so the card appears; the user confirms by clicking Approve.
+- Disambiguation happens at most once. When a tool reports multiple matches, present them to the user as a NUMBERED list exactly like "1. ...", "2. ...", and ask them to "reply with the number". Do not list the internal ids. When the user replies with a number (or otherwise names one), immediately call the tool again for that specific record — do NOT ask another clarifying or confirmation question. Never re-ask something the user already answered.
+- Changing a contact's lead status is a CONTACT action — use update_lead_status, not notes and not deals. Do not offer a deal as an option for a lead-status change.
+- The conversation may span several Slack messages in a thread. Use the prior turns as context: if you asked a clarifying question and the user answers ("yes", "the first one", an email, "1", etc.), act on it using the earlier context instead of starting over. Never reply with a generic greeting mid-conversation.
 - When you post a card (e.g. company status), keep your text reply short since the card carries the detail.
 - To move a deal "forward" or to the "next" stage, first call get_pipeline_stages and get the current stage (via get_company_status or search_records), then pass the exact next stage label.
 - To draft a context-aware follow-up to an unanswered email, use list_unanswered_emails, then get_email_thread, then draft_custom_email with a body referencing that thread.
 - Stay within GTM scope. Be concise.`;
+
+const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
+Just mention me in plain English (e.g. _@FlairX GTM Bot add a note to Acme_). Anything that changes HubSpot or Gmail posts an *Approve/Discard* card first — I never write or send until you approve.
+
+*Ask / look up*
+• Pipeline stages — _"what are the sales pipeline stages?"_
+• Lead statuses — _"what lead statuses do we have?"_
+• Find a record — _"look up Acme Corp"_
+• Company status — _"what's the status of Acme Corp?"_ (deals, contacts, notes, last activity)
+• Daily digest — _"post the digest"_ (pipeline snapshot, stalled deals, follow-ups due, overdue tasks)
+
+*Update HubSpot*
+• Add a note — _"add a note to Acme Corp — demoed today, wants pricing"_ (also refreshes last-activity date)
+• Change lead status — _"set Navin Chugh's lead status to Connected"_
+• Add a prospect — _"add Jane Doe, VP Talent at Acme, jane@acme.com to HubSpot"_ (contact + company + Prospecting deal)
+• Move a deal stage — _"move the Acme deal to Negotiation"_
+
+*Reminders*
+• Follow-up reminder — _"remind me to follow up with Acme in 2 days"_ (creates a HubSpot task + a scheduled Slack nudge)
+
+*Email (drafts only — I never send)*
+• Templated draft — _"draft an intro email to Jane Doe"_ or _"event follow-up to Jane Doe"_
+• Custom draft — _"draft a follow-up to jane@acme.com about scheduling the demo"_
+• Find unanswered — _"who hasn't replied to my emails?"_
+• Summarize a thread into notes — _"summarize Jane's last email into her notes"_
+
+*Tips*
+• You can combine actions: _"add a note to Acme — great demo, and remind me to follow up in 2 days"_.
+• If several records match, I'll show a numbered list — just reply with the number.
+• Type _help_ anytime to see this again.`;
+
+function isHelpRequest(text: string): boolean {
+  const normalized = text.trim().toLowerCase().replace(/[?!.]+$/, "");
+  return (
+    normalized === "help" ||
+    normalized === "help me" ||
+    normalized === "commands" ||
+    normalized === "menu" ||
+    normalized === "what can you do" ||
+    normalized === "what can you do for me"
+  );
+}
 
 function stripBotMention(text: string): string {
   return text.replace(/<@[A-Z0-9]+>/g, "").trim();
@@ -41,131 +92,209 @@ function parseArgs(raw: string): Record<string, unknown> {
   }
 }
 
+/** Short answers/confirmations that don't need the flagship model. */
+function isTrivialReply(text: string): boolean {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  return words.length > 0 && words.length <= TRIVIAL_REPLY_MAX_WORDS;
+}
+
+/**
+ * Runs one agent turn for a conversation identified by (channel, threadTs).
+ * Replies are always posted into that thread so follow-up messages in the same
+ * thread map back to the same stored history.
+ */
+async function runAgentTurn(
+  client: App["client"],
+  openai: OpenAI | null,
+  echoMode: boolean,
+  params: {
+    channel: string;
+    threadTs: string;
+    userMessage: string;
+    userId: string;
+  },
+): Promise<void> {
+  const { channel, threadTs, userMessage, userId } = params;
+  const conversationKey = `${channel}:${threadTs}`;
+
+  const post = (text: string) =>
+    client.chat.postMessage({ channel, thread_ts: threadTs, text });
+
+  try {
+    if (!userMessage) {
+      await post(
+        "Hey! Mention me with a request, e.g. _add a note to Acme Corp — demoed today_ or _who hasn't replied to my emails this week?_ — or say *help* to see everything I can do.",
+      );
+      return;
+    }
+
+    if (echoMode) {
+      await post(`Echo: ${userMessage}`);
+      return;
+    }
+
+    // Fast-path: "help" is deterministic, so skip the model entirely.
+    if (isHelpRequest(userMessage)) {
+      await post(HELP_TEXT);
+      return;
+    }
+
+    const history = conversations.get(conversationKey) ?? [];
+    history.push({ role: "user", content: userMessage });
+
+    const messages: StoredMessage[] = [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...history,
+    ];
+
+    const ctx: ToolContext = {
+      client,
+      channel,
+      threadTs,
+      userId,
+    };
+    // Short follow-ups ("yes", "the first one") use the cheaper model; the
+    // full thread history still gives it the context it needs to act.
+    const model = isTrivialReply(userMessage) ? CHEAP_MODEL : MODEL;
+    let reply = "";
+
+    for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
+      const completion = await openai!.chat.completions.create({
+        model,
+        messages,
+        tools: toolDefinitions,
+        tool_choice: "auto",
+      });
+
+      const choice = completion.choices[0]?.message;
+      if (!choice) {
+        reply = "Sorry, I had trouble thinking of a response.";
+        break;
+      }
+
+      messages.push(choice);
+
+      if (choice.tool_calls && choice.tool_calls.length > 0) {
+        for (const call of choice.tool_calls) {
+          if (call.type !== "function") {
+            continue;
+          }
+          let result: string;
+          try {
+            result = await executeTool(
+              call.function.name,
+              parseArgs(call.function.arguments),
+              ctx,
+            );
+          } catch (error) {
+            result =
+              error instanceof Error
+                ? `Error: ${error.message}`
+                : "Error running that action.";
+          }
+          messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            content: result,
+          });
+        }
+        continue;
+      }
+
+      reply =
+        typeof choice.content === "string" && choice.content.trim()
+          ? choice.content
+          : "Done.";
+      break;
+    }
+
+    if (!reply) {
+      reply =
+        "I wasn't able to finish that in a reasonable number of steps. Could you narrow the request?";
+    }
+
+    // Persist only plain user/assistant turns so trimming can't orphan a
+    // tool message (which would break the next OpenAI request).
+    history.push({ role: "assistant", content: reply });
+    if (history.length > MAX_HISTORY_MESSAGES) {
+      history.splice(0, history.length - MAX_HISTORY_MESSAGES);
+    }
+    conversations.set(conversationKey, history);
+
+    await post(reply);
+  } catch (error) {
+    console.error("[agent] turn failed:", error);
+    try {
+      await post("Sorry, I hit an error handling that. Please try again.");
+    } catch (postError) {
+      console.error("[agent] failed to post error reply:", postError);
+    }
+  }
+}
+
 export function registerMentionHandler(
   app: App,
   echoMode: boolean,
   openai: OpenAI | null,
 ): void {
+  // Direct @mention: starts a conversation (or continues one when mentioned
+  // inside an existing thread). Replies are threaded on the mention so later
+  // messages in that thread continue the same conversation.
   app.event("app_mention", async ({ event, client }) => {
     if (!("text" in event) || !event.text) {
       return;
     }
 
     const channel = event.channel;
-    // Only thread when the mention is already inside a thread; otherwise reply
-    // as a normal channel message.
-    const replyThreadTs = event.thread_ts;
-    const conversationKey = `${channel}:${event.thread_ts ?? event.ts}`;
+    const threadTs = event.thread_ts ?? event.ts;
     const userMessage = stripBotMention(event.text);
     const userId = event.user ?? "";
 
-    const post = (text: string) =>
-      client.chat.postMessage({
-        channel,
-        ...(replyThreadTs ? { thread_ts: replyThreadTs } : {}),
-        text,
-      });
+    await runAgentTurn(client, openai, echoMode, {
+      channel,
+      threadTs,
+      userMessage,
+      userId,
+    });
+  });
 
-    try {
-      if (!userMessage) {
-        await post(
-          "Hey! Mention me with a request, e.g. `@FlairX GTM Bot add a note to Acme Corp — demoed today` or `who hasn't replied to my emails this week?`",
-        );
-        return;
-      }
+  // Plain messages inside a thread the bot is already engaged in: continue the
+  // conversation without requiring another @mention (e.g. answering "yes").
+  app.event("message", async ({ event, client, context }) => {
+    const msg = event as {
+      subtype?: string;
+      text?: string;
+      user?: string;
+      bot_id?: string;
+      thread_ts?: string;
+      ts: string;
+      channel: string;
+    };
 
-      if (echoMode) {
-        await post(`Echo: ${userMessage}`);
-        return;
-      }
-
-      const history = conversations.get(conversationKey) ?? [];
-      history.push({ role: "user", content: userMessage });
-
-      const messages: StoredMessage[] = [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...history,
-      ];
-
-      const ctx: ToolContext = {
-        client,
-        channel,
-        ...(replyThreadTs ? { threadTs: replyThreadTs } : {}),
-        userId,
-      };
-      let reply = "";
-
-      for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-        const completion = await openai!.chat.completions.create({
-          model: MODEL,
-          messages,
-          tools: toolDefinitions,
-          tool_choice: "auto",
-        });
-
-        const choice = completion.choices[0]?.message;
-        if (!choice) {
-          reply = "Sorry, I had trouble thinking of a response.";
-          break;
-        }
-
-        messages.push(choice);
-
-        if (choice.tool_calls && choice.tool_calls.length > 0) {
-          for (const call of choice.tool_calls) {
-            if (call.type !== "function") {
-              continue;
-            }
-            let result: string;
-            try {
-              result = await executeTool(
-                call.function.name,
-                parseArgs(call.function.arguments),
-                ctx,
-              );
-            } catch (error) {
-              result =
-                error instanceof Error
-                  ? `Error: ${error.message}`
-                  : "Error running that action.";
-            }
-            messages.push({
-              role: "tool",
-              tool_call_id: call.id,
-              content: result,
-            });
-          }
-          continue;
-        }
-
-        reply =
-          typeof choice.content === "string" && choice.content.trim()
-            ? choice.content
-            : "Done.";
-        break;
-      }
-
-      if (!reply) {
-        reply =
-          "I wasn't able to finish that in a reasonable number of steps. Could you narrow the request?";
-      }
-
-      history.push({ role: "assistant", content: reply });
-      if (history.length > MAX_HISTORY_MESSAGES) {
-        history.splice(0, history.length - MAX_HISTORY_MESSAGES);
-      }
-      conversations.set(conversationKey, history);
-
-      await post(reply);
-    } catch (error) {
-      console.error("[mention] failed:", error);
-      try {
-        await post(
-          "Sorry, I hit an error handling that mention. Please try again.",
-        );
-      } catch (postError) {
-        console.error("[mention] failed to post error reply:", postError);
-      }
+    // Ignore edits, joins, bot messages, and anything without text.
+    if (msg.subtype || msg.bot_id || !msg.text) {
+      return;
     }
+    // Only continue threaded replies.
+    if (!msg.thread_ts) {
+      return;
+    }
+    // Mentions are handled by app_mention; skip to avoid double replies.
+    const botUserId = context.botUserId;
+    if (botUserId && msg.text.includes(`<@${botUserId}>`)) {
+      return;
+    }
+    // Only respond in threads the bot is actively part of.
+    const conversationKey = `${msg.channel}:${msg.thread_ts}`;
+    if (!conversations.has(conversationKey)) {
+      return;
+    }
+
+    await runAgentTurn(client, openai, echoMode, {
+      channel: msg.channel,
+      threadTs: msg.thread_ts,
+      userMessage: msg.text.trim(),
+      userId: msg.user ?? "",
+    });
   });
 }

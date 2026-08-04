@@ -285,6 +285,106 @@ export function buildStageMovePreviewBlocks(
   ];
 }
 
+export function buildLeadStatusPreviewBlocks(
+  contactName: string,
+  contactEmail: string,
+  statusLabel: string,
+  pendingId: string,
+): KnownBlock[] {
+  return [
+    {
+      type: "header",
+      text: { type: "plain_text", text: "Lead status update preview" },
+    },
+    {
+      type: "section",
+      fields: [
+        {
+          type: "mrkdwn",
+          text: `*Contact:*\n${contactName}${contactEmail ? ` (${contactEmail})` : ""}`,
+        },
+        { type: "mrkdwn", text: `*New lead status:*\n${statusLabel}` },
+      ],
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Approve → update status" },
+          style: "primary",
+          action_id: "approve_lead_status",
+          value: pendingId,
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Discard" },
+          style: "danger",
+          action_id: "discard_lead_status",
+          value: pendingId,
+        },
+      ],
+    },
+  ];
+}
+
+export function buildReminderPreviewBlocks(
+  recordName: string,
+  recordType: NoteRecordMatch["type"],
+  dueLabel: string,
+  days: number,
+  note: string,
+  pendingId: string,
+): KnownBlock[] {
+  return [
+    {
+      type: "header",
+      text: { type: "plain_text", text: "Follow-up reminder preview" },
+    },
+    {
+      type: "section",
+      fields: [
+        { type: "mrkdwn", text: `*Record:*\n${recordName} (${recordType})` },
+        { type: "mrkdwn", text: `*When:*\nin ${days} day(s) — ${dueLabel}` },
+      ],
+    },
+    ...(note
+      ? ([
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: `*Note:*\n${note}` },
+          },
+        ] as KnownBlock[])
+      : []),
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "On approve: create a HubSpot task due then and schedule a Slack nudge in this channel.",
+      },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Approve → set reminder" },
+          style: "primary",
+          action_id: "approve_reminder",
+          value: pendingId,
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Discard" },
+          style: "danger",
+          action_id: "discard_reminder",
+          value: pendingId,
+        },
+      ],
+    },
+  ];
+}
+
 function truncateInline(text: string, max = 300): string {
   if (text.length <= max) {
     return text;

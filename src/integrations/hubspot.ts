@@ -943,6 +943,51 @@ export async function associateDefault(
   );
 }
 
+const RECORD_OBJECT_TYPE: Record<
+  NoteRecordType,
+  "contacts" | "companies" | "deals"
+> = {
+  contact: "contacts",
+  company: "companies",
+  deal: "deals",
+};
+
+/** Create a HubSpot task (engagement) due at dueMs, optionally owned. */
+export async function createTask(opts: {
+  subject: string;
+  dueMs: number;
+  body?: string;
+  ownerId?: string;
+}): Promise<{ id: string }> {
+  const properties: Record<string, string> = {
+    hs_task_subject: opts.subject,
+    hs_timestamp: String(opts.dueMs),
+    hs_task_status: "NOT_STARTED",
+    hs_task_type: "TODO",
+    ...(opts.body ? { hs_task_body: opts.body } : {}),
+    ...(opts.ownerId ? { hubspot_owner_id: opts.ownerId } : {}),
+  };
+
+  const data = await hubspotFetch<{ id: string }>("/crm/v3/objects/tasks", {
+    method: "POST",
+    body: JSON.stringify({ properties }),
+  });
+  return { id: data.id };
+}
+
+/** Associate a task with a contact, company, or deal using the default type. */
+export async function associateTaskToRecord(
+  taskId: string,
+  recordType: NoteRecordType,
+  recordId: string,
+): Promise<void> {
+  const toType = RECORD_OBJECT_TYPE[recordType];
+  await hubspotFetch(
+    `/crm/v4/objects/tasks/${taskId}/associations/default/${toType}/${recordId}`,
+    { method: "PUT" },
+  );
+}
+
 export type CreateProspectInput = {
   firstName: string;
   lastName: string;

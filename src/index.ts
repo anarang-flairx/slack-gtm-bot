@@ -5,7 +5,9 @@ import { registerDigestActions } from "./handlers/digestActions.js";
 import { registerEmailActions } from "./handlers/emailActions.js";
 import { registerMentionHandler } from "./handlers/mention.js";
 import { registerNoteActions } from "./handlers/noteActions.js";
+import { registerLeadStatusActions } from "./handlers/leadStatusActions.js";
 import { registerProspectActions } from "./handlers/prospectActions.js";
+import { registerReminderActions } from "./handlers/reminderActions.js";
 import { registerStageMoveActions } from "./handlers/stageMoveActions.js";
 
 const echoMode = process.env.DEV_ECHO_MODE === "true";
@@ -43,6 +45,8 @@ registerEmailActions(app);
 registerNoteActions(app);
 registerProspectActions(app);
 registerStageMoveActions(app);
+registerReminderActions(app);
+registerLeadStatusActions(app);
 registerDigestActions(app);
 
 (async () => {
