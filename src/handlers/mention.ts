@@ -45,7 +45,6 @@ Rules:
 - Stay within GTM scope. Be concise.`;
 
 const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
-Just mention me in plain English (e.g. _@FlairX GTM Bot add a note to Acme_). Anything that changes HubSpot or Gmail posts an *Approve/Discard* card first — I never write or send until you approve.
 
 *Ask / look up*
 • Pipeline stages — _"what are the sales pipeline stages?"_

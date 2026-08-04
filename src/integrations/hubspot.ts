@@ -751,6 +751,79 @@ export async function findCompaniesByName(
   }));
 }
 
+export async function findContactByEmail(
+  email: string,
+): Promise<{ id: string; name: string } | null> {
+  const query = email.trim().toLowerCase();
+  if (!query) {
+    return null;
+  }
+
+  const search = await hubspotFetch<HubSpotSearchResponse>(
+    "/crm/v3/objects/contacts/search",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        filterGroups: [
+          { filters: [{ propertyName: "email", operator: "EQ", value: query }] },
+        ],
+        properties: ["firstname", "lastname", "email"],
+        limit: 1,
+      }),
+    },
+  );
+
+  const contact = search.results[0];
+  if (!contact) {
+    return null;
+  }
+  const first = contact.properties.firstname?.trim() ?? "";
+  const last = contact.properties.lastname?.trim() ?? "";
+  return {
+    id: contact.id,
+    name:
+      `${first} ${last}`.trim() ||
+      contact.properties.email?.trim() ||
+      "Unknown contact",
+  };
+}
+
+export async function findCompanyByDomain(
+  domain: string,
+): Promise<{ id: string; name: string } | null> {
+  const query = domain.trim().toLowerCase();
+  if (!query) {
+    return null;
+  }
+
+  const search = await hubspotFetch<HubSpotSearchResponse>(
+    "/crm/v3/objects/companies/search",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        filterGroups: [
+          {
+            filters: [
+              { propertyName: "domain", operator: "EQ", value: query },
+            ],
+          },
+        ],
+        properties: ["name", "domain"],
+        limit: 1,
+      }),
+    },
+  );
+
+  const company = search.results[0];
+  if (!company) {
+    return null;
+  }
+  return {
+    id: company.id,
+    name: company.properties.name?.trim() || "Untitled company",
+  };
+}
+
 export async function findContactsByName(
   name: string,
 ): Promise<Array<{ id: string; name: string; email: string; company: string }>> {
