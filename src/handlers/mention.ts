@@ -1,6 +1,12 @@
 import type { App } from "@slack/bolt";
 import type OpenAI from "openai";
 import { executeTool, toolDefinitions, type ToolContext } from "../agent/tools.js";
+import {
+  fetchSlackImageAsDataUrl,
+  imageFilesFrom,
+  type SlackFile,
+} from "../lib/slackFiles.js";
+import { extractLeadsFromImages } from "../lib/visionExtract.js";
 
 type StoredMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -47,6 +53,10 @@ Just mention me in plain English (e.g. _@FlairX GTM Bot add a note to Acme_). An
 • Find a record — _"look up Acme Corp"_
 • Company status — _"what's the status of Acme Corp?"_ (deals, contacts, notes, last activity)
 • Daily digest — _"post the digest"_ (pipeline snapshot, stalled deals, follow-ups due, overdue tasks)
+
+*Capture leads from photos*
+• Send a badge or business-card photo (with an optional note like _"met at SaaStr, wants a demo"_) and I'll read the details and post an add-prospect card. Multiple people in one photo? I'll post one card each.
+• Send a screenshot of a WhatsApp/LinkedIn message and I'll pull out the sender as a new lead.
 
 *Update HubSpot*
 • Add a note — _"add a note to Acme Corp — demoed today, wants pricing"_ (also refreshes last-activity date)
@@ -232,6 +242,89 @@ async function runAgentTurn(
   }
 }
 
+/**
+ * Handles a mention/message that includes image attachments: downloads each
+ * image, runs vision OCR to extract lead(s) from badges/business cards or
+ * WhatsApp/LinkedIn screenshots, and posts an add-prospect approval card per
+ * person found. Approval creates the full contact + company + deal.
+ */
+async function runImageCapture(
+  client: App["client"],
+  openai: OpenAI | null,
+  params: {
+    channel: string;
+    threadTs: string;
+    files: SlackFile[];
+    context: string;
+    userId: string;
+  },
+): Promise<void> {
+  const { channel, threadTs, files, context, userId } = params;
+  const post = (text: string) =>
+    client.chat.postMessage({ channel, thread_ts: threadTs, text });
+
+  if (!openai) {
+    await post("Image scanning needs OpenAI, which isn't configured right now.");
+    return;
+  }
+
+  try {
+    const botToken = process.env.SLACK_BOT_TOKEN ?? "";
+    const dataUrls: string[] = [];
+    for (const file of files) {
+      const url = await fetchSlackImageAsDataUrl(file, botToken);
+      if (url) {
+        dataUrls.push(url);
+      }
+    }
+
+    if (dataUrls.length === 0) {
+      await post("I couldn't download those images. Please try again.");
+      return;
+    }
+
+    const leads = await extractLeadsFromImages(openai, dataUrls, context);
+    if (leads.length === 0) {
+      await post(
+        "I couldn't read any contact details from that. Try a clearer photo, or just type the details and I'll add them.",
+      );
+      return;
+    }
+
+    const ctx: ToolContext = { client, channel, threadTs, userId };
+    for (const lead of leads) {
+      const args: Record<string, unknown> = {
+        first_name: lead.firstName,
+        last_name: lead.lastName,
+        company_name: lead.company,
+        email: lead.email,
+        phone: lead.phone,
+        mobile: lead.mobile,
+        title: lead.title,
+        linkedin: lead.linkedin,
+        source: lead.source || context || undefined,
+        notes: lead.notes,
+      };
+      await executeTool("add_prospect", args, ctx);
+    }
+
+    // Mark the thread active so plain follow-ups continue the conversation.
+    const conversationKey = `${channel}:${threadTs}`;
+    if (!conversations.has(conversationKey)) {
+      conversations.set(conversationKey, []);
+    }
+
+    await post(
+      leads.length === 1
+        ? "Found 1 lead — review the card above and click Approve to add it to HubSpot."
+        : `Found ${leads.length} leads — review the cards above and Approve the ones you want in HubSpot.`,
+    );
+  } catch (error) {
+    console.error("[image-capture] failed:", error);
+    await post("Sorry, I hit an error reading those images. Please try again.");
+  }
+}
+
 export function registerMentionHandler(
   app: App,
   echoMode: boolean,
@@ -249,6 +342,20 @@ export function registerMentionHandler(
     const threadTs = event.thread_ts ?? event.ts;
     const userMessage = stripBotMention(event.text);
     const userId = event.user ?? "";
+
+    // Photos of badges/business cards or WhatsApp/LinkedIn screenshots →
+    // vision OCR + add-prospect cards.
+    const images = imageFilesFrom(event as unknown as { files?: SlackFile[] });
+    if (images.length > 0) {
+      await runImageCapture(client, openai, {
+        channel,
+        threadTs,
+        files: images,
+        context: userMessage,
+        userId,
+      });
+      return;
+    }
 
     await runAgentTurn(client, openai, echoMode, {
       channel,
@@ -269,10 +376,14 @@ export function registerMentionHandler(
       thread_ts?: string;
       ts: string;
       channel: string;
+      files?: SlackFile[];
     };
 
-    // Ignore edits, joins, bot messages, and anything without text.
-    if (msg.subtype || msg.bot_id || !msg.text) {
+    // Ignore bot messages; allow normal messages and file uploads only.
+    if (msg.bot_id) {
+      return;
+    }
+    if (msg.subtype && msg.subtype !== "file_share") {
       return;
     }
     // Only continue threaded replies.
@@ -281,12 +392,29 @@ export function registerMentionHandler(
     }
     // Mentions are handled by app_mention; skip to avoid double replies.
     const botUserId = context.botUserId;
-    if (botUserId && msg.text.includes(`<@${botUserId}>`)) {
+    if (botUserId && (msg.text ?? "").includes(`<@${botUserId}>`)) {
       return;
     }
     // Only respond in threads the bot is actively part of.
     const conversationKey = `${msg.channel}:${msg.thread_ts}`;
     if (!conversations.has(conversationKey)) {
+      return;
+    }
+
+    // Images dropped into an active thread → vision OCR + add-prospect cards.
+    const images = imageFilesFrom(msg);
+    if (images.length > 0) {
+      await runImageCapture(client, openai, {
+        channel: msg.channel,
+        threadTs: msg.thread_ts,
+        files: images,
+        context: (msg.text ?? "").trim(),
+        userId: msg.user ?? "",
+      });
+      return;
+    }
+
+    if (!msg.text) {
       return;
     }
 
