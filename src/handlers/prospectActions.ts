@@ -1,12 +1,13 @@
 import type { App } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
-import { createGmailDraft } from "../integrations/gmail.js";
+import { hubspotRecordUrl } from "../digest/format.js";
+import { createProspect } from "../integrations/hubspot.js";
 import {
-  beginDraftAction,
-  completeDraftAction,
-  releaseDraftAction,
-  takeDraft,
-} from "../lib/draftStore.js";
+  beginProspectAction,
+  completeProspectAction,
+  releaseProspectAction,
+  takeProspect,
+} from "../lib/prospectStore.js";
 import { postThread } from "../lib/slackPost.js";
 
 function actionContext(body: {
@@ -26,7 +27,7 @@ function actionContext(body: {
   };
 }
 
-async function replaceDraftMessage(
+async function replaceMessage(
   client: App["client"],
   channelId: string | undefined,
   messageTs: string | undefined,
@@ -49,8 +50,8 @@ async function replaceDraftMessage(
   });
 }
 
-export function registerEmailActions(app: App): void {
-  app.action("approve_email_draft", async ({ ack, body, action, client }) => {
+export function registerProspectActions(app: App): void {
+  app.action("approve_add_prospect", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -58,8 +59,8 @@ export function registerEmailActions(app: App): void {
     }
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
-    const draftId = action.value;
-    const result = beginDraftAction(draftId, userId);
+    const pendingId = action.value;
+    const result = beginProspectAction(pendingId, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -67,7 +68,7 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This draft expired. Mention me again to prepare the draft.",
+          "This prospect preview expired. Mention me again to add the prospect.",
         );
       }
       return;
@@ -79,29 +80,40 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who created this draft can approve or discard it.",
+          "Only the person who created this prospect can approve or discard it.",
         );
       }
       return;
     }
 
-    const draft = result.draft;
+    const pending = result.pending;
 
     try {
-      await createGmailDraft(draft.to, draft.subject, draft.body);
-      completeDraftAction(draftId);
+      const created = await createProspect({
+        firstName: pending.firstName,
+        lastName: pending.lastName,
+        ...(pending.companyName ? { companyName: pending.companyName } : {}),
+        ...pending.fields,
+      });
+      completeProspectAction(pendingId);
 
-      const successText = `Gmail draft created for *${draft.contactName}* (${draft.to}). Open Gmail → Drafts to review and send.`;
-      await replaceDraftMessage(client, channelId, messageTs, successText);
+      const contactUrl = hubspotRecordUrl("contact", created.contactId);
+      const dealUrl = hubspotRecordUrl("deal", created.dealId);
+      const companyPart = created.companyId
+        ? ` · company <${hubspotRecordUrl("company", created.companyId)}|${created.companyName}>`
+        : "";
+
+      const successText = `Prospect created: contact <${contactUrl}|${created.contactName}> · deal <${dealUrl}|${created.dealName}> (${created.stageLabel})${companyPart}`;
+      await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
         await postThread(client, channelId, threadTs, successText);
       }
     } catch (error) {
-      releaseDraftAction(draftId);
+      releaseProspectAction(pendingId);
 
       const message =
-        error instanceof Error ? error.message : "Failed to create Gmail draft";
+        error instanceof Error ? error.message : "Failed to create prospect";
 
       if (channelId) {
         await postThread(client, channelId, threadTs, message);
@@ -109,7 +121,7 @@ export function registerEmailActions(app: App): void {
     }
   });
 
-  app.action("discard_email_draft", async ({ ack, body, action, client }) => {
+  app.action("discard_add_prospect", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -117,7 +129,7 @@ export function registerEmailActions(app: App): void {
     }
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
-    const result = takeDraft(action.value, userId);
+    const result = takeProspect(action.value, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -125,7 +137,7 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This draft already expired or was discarded.",
+          "This prospect preview already expired or was discarded.",
         );
       }
       return;
@@ -137,14 +149,14 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who created this draft can approve or discard it.",
+          "Only the person who created this prospect can approve or discard it.",
         );
       }
       return;
     }
 
-    const discardText = `Draft for *${result.draft.contactName}* discarded.`;
-    await replaceDraftMessage(client, channelId, messageTs, discardText);
+    const discardText = `Prospect for *${result.pending.displayName}* discarded.`;
+    await replaceMessage(client, channelId, messageTs, discardText);
 
     if (channelId && !messageTs) {
       await postThread(client, channelId, threadTs, discardText);

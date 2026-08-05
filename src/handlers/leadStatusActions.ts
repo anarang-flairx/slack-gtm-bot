@@ -1,12 +1,13 @@
 import type { App } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
-import { createGmailDraft } from "../integrations/gmail.js";
+import { hubspotRecordUrl } from "../digest/format.js";
+import { updateObjectProperties } from "../integrations/hubspot.js";
 import {
-  beginDraftAction,
-  completeDraftAction,
-  releaseDraftAction,
-  takeDraft,
-} from "../lib/draftStore.js";
+  beginLeadStatusAction,
+  completeLeadStatusAction,
+  releaseLeadStatusAction,
+  takeLeadStatus,
+} from "../lib/leadStatusStore.js";
 import { postThread } from "../lib/slackPost.js";
 
 function actionContext(body: {
@@ -26,7 +27,7 @@ function actionContext(body: {
   };
 }
 
-async function replaceDraftMessage(
+async function replaceMessage(
   client: App["client"],
   channelId: string | undefined,
   messageTs: string | undefined,
@@ -35,22 +36,16 @@ async function replaceDraftMessage(
   if (!channelId || !messageTs) {
     return;
   }
-
   await client.chat.update({
     channel: channelId,
     ts: messageTs,
     text,
-    blocks: [
-      {
-        type: "section",
-        text: { type: "mrkdwn", text },
-      },
-    ],
+    blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
   });
 }
 
-export function registerEmailActions(app: App): void {
-  app.action("approve_email_draft", async ({ ack, body, action, client }) => {
+export function registerLeadStatusActions(app: App): void {
+  app.action("approve_lead_status", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -58,8 +53,8 @@ export function registerEmailActions(app: App): void {
     }
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
-    const draftId = action.value;
-    const result = beginDraftAction(draftId, userId);
+    const pendingId = action.value;
+    const result = beginLeadStatusAction(pendingId, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -67,7 +62,7 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This draft expired. Mention me again to prepare the draft.",
+          "This lead status update expired. Mention me again to redo it.",
         );
       }
       return;
@@ -79,37 +74,41 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who created this draft can approve or discard it.",
+          "Only the person who requested this update can approve or discard it.",
         );
       }
       return;
     }
 
-    const draft = result.draft;
+    const pending = result.pending;
 
     try {
-      await createGmailDraft(draft.to, draft.subject, draft.body);
-      completeDraftAction(draftId);
+      await updateObjectProperties("contacts", pending.contactId, {
+        hs_lead_status: pending.statusValue,
+      });
 
-      const successText = `Gmail draft created for *${draft.contactName}* (${draft.to}). Open Gmail → Drafts to review and send.`;
-      await replaceDraftMessage(client, channelId, messageTs, successText);
+      completeLeadStatusAction(pendingId);
+
+      const url = hubspotRecordUrl("contact", pending.contactId);
+      const successText = `Updated lead status for <${url}|${pending.contactName}> to *${pending.statusLabel}*.`;
+      await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
         await postThread(client, channelId, threadTs, successText);
       }
     } catch (error) {
-      releaseDraftAction(draftId);
-
+      releaseLeadStatusAction(pendingId);
       const message =
-        error instanceof Error ? error.message : "Failed to create Gmail draft";
-
+        error instanceof Error
+          ? error.message
+          : "Failed to update lead status";
       if (channelId) {
         await postThread(client, channelId, threadTs, message);
       }
     }
   });
 
-  app.action("discard_email_draft", async ({ ack, body, action, client }) => {
+  app.action("discard_lead_status", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -117,7 +116,7 @@ export function registerEmailActions(app: App): void {
     }
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
-    const result = takeDraft(action.value, userId);
+    const result = takeLeadStatus(action.value, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -125,7 +124,7 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This draft already expired or was discarded.",
+          "This lead status update already expired or was discarded.",
         );
       }
       return;
@@ -137,14 +136,14 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who created this draft can approve or discard it.",
+          "Only the person who requested this update can approve or discard it.",
         );
       }
       return;
     }
 
-    const discardText = `Draft for *${result.draft.contactName}* discarded.`;
-    await replaceDraftMessage(client, channelId, messageTs, discardText);
+    const discardText = `Lead status update for *${result.pending.contactName}* discarded.`;
+    await replaceMessage(client, channelId, messageTs, discardText);
 
     if (channelId && !messageTs) {
       await postThread(client, channelId, threadTs, discardText);

@@ -13,7 +13,11 @@ function formatInlineMarkdown(line: string): string {
     /\[([^\]]+)\]\(([^)]*)\)/g,
     (_match, label: string, url: string) => {
       const trimmedUrl = url.trim();
-      if (!trimmedUrl || trimmedUrl === "PLACEHOLDER-URL") {
+      if (
+        !trimmedUrl ||
+        trimmedUrl === "PLACEHOLDER-URL" ||
+        !/^https?:\/\//i.test(trimmedUrl)
+      ) {
         return escapeHtml(label);
       }
       const safeUrl = escapeHtml(trimmedUrl);

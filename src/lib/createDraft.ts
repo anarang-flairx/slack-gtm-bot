@@ -25,6 +25,7 @@ export async function createDraftByContactId(
   template: DraftType,
   userId: string,
   channelId: string,
+  threadTs?: string,
 ): Promise<DraftPreview> {
   const context = await getContactContextById(contactId);
   const templateFile = TEMPLATE_FILES[template];
@@ -49,6 +50,7 @@ export async function createDraftByContactId(
     dealStage: context.dealStage,
     createdBy: userId,
     channelId,
+    ...(threadTs ? { threadTs } : {}),
   });
 
   return {

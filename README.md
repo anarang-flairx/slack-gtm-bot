@@ -1,6 +1,6 @@
 # FlairX GTM Bot
 
-Slack bot for FlairX's go-to-market team. Mention the bot in Slack — it does the work and replies in-thread with links to created records.
+Slack bot for FlairX's go-to-market team. **Mention the bot in plain English** — it figures out the action, does the work, and replies in-thread with links to created records.
 
 ## Problem
 
@@ -12,58 +12,60 @@ FlairX's GTM motion is conference-heavy and high-touch. Three bottlenecks slow i
 
 FlairX GTM Bot connects field activity, deal follow-ups, and pipeline data into Slack — where the team already works.
 
-## Features
+## How it works
 
-| Feature | Description | Status |
-|---|---|---|
-| **Basic chat** | `@mention` the bot for a conversation in-thread | ✅ Phase 0 |
-| **Badge scan → HubSpot** | Photo → OCR → Apollo enrichment → confirmation card → CRM records | 🔜 Phase 1 |
-| **Reminders & digest** | `/digest` posts pipeline + stalled deals + late follow-ups | ✅ Phase 2 (manual) |
-| **Commitment capture** | Forward WhatsApp/LinkedIn to Slack → HubSpot task + nudge | 🔜 Phase 2 |
-| **Email drafting** | Stage-aware drafts → Gmail Drafts (bot never sends) | 🔜 Phase 3 |
-| **Pipeline Q&A** | Natural-language HubSpot queries + recurring reports | 🔜 Phase 4 |
+Mention the bot and ask for what you want. The bot runs an OpenAI tool-calling loop (`gpt-4.1` by default) that maps your request to the right HubSpot/Gmail action. Anything that writes data first posts an **Approve / Discard** card; nothing is created, moved, or drafted until you approve. Only the person who made the request can approve their own card.
 
-### Badge scan flow (Phase 1)
+## What you can ask
 
-1. Post a badge photo in `#gtm-leads` with context: `@FlairX GTM Bot met at SHRM 2026, hiring 20 engineers`
-2. Bot extracts contact details (LLM vision), enriches via Apollo
-3. Editable confirmation card with Approve / Edit / Discard
-4. On approve → HubSpot contact, company, and deal in **Prospecting**
+| Ask | What happens |
+|---|---|
+| "what are the sales pipeline stages?" / "what lead statuses do we have?" | Answers from HubSpot |
+| "what's the status of Acme Corp?" | Posts a company card: deals, contacts, notes (incl. Codex-written HubSpot notes), last activity |
+| "add a note to Acme Corp — demoed today, sending proposal" | Preview → appends a dated note + refreshes the activity date (contact, company, or deal) |
+| "move Acme Corp to Negotiation" | Preview → updates the deal stage and logs a dated note |
+| "add Jane Doe at Acme, jane@acme.com, VP Talent, met at SHRM 2026" | Preview → creates a contact (+ company) and a deal in **Prospecting** |
+| "draft an intro email to Jane Doe" / "…event follow-up…" | Preview → templated draft saved to Gmail Drafts |
+| "who hasn't replied to my emails this week?" | Lists sent Gmail threads with no reply, then can draft context-aware follow-ups |
+| "summarize the Acme email thread into their notes" | Reads the thread, previews a summary note on the contact **and** its company |
+| "post the digest" | Builds and posts the daily digest to `DIGEST_CHANNEL` |
 
-### Reminders & commitments (Phase 2)
-
-- **`/digest`** — on-demand GTM daily summary posted to `DIGEST_CHANNEL`
-  - Pipeline snapshot (open deals, raw + weighted totals)
-  - Stalled deals by stage quiet thresholds
-  - Contacts owed a follow-up (Attempted / Connected) with **Draft follow-up** buttons
-  - Overdue HubSpot tasks (when present)
-- Slash commands: `/leads due`, `/leads stale`, `/leads remind` (later)
-- Forward WhatsApp/LinkedIn messages → parsed commitment → HubSpot note + task + scheduled nudge
-
-### Daily digest setup
-
-1. Register slash command `/digest` in Slack app settings (scope `commands`) and reinstall
-2. Invite the bot to your digest channel (e.g. `#gtm-daily`)
-3. Copy the channel ID into `.env` as `DIGEST_CHANNEL`
-4. Set `HUBSPOT_PORTAL_ID` and `HUBSPOT_APP_HOST` for record links
-5. Run `npm run dev`, then in Slack:
+Example:
 
 ```text
-/digest
+@FlairX GTM Bot add a note to Acme Corp — called today, demo booked for next week
+@FlairX GTM Bot move Acme Corp forward to Demo Scheduled
+@FlairX GTM Bot who hasn't replied to my emails in the last 10 days?
 ```
 
-Click **Draft follow-up** on a contact row to create a Gmail draft from `event-follow-up.md`.
+When a name is ambiguous, the bot lists the matches and asks which one you mean.
 
-### Email drafting (Phase 3)
+### Notes and activity dates
 
-- Stage-aware follow-up drafts from HubSpot context
+Bot-written notes use custom HubSpot properties (contact `outreach_notes` / `last_contact_date`, deal `deal_notes` / `notes_last_updated`, company `company_notes` / `notes_last_updated`) and set the activity date. The bot **also reads native HubSpot note engagements** — the notes the CEO writes from Codex via the HubSpot MCP connection — so the company status card and the digest's stalled/follow-up checks reflect that activity too.
+
+### Daily digest
+
+- Pipeline snapshot (open deals, raw + weighted totals)
+- Stalled deals by stage quiet thresholds
+- Contacts owed a follow-up (Attempted / Connected) with **Draft follow-up** buttons
+- Overdue HubSpot tasks (when present)
+
+Setup: invite the bot to your digest channel, put its channel ID in `.env` as `DIGEST_CHANNEL`, set `HUBSPOT_PORTAL_ID` / `HUBSPOT_APP_HOST` for record links, then ask `@FlairX GTM Bot post the digest`.
+
+### Email drafting
+
+- Templated (intro / event follow-up) or custom, context-aware drafts
 - Approve → saved to Gmail Drafts
 - **The bot never sends email** — a human always presses send
+
+## Relationship to the CEO's Codex setup
+
+The CEO also has Codex connected to HubSpot (MCP) and Gmail, which covers the same use cases for personal, ad-hoc work in a private chat. This Slack bot is the **team-visible** layer: shared Approve/Discard cards, in-channel status, and the digest. Because the bot reads native HubSpot notes, both surfaces stay consistent.
 
 ## Non-goals
 
 - Does not send email autonomously (Gmail drafts only)
-- Does not auto-advance deal stages in HubSpot
 - Does not replace HubSpot as the system of record
 - No direct WhatsApp/LinkedIn API in v1 (forward-to-Slack instead)
 - GTM scope only — not a general-purpose assistant
@@ -71,8 +73,8 @@ Click **Draft follow-up** on a contact row to create a Gmail draft from `event-f
 ## Tech stack
 
 - **Slack** — [Bolt for JavaScript](https://slack.dev/bolt-js/), Socket Mode (no public webhook in v1)
-- **LLM** — OpenAI (chat, vision OCR, commitment parsing, email drafting)
-- **Integrations** — HubSpot (Service Key), Apollo, Gmail (compose-only OAuth)
+- **LLM** — OpenAI tool calling (`gpt-4.1`, overridable via `OPENAI_MODEL`)
+- **Integrations** — HubSpot (Service Key), Gmail (compose + read-only OAuth)
 - **Runtime** — Node.js + TypeScript
 
 ## Getting started
@@ -87,10 +89,11 @@ Click **Draft follow-up** on a contact row to create a Gmail draft from `event-f
 
 1. Create an app at [api.slack.com](https://api.slack.com/apps)
 2. Enable **Socket Mode** and create an app-level token (`connections:write`)
-3. Add bot scopes: `app_mentions:read`, `chat:write`, `channels:history`, `groups:history`, `commands`
+3. Add bot scopes: `app_mentions:read`, `chat:write`, `channels:history`, `groups:history`
 4. Subscribe to bot event: `app_mention`
-5. Create slash commands: `/intro-draft`, `/event-follow-up`, `/digest`
-6. Install to workspace
+5. Install to workspace
+
+No slash commands are needed. If you're upgrading from an older version, **delete the old slash commands** (`/intro-draft`, `/event-follow-up`, `/update-notes`, `/digest`, `/current-status`, `/add-prospect`) in the Slack app settings so they don't show `dispatch_failed` — everything now runs through `@mention`.
 
 ### Run locally
 
@@ -111,20 +114,32 @@ DEV_ECHO_MODE=true
 
 # Required when DEV_ECHO_MODE is false
 OPENAI_API_KEY=sk-...
+# Optional: override the model (default gpt-4.1)
+OPENAI_MODEL=gpt-4.1
 ```
 
 Invite the bot to a channel and mention it:
 
 ```text
 /invite @FlairX GTM Bot
-@FlairX GTM Bot hello
+@FlairX GTM Bot what are our pipeline stages?
 ```
 
-With `DEV_ECHO_MODE=true`, the bot replies `Echo: hello`. With echo mode off, it holds a multi-turn conversation via OpenAI.
+With `DEV_ECHO_MODE=true`, the bot replies `Echo: <your text>`. With echo mode off, it runs the full tool-calling agent via OpenAI.
+
+### Gmail setup
+
+The bot needs its own Google OAuth credentials (the Codex Gmail connector only works inside Codex, not here). Run the one-time auth flow to grant **compose + read-only** Gmail access:
+
+```bash
+npm run gmail-auth
+```
+
+Sign in as the sending account, then copy `GOOGLE_REFRESH_TOKEN` and `GMAIL_SENDER_EMAIL` into `.env`. Read access powers "who hasn't replied?" and email summaries; compose access powers Gmail drafts. If you authorized an earlier version (compose only), re-run this to add the read scope.
 
 ### HubSpot setup
 
-Before Phase 1, complete the one-time HubSpot checklist: [HUBSPOT_SETUP.md](HUBSPOT_SETUP.md)
+Complete the one-time HubSpot checklist: [HUBSPOT_SETUP.md](HUBSPOT_SETUP.md)
 
 Deal pipeline stages (must match exactly):
 
@@ -142,22 +157,17 @@ Deal pipeline stages (must match exactly):
 ```text
 slack-gtm-bot/
 ├── src/
-│   └── index.ts          # Bot entry point (app_mention handler)
+│   ├── index.ts          # Entry point: registers the mention agent + button handlers
+│   ├── agent/tools.ts    # OpenAI tool schemas + executor (wraps HubSpot/Gmail)
+│   ├── handlers/         # mention loop + Approve/Discard action handlers
+│   ├── integrations/     # hubspot.ts, gmail.ts
+│   ├── lib/              # previews (Block Kit), stores, note/draft helpers
+│   └── digest/           # daily digest queries + blocks
 ├── PRD.md                # Full product requirements
 ├── HUBSPOT_SETUP.md      # HubSpot one-time setup checklist
 ├── .env.example
 └── package.json
 ```
-
-## Roadmap
-
-| Phase | Scope | Target |
-|---|---|---|
-| **0** | Slack app + basic `@mention` chat | ✅ Current |
-| **1** | Badge scan → HubSpot | Weeks 1–3 |
-| **2** | Reminders, digest, commitment capture | Weeks 3–5 |
-| **3** | Gmail draft generation | Weeks 5–7 |
-| **4** | Pipeline Q&A and reporting | Weeks 7–9 |
 
 See [PRD.md](PRD.md) for full requirements, architecture, data model, and success metrics.
 

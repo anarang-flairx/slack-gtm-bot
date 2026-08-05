@@ -1,12 +1,14 @@
 import type { App } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
-import { createGmailDraft } from "../integrations/gmail.js";
+import { hubspotRecordUrl } from "../digest/format.js";
+import type { NoteRecordMatch } from "../integrations/hubspot.js";
 import {
-  beginDraftAction,
-  completeDraftAction,
-  releaseDraftAction,
-  takeDraft,
-} from "../lib/draftStore.js";
+  beginNoteUpdateAction,
+  completeNoteUpdateAction,
+  releaseNoteUpdateAction,
+  takeNoteUpdate,
+} from "../lib/noteUpdateStore.js";
+import { appendNotesToRecord } from "../lib/updateNotes.js";
 import { postThread } from "../lib/slackPost.js";
 
 function actionContext(body: {
@@ -26,7 +28,7 @@ function actionContext(body: {
   };
 }
 
-async function replaceDraftMessage(
+async function replaceMessage(
   client: App["client"],
   channelId: string | undefined,
   messageTs: string | undefined,
@@ -49,8 +51,8 @@ async function replaceDraftMessage(
   });
 }
 
-export function registerEmailActions(app: App): void {
-  app.action("approve_email_draft", async ({ ack, body, action, client }) => {
+export function registerNoteActions(app: App): void {
+  app.action("approve_notes_update", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -58,8 +60,8 @@ export function registerEmailActions(app: App): void {
     }
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
-    const draftId = action.value;
-    const result = beginDraftAction(draftId, userId);
+    const pendingId = action.value;
+    const result = beginNoteUpdateAction(pendingId, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -67,7 +69,7 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This draft expired. Mention me again to prepare the draft.",
+          "This notes update expired. Mention me again to update the note.",
         );
       }
       return;
@@ -79,29 +81,36 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who created this draft can approve or discard it.",
+          "Only the person who created this update can approve or discard it.",
         );
       }
       return;
     }
 
-    const draft = result.draft;
+    const pending = result.pending;
+    const match: NoteRecordMatch = {
+      type: pending.recordType,
+      id: pending.recordId,
+      name: pending.recordName,
+      detail: pending.recordDetail,
+    };
 
     try {
-      await createGmailDraft(draft.to, draft.subject, draft.body);
-      completeDraftAction(draftId);
+      await appendNotesToRecord(match, pending.note);
+      completeNoteUpdateAction(pendingId);
 
-      const successText = `Gmail draft created for *${draft.contactName}* (${draft.to}). Open Gmail → Drafts to review and send.`;
-      await replaceDraftMessage(client, channelId, messageTs, successText);
+      const url = hubspotRecordUrl(match.type, match.id);
+      const successText = `Notes updated on ${match.type} <${url}|${match.name}>.`;
+      await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
         await postThread(client, channelId, threadTs, successText);
       }
     } catch (error) {
-      releaseDraftAction(draftId);
+      releaseNoteUpdateAction(pendingId);
 
       const message =
-        error instanceof Error ? error.message : "Failed to create Gmail draft";
+        error instanceof Error ? error.message : "Failed to update notes";
 
       if (channelId) {
         await postThread(client, channelId, threadTs, message);
@@ -109,7 +118,7 @@ export function registerEmailActions(app: App): void {
     }
   });
 
-  app.action("discard_email_draft", async ({ ack, body, action, client }) => {
+  app.action("discard_notes_update", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -117,7 +126,7 @@ export function registerEmailActions(app: App): void {
     }
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
-    const result = takeDraft(action.value, userId);
+    const result = takeNoteUpdate(action.value, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -125,7 +134,7 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This draft already expired or was discarded.",
+          "This notes update already expired or was discarded.",
         );
       }
       return;
@@ -137,14 +146,14 @@ export function registerEmailActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who created this draft can approve or discard it.",
+          "Only the person who created this update can approve or discard it.",
         );
       }
       return;
     }
 
-    const discardText = `Draft for *${result.draft.contactName}* discarded.`;
-    await replaceDraftMessage(client, channelId, messageTs, discardText);
+    const discardText = `Notes update for *${result.pending.recordName}* discarded.`;
+    await replaceMessage(client, channelId, messageTs, discardText);
 
     if (channelId && !messageTs) {
       await postThread(client, channelId, threadTs, discardText);

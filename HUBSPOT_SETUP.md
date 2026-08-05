@@ -54,6 +54,8 @@ Create these if they don't already exist:
 | Role in hiring process | `role_in_hiring_process` | Single-line text (or dropdown: Decision maker / Influencer / User / Unknown) |
 | Industry focus | `industry_focus` | Single-line text |
 | Hiring urgency | `hiring_urgency` | Dropdown: high / medium / low |
+| Outreach Notes | `outreach_notes` | Multi-line text |
+| Last Contact Date | `last_contact_date` | Date |
 
 **Already exists — do not create:** **Method of Contact**. Flare uses this for preferred communication channel (Email, WhatsApp, LinkedIn, Phone). Confirm its internal name in Settings → Data Management → Properties → Method of Contact (often `method_of_contact`).
 
@@ -65,6 +67,8 @@ Create these if they don't already exist:
 | Industry vertical | `industry_vertical` | Single-line text |
 | Growth stage | `growth_stage` | Single-line text |
 | Contract type | `contract_type` | Dropdown (set by team during sales process) |
+| Company Notes | `company_notes` | Multi-line text |
+| Last Activity Date | `notes_last_updated` | Date |
 
 ### Deal properties
 
@@ -73,6 +77,10 @@ Create these if they don't already exist:
 | Lead source | `lead_source` | Single-line text (conference name) |
 | Loss reason | `loss_reason` | Dropdown or single-line text |
 | Competitor evaluated | `competitor_evaluated` | Single-line text |
+| Deal Notes | `deal_notes` | Multi-line text |
+| Last Activity Date | `notes_last_updated` | Date |
+
+`/digest` watches deal `notes_last_updated` for stalled deals and contact `last_contact_date` for follow-ups (including empty dates). `/update-notes` appends to the notes field and sets the matching date to today.
 
 ## 4. Verify
 

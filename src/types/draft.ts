@@ -13,4 +13,11 @@ export type PendingDraft = {
   dealStage: string;
   createdBy: string;
   channelId: string;
+  threadTs?: string;
+  createdAt: number;
 };
+
+export type TakeDraftResult =
+  | { status: "ok"; draft: PendingDraft }
+  | { status: "not_found" }
+  | { status: "forbidden" };

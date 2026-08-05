@@ -2,14 +2,48 @@ import {
   batchReadCompanies,
   getLeadStatusMap,
   getPipelineMeta,
+  latestNoteTimestampMs,
   searchObjects,
 } from "../integrations/hubspot.js";
+import {
+  contactActivityDateProperty,
+  dealActivityDateProperty,
+} from "../lib/noteProperties.js";
 import {
   daysAgoMs,
   daysSince,
   envInt,
   startOfTodayMs,
 } from "./format.js";
+
+/** Quiet if date is older than threshold, OR the date property is unset. */
+function quietDateFilterGroups(
+  baseFilters: Array<Record<string, unknown>>,
+  dateProperty: string,
+  olderThanMs: number,
+): Array<{ filters: Array<Record<string, unknown>> }> {
+  return [
+    {
+      filters: [
+        ...baseFilters,
+        {
+          propertyName: dateProperty,
+          operator: "LT",
+          value: String(olderThanMs),
+        },
+      ],
+    },
+    {
+      filters: [
+        ...baseFilters,
+        {
+          propertyName: dateProperty,
+          operator: "NOT_HAS_PROPERTY",
+        },
+      ],
+    },
+  ];
+}
 
 export type OpenDeal = {
   id: string;
@@ -91,13 +125,14 @@ export async function queryOpenDeals(): Promise<PipelineSnapshot> {
       "dealstage",
       "closedate",
       "hs_lastmodifieddate",
-      "notes_last_updated",
+      dealActivityDateProperty(),
       "hubspot_owner_id",
     ],
     sorts: [{ propertyName: "amount", direction: "DESCENDING" }],
   });
 
   const todayStart = startOfTodayMs();
+  const activityDateProp = dealActivityDateProperty();
 
   const deals: OpenDeal[] = results.map((deal) => {
     const stageId = deal.properties.dealstage ?? "";
@@ -109,7 +144,7 @@ export async function queryOpenDeals(): Promise<PipelineSnapshot> {
       stageLabel: pipeline.stageById.get(stageId)?.label ?? stageId,
       closeDate: deal.properties.closedate ?? null,
       lastModified: parseMs(deal.properties.hs_lastmodifieddate),
-      notesLastUpdated: parseMs(deal.properties.notes_last_updated),
+      notesLastUpdated: parseMs(deal.properties[activityDateProp]),
       createdAt: deal.createdAt ? Date.parse(deal.createdAt) : null,
     };
   });
@@ -171,34 +206,33 @@ export async function queryStalledDeals(): Promise<StalledDeal[]> {
     .map((label) => pipeline.stageByLabel.get(label.toLowerCase())?.id)
     .filter((id): id is string => Boolean(id));
 
+  const activityDateProp = dealActivityDateProperty();
   const filterGroups: Array<{ filters: Array<Record<string, unknown>> }> = [];
 
   if (lateStageIds.length > 0) {
-    filterGroups.push({
-      filters: [
-        { propertyName: "hs_is_closed", operator: "EQ", value: "false" },
-        { propertyName: "dealstage", operator: "IN", values: lateStageIds },
-        {
-          propertyName: "notes_last_updated",
-          operator: "LT",
-          value: String(daysAgoMs(lateDays, now)),
-        },
-      ],
-    });
+    filterGroups.push(
+      ...quietDateFilterGroups(
+        [
+          { propertyName: "hs_is_closed", operator: "EQ", value: "false" },
+          { propertyName: "dealstage", operator: "IN", values: lateStageIds },
+        ],
+        activityDateProp,
+        daysAgoMs(lateDays, now),
+      ),
+    );
   }
 
   if (earlyStageIds.length > 0) {
-    filterGroups.push({
-      filters: [
-        { propertyName: "hs_is_closed", operator: "EQ", value: "false" },
-        { propertyName: "dealstage", operator: "IN", values: earlyStageIds },
-        {
-          propertyName: "notes_last_updated",
-          operator: "LT",
-          value: String(daysAgoMs(earlyDays, now)),
-        },
-      ],
-    });
+    filterGroups.push(
+      ...quietDateFilterGroups(
+        [
+          { propertyName: "hs_is_closed", operator: "EQ", value: "false" },
+          { propertyName: "dealstage", operator: "IN", values: earlyStageIds },
+        ],
+        activityDateProp,
+        daysAgoMs(earlyDays, now),
+      ),
+    );
   }
 
   if (filterGroups.length === 0) {
@@ -211,34 +245,65 @@ export async function queryStalledDeals(): Promise<StalledDeal[]> {
       "dealname",
       "amount",
       "dealstage",
-      "notes_last_updated",
+      activityDateProp,
       "hubspot_owner_id",
       "closedate",
       "hs_lastmodifieddate",
     ],
   });
 
-  return results
-    .map((deal) => {
-      const stageId = deal.properties.dealstage ?? "";
-      const notesLastUpdated = parseMs(deal.properties.notes_last_updated);
-      const createdAt = deal.createdAt ? Date.parse(deal.createdAt) : null;
-      const lastModified = parseMs(deal.properties.hs_lastmodifieddate);
-      const quietFrom = notesLastUpdated ?? createdAt ?? lastModified;
+  const stalled: StalledDeal[] = results.map((deal) => {
+    const stageId = deal.properties.dealstage ?? "";
+    const notesLastUpdated = parseMs(deal.properties[activityDateProp]);
+    const createdAt = deal.createdAt ? Date.parse(deal.createdAt) : null;
+    const lastModified = parseMs(deal.properties.hs_lastmodifieddate);
+    const quietFrom = notesLastUpdated ?? createdAt ?? lastModified;
 
+    return {
+      id: deal.id,
+      name: deal.properties.dealname?.trim() || "Untitled deal",
+      amount: parseAmount(deal.properties.amount),
+      stageId,
+      stageLabel: pipeline.stageById.get(stageId)?.label ?? stageId,
+      closeDate: deal.properties.closedate ?? null,
+      lastModified,
+      notesLastUpdated,
+      createdAt,
+      daysQuiet: daysSince(quietFrom, now),
+    };
+  });
+
+  // Native HubSpot notes (e.g. written from Codex/HubSpot MCP) also count as
+  // recent activity, so re-check each stalled candidate against its latest note
+  // and drop any that are no longer quiet past their stage threshold.
+  const lateStageSet = new Set(lateStageIds);
+  const enriched = await Promise.all(
+    stalled.map(async (deal) => {
+      const nativeMs = await latestNoteTimestampMs("deals", deal.id).catch(
+        () => null,
+      );
+      if (!nativeMs) {
+        return deal;
+      }
+      const quietFrom = Math.max(
+        deal.notesLastUpdated ?? 0,
+        nativeMs,
+        deal.createdAt ?? 0,
+        deal.lastModified ?? 0,
+      );
       return {
-        id: deal.id,
-        name: deal.properties.dealname?.trim() || "Untitled deal",
-        amount: parseAmount(deal.properties.amount),
-        stageId,
-        stageLabel: pipeline.stageById.get(stageId)?.label ?? stageId,
-        closeDate: deal.properties.closedate ?? null,
-        lastModified,
-        notesLastUpdated,
-        createdAt,
+        ...deal,
+        notesLastUpdated: Math.max(deal.notesLastUpdated ?? 0, nativeMs),
         daysQuiet: daysSince(quietFrom, now),
       };
-    })
+    }),
+  );
+
+  return enriched
+    .filter(
+      (deal) =>
+        deal.daysQuiet >= (lateStageSet.has(deal.stageId) ? lateDays : earlyDays),
+    )
     .sort((a, b) => b.daysQuiet - a.daysQuiet);
 }
 
@@ -277,32 +342,30 @@ export async function queryFollowUpContacts(): Promise<FollowUpContact[]> {
     companyId: string;
     leadStatusLabel: string;
     daysOverdue: number;
+    lastActivityMs: number | null;
   }> = [];
+
+  const activityDateProp = contactActivityDateProperty();
 
   for (const bucket of buckets) {
     const results = await searchObjects("contacts", {
-      filterGroups: [
-        {
-          filters: [
-            {
-              propertyName: "hs_lead_status",
-              operator: "EQ",
-              value: bucket.value,
-            },
-            {
-              propertyName: "notes_last_updated",
-              operator: "LT",
-              value: String(daysAgoMs(bucket.days, now)),
-            },
-          ],
-        },
-      ],
+      filterGroups: quietDateFilterGroups(
+        [
+          {
+            propertyName: "hs_lead_status",
+            operator: "EQ",
+            value: bucket.value,
+          },
+        ],
+        activityDateProp,
+        daysAgoMs(bucket.days, now),
+      ),
       properties: [
         "firstname",
         "lastname",
         "email",
         "hs_lead_status",
-        "notes_last_updated",
+        activityDateProp,
         "associatedcompanyid",
       ],
     });
@@ -315,33 +378,53 @@ export async function queryFollowUpContacts(): Promise<FollowUpContact[]> {
         companyIds.push(companyId);
       }
 
+      const lastContact = parseMs(contact.properties[activityDateProp]);
+      const createdAt = contact.createdAt
+        ? Date.parse(contact.createdAt)
+        : null;
+
       rows.push({
         id: contact.id,
         name: `${first} ${last}`.trim() || "Unknown contact",
         email: contact.properties.email?.trim() ?? "",
         companyId,
         leadStatusLabel: bucket.label,
-        daysOverdue: daysSince(
-          parseMs(contact.properties.notes_last_updated),
-          now,
-        ),
+        daysOverdue: daysSince(lastContact ?? createdAt, now),
+        lastActivityMs: lastContact ?? createdAt,
       });
     }
   }
 
   const companyNames = await batchReadCompanies(companyIds);
+  const bucketDays = new Map(buckets.map((b) => [b.label, b.days]));
 
-  return rows
-    .map((row) => ({
-      id: row.id,
-      name: row.name,
-      email: row.email,
-      companyName: row.companyId
-        ? companyNames.get(row.companyId) ?? ""
-        : "",
-      leadStatusLabel: row.leadStatusLabel,
-      daysOverdue: row.daysOverdue,
-    }))
+  const enriched = await Promise.all(
+    rows.map(async (row) => {
+      const base = {
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        companyName: row.companyId ? companyNames.get(row.companyId) ?? "" : "",
+        leadStatusLabel: row.leadStatusLabel,
+        daysOverdue: row.daysOverdue,
+      };
+
+      const nativeMs = await latestNoteTimestampMs("contacts", row.id).catch(
+        () => null,
+      );
+      if (!nativeMs) {
+        return base;
+      }
+      const effective = Math.max(row.lastActivityMs ?? 0, nativeMs);
+      return { ...base, daysOverdue: daysSince(effective, now) };
+    }),
+  );
+
+  return enriched
+    .filter(
+      (row) =>
+        row.daysOverdue >= (bucketDays.get(row.leadStatusLabel) ?? 0),
+    )
     .sort((a, b) => b.daysOverdue - a.daysOverdue);
 }
 
