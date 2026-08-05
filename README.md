@@ -2,8 +2,6 @@
 
 Slack bot for FlairX's go-to-market team. **Mention the bot in plain English** — it figures out the action, does the work, and replies in-thread with links to created records.
 
-`@mention` is the only interface (no slash commands). It tracks follow-ups, drafts Gmail emails, moves deals, adds prospects, and answers pipeline questions — all in natural language, with an Approve/Discard card before anything is written.
-
 ## Problem
 
 FlairX's GTM motion is conference-heavy and high-touch. Three bottlenecks slow it down:
