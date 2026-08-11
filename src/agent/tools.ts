@@ -153,7 +153,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "get_company_status",
       description:
-        "Post a status card for a company: its deals, contacts, notes (including native HubSpot notes), and last activity. Use for 'what's the status of X'.",
+        "Post a status card for a company: its deals, contacts, notes (including native HubSpot notes), and last activity. Use ONLY for 'what's the status of X' / status lookups. Do NOT use this for 'move X to deals' or creating a deal — use create_company_deal instead.",
       parameters: {
         type: "object",
         properties: {
@@ -247,7 +247,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "create_company_deal",
       description:
-        "Prepare a new HubSpot deal on an *existing* company. Deal name is always '[Company] - FlairX'. Associates the company and ALL of its existing contacts. Posts an approval card; the deal is only created after approval. Use for 'move X to deals', 'create a deal for X', 'add X to the pipeline' when X is a company. Do not ask which contacts to include. Default stage is Prospecting unless the user names another stage.",
+        "Create a NEW HubSpot deal on an *existing* company. THIS is the tool for 'move X to deals', 'add X to deals/pipeline', 'create a deal for X', 'new deal for X', or thread follow-ups like 'new deal' / 'create a new one' about a company. Deal name is always '[Company] - FlairX'. Associates the company and ALL existing contacts automatically — never ask for contacts, deal name, first name, or email. Posts an approval card. Default stage is Prospecting unless the user names another stage. Do NOT use move_deal_stage or add_prospect for these requests.",
       parameters: {
         type: "object",
         properties: {
@@ -275,7 +275,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "move_deal_stage",
       description:
-        "Prepare a move of a deal to a different pipeline stage. Identify the deal by company name and/or deal name. Posts an approval card; the stage only changes after approval.",
+        "Change the pipeline STAGE of an *existing* deal (e.g. Prospecting → Negotiation). NOT for creating deals. NOT for 'move company to deals' / 'add company to pipeline' — those require create_company_deal. Identify the deal by company name and/or deal name. Posts an approval card.",
       parameters: {
         type: "object",
         properties: {
@@ -725,7 +725,7 @@ async function runMoveDealStage(
   }
 
   if (deals.length === 0) {
-    return `No deal found for ${companyName ?? dealName}.`;
+    return `No existing deal found for ${companyName ?? dealName}. If the user wants to CREATE a new deal for this company (e.g. "move X to deals" / "new deal"), call create_company_deal with company_name — do not ask for contact details or a deal name.`;
   }
 
   if (deals.length > 1) {
@@ -1056,7 +1056,11 @@ export async function executeTool(
         `Current status for ${status.name}`,
         buildCompanyStatusBlocks(status),
       );
-      return `Posted a status card for ${status.name}: ${status.deals.length} deal(s), ${status.contacts.length} contact(s), last activity ${status.lastActivity ?? "unknown"}.`;
+      const dealHint =
+        status.deals.length === 0
+          ? ` If the user wants a deal/pipeline record for this company, call create_company_deal next (do not ask for contacts or deal name).`
+          : "";
+      return `Posted a status card for ${status.name}: ${status.deals.length} deal(s), ${status.contacts.length} contact(s), last activity ${status.lastActivity ?? "unknown"}.${dealHint}`;
     }
 
     case "post_digest": {
