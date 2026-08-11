@@ -801,33 +801,185 @@ export async function findCompaniesByName(
     return [];
   }
 
-  const search = await hubspotFetch<HubSpotSearchResponse>(
-    "/crm/v3/objects/companies/search",
-    {
-      method: "POST",
-      body: JSON.stringify({
-        filterGroups: [
+  // CONTAINS_TOKEN rejects tokens shorter than 3 chars and treats punctuation
+  // as separators — "Programmers.ai" becomes ["Programmers", "ai"] and can 400.
+  const tokenQuery = query
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 3)
+    .join(" ");
+
+  const looksLikeDomain =
+    /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(query) ||
+    query.toLowerCase().includes(".ai") ||
+    query.toLowerCase().includes(".com") ||
+    query.toLowerCase().includes(".io");
+
+  const domainCandidate = looksLikeDomain
+    ? query.toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "")
+    : null;
+
+  const filterGroups: Array<{
+    filters: Array<{ propertyName: string; operator: string; value: string }>;
+  }> = [];
+
+  if (tokenQuery) {
+    filterGroups.push({
+      filters: [
+        {
+          propertyName: "name",
+          operator: "CONTAINS_TOKEN",
+          value: tokenQuery,
+        },
+      ],
+    });
+  }
+
+  // Exact name match (case-insensitive via EQ on the raw string when possible).
+  filterGroups.push({
+    filters: [
+      {
+        propertyName: "name",
+        operator: "EQ",
+        value: query,
+      },
+    ],
+  });
+
+  if (domainCandidate) {
+    filterGroups.push({
+      filters: [
+        {
+          propertyName: "domain",
+          operator: "EQ",
+          value: domainCandidate,
+        },
+      ],
+    });
+    // Also try without a leading www.
+    const bare = domainCandidate.replace(/^www\./, "");
+    if (bare !== domainCandidate) {
+      filterGroups.push({
+        filters: [
           {
-            filters: [
-              {
-                propertyName: "name",
-                operator: "CONTAINS_TOKEN",
-                value: query,
-              },
-            ],
+            propertyName: "domain",
+            operator: "EQ",
+            value: bare,
           },
         ],
-        properties: ["name", "domain"],
-        limit: 5,
-      }),
-    },
-  );
+      });
+    }
+  }
 
-  return search.results.map((company) => ({
+  // First meaningful token alone (e.g. "Programmers" from "Programmers.ai").
+  const firstToken = tokenQuery.split(/\s+/)[0];
+  if (firstToken && firstToken.toLowerCase() !== tokenQuery.toLowerCase()) {
+    filterGroups.push({
+      filters: [
+        {
+          propertyName: "name",
+          operator: "CONTAINS_TOKEN",
+          value: firstToken,
+        },
+      ],
+    });
+  }
+
+  if (filterGroups.length === 0) {
+    return [];
+  }
+
+  let results: HubSpotSearchResult[] = [];
+  try {
+    const search = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/companies/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: filterGroups.slice(0, 5), // HubSpot max 5 groups
+          properties: ["name", "domain"],
+          limit: 10,
+        }),
+      },
+    );
+    results = search.results;
+  } catch (error) {
+    // Fall back to a safer single-token search if the combined query fails.
+    if (!firstToken) {
+      throw error;
+    }
+    const search = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/companies/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: [
+            {
+              filters: [
+                {
+                  propertyName: "name",
+                  operator: "CONTAINS_TOKEN",
+                  value: firstToken,
+                },
+              ],
+            },
+            ...(domainCandidate
+              ? [
+                  {
+                    filters: [
+                      {
+                        propertyName: "domain",
+                        operator: "EQ",
+                        value: domainCandidate,
+                      },
+                    ],
+                  },
+                ]
+              : []),
+          ],
+          properties: ["name", "domain"],
+          limit: 10,
+        }),
+      },
+    );
+    results = search.results;
+  }
+
+  const mapped = results.map((company) => ({
     id: company.id,
     name: company.properties.name?.trim() || "Untitled company",
     domain: company.properties.domain?.trim() ?? "",
   }));
+
+  // Prefer exact name / domain matches, then prefix matches.
+  const needle = query.toLowerCase();
+  const domainNeedle = domainCandidate?.toLowerCase();
+  mapped.sort((a, b) => {
+    const score = (c: { name: string; domain: string }) => {
+      const name = c.name.toLowerCase();
+      const domain = c.domain.toLowerCase();
+      if (name === needle) return 0;
+      if (domainNeedle && domain === domainNeedle) return 1;
+      if (name.startsWith(needle) || name.includes(needle)) return 2;
+      if (domainNeedle && domain.includes(domainNeedle.split(".")[0] ?? "")) {
+        return 3;
+      }
+      return 4;
+    };
+    return score(a) - score(b);
+  });
+
+  // Dedupe by id and cap.
+  const seen = new Set<string>();
+  const unique: typeof mapped = [];
+  for (const c of mapped) {
+    if (seen.has(c.id)) continue;
+    seen.add(c.id);
+    unique.push(c);
+    if (unique.length >= 5) break;
+  }
+  return unique;
 }
 
 export async function findContactByEmail(
