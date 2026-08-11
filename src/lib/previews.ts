@@ -328,7 +328,9 @@ export function buildCompanyDealPreviewBlocks(
   companyName: string,
   companyId: string,
   dealName: string,
+  pipelineLabel: string,
   stageLabel: string,
+  lifecycleStageLabel: string,
   contacts: Array<{ id: string; name: string; email: string }>,
   pendingId: string,
   existingDeals?: Array<{ id: string; name: string; stage: string }>,
@@ -368,7 +370,12 @@ export function buildCompanyDealPreviewBlocks(
           text: `*Company:*\n<${companyUrl}|${companyName}>`,
         },
         { type: "mrkdwn", text: `*Deal name:*\n${dealName}` },
-        { type: "mrkdwn", text: `*Stage:*\n${stageLabel}` },
+        { type: "mrkdwn", text: `*Pipeline:*\n${pipelineLabel}` },
+        { type: "mrkdwn", text: `*Deal stage:*\n${stageLabel}` },
+        {
+          type: "mrkdwn",
+          text: `*Company lifecycle:*\n${lifecycleStageLabel}`,
+        },
         {
           type: "mrkdwn",
           text: `*Contacts to associate:*\n${contacts.length}`,
@@ -397,7 +404,7 @@ export function buildCompanyDealPreviewBlocks(
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "On approve: create the HubSpot *deal*, associate the *company*, and associate *all* listed contacts.",
+        text: "On approve: create the HubSpot *deal*, associate the *company* + *all* listed contacts, and set the company *lifecycle stage*.",
       },
     },
     {

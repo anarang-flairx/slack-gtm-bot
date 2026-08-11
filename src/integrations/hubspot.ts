@@ -74,6 +74,7 @@ export type PipelineStage = {
 
 export type PipelineMeta = {
   id: string;
+  label: string;
   stages: PipelineStage[];
   stageById: Map<string, PipelineStage>;
   stageByLabel: Map<string, PipelineStage>;
@@ -82,6 +83,7 @@ export type PipelineMeta = {
 type HubSpotPipelinesResponse = {
   results: Array<{
     id: string;
+    label: string;
     stages: Array<{
       id: string;
       label: string;
@@ -105,28 +107,28 @@ export type HubSpotContactContext = {
   leadSource: string;
 };
 
-let pipelineCache: PipelineMeta | null = null;
-let leadStatusCache: Map<string, string> | null = null;
+/** HubSpot metadata refreshes every 30s so new pipelines/stages show up without restart. */
+const META_CACHE_TTL_MS = 30_000;
+
+type TimedCache<T> = { value: T; fetchedAt: number };
+
+let pipelineCache: TimedCache<PipelineMeta> | null = null;
+let pipelinesListCache: TimedCache<
+  Array<{ id: string; label: string; stageCount: number }>
+> | null = null;
+let leadStatusCache: TimedCache<Map<string, string>> | null = null;
 let lifecycleStageCache: Map<string, string> | null = null;
+let lifecycleStageOptionsCache: TimedCache<
+  Array<{ label: string; value: string }>
+> | null = null;
 
-export async function getPipelineMeta(): Promise<PipelineMeta> {
-  if (pipelineCache) {
-    return pipelineCache;
-  }
+function cacheFresh<T>(entry: TimedCache<T> | null): entry is TimedCache<T> {
+  return !!entry && Date.now() - entry.fetchedAt < META_CACHE_TTL_MS;
+}
 
-  const data = await hubspotFetch<HubSpotPipelinesResponse>(
-    "/crm/v3/pipelines/deals",
-  );
-
-  const pipelineId = process.env.HUBSPOT_PIPELINE_ID;
-  const pipeline = pipelineId
-    ? data.results.find((p) => p.id === pipelineId)
-    : data.results[0];
-
-  if (!pipeline) {
-    throw new Error("No HubSpot deal pipeline found");
-  }
-
+function toPipelineMeta(
+  pipeline: HubSpotPipelinesResponse["results"][number],
+): PipelineMeta {
   const stages: PipelineStage[] = pipeline.stages
     .map((stage) => ({
       id: stage.id,
@@ -136,62 +138,155 @@ export async function getPipelineMeta(): Promise<PipelineMeta> {
     }))
     .sort((a, b) => a.displayOrder - b.displayOrder);
 
-  pipelineCache = {
+  return {
     id: pipeline.id,
+    label: pipeline.label?.trim() || pipeline.id,
     stages,
     stageById: new Map(stages.map((s) => [s.id, s])),
     stageByLabel: new Map(stages.map((s) => [s.label.toLowerCase(), s])),
   };
-
-  return pipelineCache;
 }
 
-async function getStageLabels(): Promise<Map<string, string>> {
-  const pipeline = await getPipelineMeta();
-  return new Map(
-    pipeline.stages.map((stage) => [stage.id, stage.label]),
+async function fetchDealPipelines(): Promise<
+  HubSpotPipelinesResponse["results"]
+> {
+  const data = await hubspotFetch<HubSpotPipelinesResponse>(
+    "/crm/v3/pipelines/deals",
   );
+  return data.results ?? [];
 }
 
-export async function getLeadStatusMap(): Promise<Map<string, string>> {
-  if (leadStatusCache) {
-    return leadStatusCache;
+/** List all HubSpot deal pipelines (short TTL cache). */
+export async function listDealPipelines(): Promise<
+  Array<{ id: string; label: string; stageCount: number }>
+> {
+  if (cacheFresh(pipelinesListCache)) {
+    return pipelinesListCache.value;
   }
 
-  const data = await hubspotFetch<{
-    options?: Array<{ label: string; value: string }>;
-  }>("/crm/v3/properties/contacts/hs_lead_status");
-
-  leadStatusCache = new Map(
-    (data.options ?? []).map((option) => [
-      option.label.toLowerCase(),
-      option.value,
-    ]),
-  );
-
-  return leadStatusCache;
+  const results = await fetchDealPipelines();
+  const list = results.map((p) => ({
+    id: p.id,
+    label: p.label?.trim() || p.id,
+    stageCount: p.stages?.length ?? 0,
+  }));
+  pipelinesListCache = { value: list, fetchedAt: Date.now() };
+  return list;
 }
 
-/** Map lifecycle stage label (lowercase) → HubSpot internal value for companies. */
-export async function getCompanyLifecycleStageMap(): Promise<
-  Map<string, string>
+async function loadCompanyLifecycleStages(): Promise<
+  Array<{ label: string; value: string }>
 > {
-  if (lifecycleStageCache) {
-    return lifecycleStageCache;
+  if (cacheFresh(lifecycleStageOptionsCache)) {
+    return lifecycleStageOptionsCache.value;
   }
 
   const data = await hubspotFetch<{
     options?: Array<{ label: string; value: string }>;
   }>("/crm/v3/properties/companies/lifecyclestage");
 
+  const options = (data.options ?? []).map((option) => ({
+    label: option.label,
+    value: option.value,
+  }));
+  lifecycleStageOptionsCache = { value: options, fetchedAt: Date.now() };
   lifecycleStageCache = new Map(
+    options.map((option) => [option.label.toLowerCase(), option.value]),
+  );
+
+  return options;
+}
+
+/**
+ * Resolve deal pipeline metadata.
+ * Prefers `pipelineId`, then `HUBSPOT_PIPELINE_ID`, then the first pipeline.
+ */
+export async function getPipelineMeta(
+  pipelineId?: string,
+): Promise<PipelineMeta> {
+  const wantId =
+    pipelineId?.trim() || process.env.HUBSPOT_PIPELINE_ID?.trim() || "";
+
+  if (
+    cacheFresh(pipelineCache) &&
+    (!wantId || pipelineCache.value.id === wantId)
+  ) {
+    return pipelineCache.value;
+  }
+
+  const results = await fetchDealPipelines();
+  const pipeline = wantId
+    ? results.find((p) => p.id === wantId)
+    : results[0];
+
+  if (!pipeline) {
+    const available = results
+      .map((p) => `${p.label?.trim() || p.id} (${p.id})`)
+      .join(", ");
+    throw new Error(
+      wantId
+        ? `No HubSpot deal pipeline with id "${wantId}". Available: ${available || "none"}`
+        : "No HubSpot deal pipeline found",
+    );
+  }
+
+  const meta = toPipelineMeta(pipeline);
+  pipelineCache = { value: meta, fetchedAt: Date.now() };
+  pipelinesListCache = {
+    value: results.map((p) => ({
+      id: p.id,
+      label: p.label?.trim() || p.id,
+      stageCount: p.stages?.length ?? 0,
+    })),
+    fetchedAt: Date.now(),
+  };
+  return meta;
+}
+
+async function getStageLabels(): Promise<Map<string, string>> {
+  // Merge labels across all pipelines so deals in any pipeline resolve.
+  const results = await fetchDealPipelines();
+  const labels = new Map<string, string>();
+  for (const pipeline of results) {
+    for (const stage of pipeline.stages ?? []) {
+      labels.set(stage.id, stage.label);
+    }
+  }
+  return labels;
+}
+
+export async function getLeadStatusMap(): Promise<Map<string, string>> {
+  if (cacheFresh(leadStatusCache)) {
+    return leadStatusCache.value;
+  }
+
+  const data = await hubspotFetch<{
+    options?: Array<{ label: string; value: string }>;
+  }>("/crm/v3/properties/contacts/hs_lead_status");
+
+  const map = new Map(
     (data.options ?? []).map((option) => [
       option.label.toLowerCase(),
       option.value,
     ]),
   );
+  leadStatusCache = { value: map, fetchedAt: Date.now() };
+  return map;
+}
 
-  return lifecycleStageCache;
+/** Map lifecycle stage label (lowercase) → HubSpot internal value for companies. */
+export async function getCompanyLifecycleStageMap(): Promise<
+  Map<string, string>
+> {
+  await loadCompanyLifecycleStages();
+  return lifecycleStageCache!;
+}
+
+/** Ordered HubSpot company lifecycle stage options (display label + value). */
+export async function getCompanyLifecycleStageOptions(): Promise<
+  Array<{ label: string; value: string }>
+> {
+  return loadCompanyLifecycleStages();
 }
 
 export type CompanyLifecycleMatch = {
@@ -1458,8 +1553,12 @@ export type CreateCompanyDealInput = {
   companyId: string;
   companyName: string;
   contactIds: string[];
-  /** Pipeline stage label; defaults to Prospecting. */
-  stageLabel?: string;
+  /** Pipeline stage label; required for create. */
+  stageLabel: string;
+  /** HubSpot deal pipeline id (optional; falls back to env / default). */
+  pipelineId?: string;
+  /** Company lifecycle stage label to set on the company. */
+  lifecycleStageLabel?: string;
   /** When true, create even if the company already has deals. */
   force?: boolean;
 };
@@ -1470,26 +1569,45 @@ export type CreateCompanyDealResult = {
   companyId: string;
   companyName: string;
   stageLabel: string;
+  pipelineLabel: string;
+  lifecycleStageLabel: string | null;
   associatedContactIds: string[];
 };
 
 /**
  * Create a deal on an existing company, named "[Company] - FlairX", and
  * associate the company plus every provided contact.
+ * Optionally updates the company's lifecycle stage.
  * Refuses if the company already has deals unless `force` is set.
  */
 export async function createDealForCompany(
   input: CreateCompanyDealInput,
 ): Promise<CreateCompanyDealResult> {
-  const pipeline = await getPipelineMeta();
-  const stageLabel = (input.stageLabel ?? "Prospecting").trim();
-  const stage =
-    pipeline.stageByLabel.get(stageLabel.toLowerCase()) ??
-    pipeline.stageByLabel.get("prospecting") ??
-    pipeline.stages[0];
+  const pipeline = await getPipelineMeta(input.pipelineId);
+  const stageLabel = input.stageLabel.trim();
+  const stage = pipeline.stageByLabel.get(stageLabel.toLowerCase());
 
   if (!stage) {
-    throw new Error("No deal pipeline stages found in HubSpot");
+    throw new Error(
+      `Unknown deal pipeline stage "${input.stageLabel}" in pipeline "${pipeline.label}"`,
+    );
+  }
+
+  let lifecycleValue: string | null = null;
+  let lifecycleLabel: string | null = null;
+  if (input.lifecycleStageLabel?.trim()) {
+    const options = await getCompanyLifecycleStageOptions();
+    const match = options.find(
+      (o) =>
+        o.label.toLowerCase() === input.lifecycleStageLabel!.trim().toLowerCase(),
+    );
+    if (!match) {
+      throw new Error(
+        `Unknown company lifecycle stage "${input.lifecycleStageLabel}"`,
+      );
+    }
+    lifecycleValue = match.value;
+    lifecycleLabel = match.label;
   }
 
   const dealName = formatCompanyDealName(input.companyName);
@@ -1518,12 +1636,20 @@ export async function createDealForCompany(
     await associateDefault("contacts", contactId, "deals", deal.id);
   }
 
+  if (lifecycleValue) {
+    await updateObjectProperties("companies", input.companyId, {
+      lifecyclestage: lifecycleValue,
+    });
+  }
+
   return {
     dealId: deal.id,
     dealName,
     companyId: input.companyId,
     companyName: input.companyName,
     stageLabel: stage.label,
+    pipelineLabel: pipeline.label,
+    lifecycleStageLabel: lifecycleLabel,
     associatedContactIds: [...input.contactIds],
   };
 }

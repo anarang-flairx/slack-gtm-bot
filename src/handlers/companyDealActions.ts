@@ -88,7 +88,9 @@ export function registerCompanyDealActions(app: App): void {
         companyId: pending.companyId,
         companyName: pending.companyName,
         contactIds: pending.contacts.map((c) => c.id),
+        pipelineId: pending.pipelineId,
         stageLabel: pending.stageLabel,
+        lifecycleStageLabel: pending.lifecycleStageLabel,
         force: pending.force === true,
       });
       completeCompanyDealAction(pendingId);
@@ -96,7 +98,10 @@ export function registerCompanyDealActions(app: App): void {
       const dealUrl = hubspotRecordUrl("deal", created.dealId);
       const companyUrl = hubspotRecordUrl("company", created.companyId);
       const contactCount = created.associatedContactIds.length;
-      const successText = `Deal created: <${dealUrl}|${created.dealName}> (${created.stageLabel}) · company <${companyUrl}|${created.companyName}> · ${contactCount} contact${contactCount === 1 ? "" : "s"} associated`;
+      const lifecyclePart = created.lifecycleStageLabel
+        ? ` · lifecycle *${created.lifecycleStageLabel}*`
+        : "";
+      const successText = `Deal created: <${dealUrl}|${created.dealName}> (${created.pipelineLabel} / ${created.stageLabel}) · company <${companyUrl}|${created.companyName}>${lifecyclePart} · ${contactCount} contact${contactCount === 1 ? "" : "s"} associated`;
       await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
