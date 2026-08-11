@@ -107,6 +107,7 @@ export type HubSpotContactContext = {
 
 let pipelineCache: PipelineMeta | null = null;
 let leadStatusCache: Map<string, string> | null = null;
+let lifecycleStageCache: Map<string, string> | null = null;
 
 export async function getPipelineMeta(): Promise<PipelineMeta> {
   if (pipelineCache) {
@@ -169,6 +170,84 @@ export async function getLeadStatusMap(): Promise<Map<string, string>> {
   );
 
   return leadStatusCache;
+}
+
+/** Map lifecycle stage label (lowercase) → HubSpot internal value for companies. */
+export async function getCompanyLifecycleStageMap(): Promise<
+  Map<string, string>
+> {
+  if (lifecycleStageCache) {
+    return lifecycleStageCache;
+  }
+
+  const data = await hubspotFetch<{
+    options?: Array<{ label: string; value: string }>;
+  }>("/crm/v3/properties/companies/lifecyclestage");
+
+  lifecycleStageCache = new Map(
+    (data.options ?? []).map((option) => [
+      option.label.toLowerCase(),
+      option.value,
+    ]),
+  );
+
+  return lifecycleStageCache;
+}
+
+export type CompanyLifecycleMatch = {
+  id: string;
+  name: string;
+  domain: string;
+  lifecycleStage: string;
+};
+
+/** List HubSpot companies whose lifecycle stage matches the given label. */
+export async function listCompaniesByLifecycleStage(
+  stageLabel: string,
+  maxResults = 50,
+): Promise<CompanyLifecycleMatch[]> {
+  const label = stageLabel.trim();
+  if (!label) {
+    return [];
+  }
+
+  const stageMap = await getCompanyLifecycleStageMap();
+  const stageValue =
+    stageMap.get(label.toLowerCase()) ??
+    [...stageMap.entries()].find(([key]) =>
+      key.includes(label.toLowerCase()),
+    )?.[1];
+
+  if (!stageValue) {
+    const valid = [...stageMap.keys()].join(", ");
+    throw new Error(
+      `"${stageLabel}" is not a valid company lifecycle stage. Valid options: ${valid}.`,
+    );
+  }
+
+  const results = await searchObjects("companies", {
+    filterGroups: [
+      {
+        filters: [
+          {
+            propertyName: "lifecyclestage",
+            operator: "EQ",
+            value: stageValue,
+          },
+        ],
+      },
+    ],
+    properties: ["name", "domain", "lifecyclestage"],
+    sorts: [{ propertyName: "name", direction: "ASCENDING" }],
+  });
+
+  return results.slice(0, maxResults).map((company) => ({
+    id: company.id,
+    name: company.properties.name?.trim() || "Untitled company",
+    domain: company.properties.domain?.trim() ?? "",
+    lifecycleStage:
+      company.properties.lifecyclestage?.trim() || stageLabel,
+  }));
 }
 
 export async function searchObjects(
@@ -1084,21 +1163,30 @@ export type CreateProspectResult = {
   stageLabel: string;
 };
 
-export async function createProspect(
+export type CreateContactResult = {
+  contactId: string;
+  companyId: string | null;
+  contactName: string;
+  companyName: string | null;
+};
+
+/** Canonical deal name for FlairX pipeline deals. */
+export function formatCompanyDealName(companyName: string): string {
+  const name = companyName.trim();
+  return name ? `${name} - FlairX` : "FlairX";
+}
+
+/** Create a HubSpot contact and optionally a linked company record. No deal. */
+export async function createContact(
   input: CreateProspectInput,
-): Promise<CreateProspectResult> {
-  const pipeline = await getPipelineMeta();
-  const prospecting =
-    pipeline.stageByLabel.get("prospecting") ?? pipeline.stages[0];
-
-  if (!prospecting) {
-    throw new Error("No Prospecting stage found in HubSpot deal pipeline");
-  }
-
+): Promise<CreateContactResult> {
   const contactName = `${input.firstName} ${input.lastName}`.trim();
-  const dealName = input.companyName
-    ? `${input.companyName} — ${contactName}`
-    : contactName;
+
+  let notes = input.notes?.trim() ?? "";
+  if (input.source?.trim()) {
+    const sourceLine = `Source: ${input.source.trim()}`;
+    notes = notes ? `${notes}\n${sourceLine}` : sourceLine;
+  }
 
   const contactProperties: Record<string, string> = {
     firstname: input.firstName,
@@ -1111,8 +1199,8 @@ export async function createProspect(
     ...(input.linkedin ? { hs_linkedin_url: input.linkedin } : {}),
   };
 
-  if (input.notes) {
-    contactProperties[contactNotesProperty()] = appendDatedNote("", input.notes);
+  if (notes) {
+    contactProperties[contactNotesProperty()] = appendDatedNote("", notes);
   }
 
   const contact = await createCrmObject("contacts", contactProperties);
@@ -1131,7 +1219,34 @@ export async function createProspect(
       });
       companyId = company.id;
     }
+    await associateDefault("contacts", contact.id, "companies", companyId);
   }
+
+  return {
+    contactId: contact.id,
+    companyId,
+    contactName,
+    companyName: input.companyName ?? null,
+  };
+}
+
+export async function createProspect(
+  input: CreateProspectInput,
+): Promise<CreateProspectResult> {
+  const pipeline = await getPipelineMeta();
+  const prospecting =
+    pipeline.stageByLabel.get("prospecting") ?? pipeline.stages[0];
+
+  if (!prospecting) {
+    throw new Error("No Prospecting stage found in HubSpot deal pipeline");
+  }
+
+  const { contactId, companyId, contactName, companyName } =
+    await createContact(input);
+
+  const dealName = companyName
+    ? formatCompanyDealName(companyName)
+    : formatCompanyDealName(contactName);
 
   const dealProperties: Record<string, string> = {
     dealname: dealName,
@@ -1142,20 +1257,77 @@ export async function createProspect(
 
   const deal = await createCrmObject("deals", dealProperties);
 
-  await associateDefault("contacts", contact.id, "deals", deal.id);
+  await associateDefault("contacts", contactId, "deals", deal.id);
   if (companyId) {
-    await associateDefault("contacts", contact.id, "companies", companyId);
     await associateDefault("companies", companyId, "deals", deal.id);
   }
 
   return {
-    contactId: contact.id,
+    contactId,
     dealId: deal.id,
     companyId,
     contactName,
     dealName,
-    companyName: input.companyName ?? null,
+    companyName,
     stageLabel: prospecting.label,
+  };
+}
+
+export type CreateCompanyDealInput = {
+  companyId: string;
+  companyName: string;
+  contactIds: string[];
+  /** Pipeline stage label; defaults to Prospecting. */
+  stageLabel?: string;
+};
+
+export type CreateCompanyDealResult = {
+  dealId: string;
+  dealName: string;
+  companyId: string;
+  companyName: string;
+  stageLabel: string;
+  associatedContactIds: string[];
+};
+
+/**
+ * Create a deal on an existing company, named "[Company] - FlairX", and
+ * associate the company plus every provided contact.
+ */
+export async function createDealForCompany(
+  input: CreateCompanyDealInput,
+): Promise<CreateCompanyDealResult> {
+  const pipeline = await getPipelineMeta();
+  const stageLabel = (input.stageLabel ?? "Prospecting").trim();
+  const stage =
+    pipeline.stageByLabel.get(stageLabel.toLowerCase()) ??
+    pipeline.stageByLabel.get("prospecting") ??
+    pipeline.stages[0];
+
+  if (!stage) {
+    throw new Error("No deal pipeline stages found in HubSpot");
+  }
+
+  const dealName = formatCompanyDealName(input.companyName);
+  const deal = await createCrmObject("deals", {
+    dealname: dealName,
+    dealstage: stage.id,
+    pipeline: pipeline.id,
+  });
+
+  await associateDefault("companies", input.companyId, "deals", deal.id);
+
+  for (const contactId of input.contactIds) {
+    await associateDefault("contacts", contactId, "deals", deal.id);
+  }
+
+  return {
+    dealId: deal.id,
+    dealName,
+    companyId: input.companyId,
+    companyName: input.companyName,
+    stageLabel: stage.label,
+    associatedContactIds: [...input.contactIds],
   };
 }
 

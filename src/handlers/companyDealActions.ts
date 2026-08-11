@@ -1,13 +1,13 @@
 import type { App } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
 import { hubspotRecordUrl } from "../digest/format.js";
-import { createContact, createProspect } from "../integrations/hubspot.js";
+import { createDealForCompany } from "../integrations/hubspot.js";
 import {
-  beginProspectAction,
-  completeProspectAction,
-  releaseProspectAction,
-  takeProspect,
-} from "../lib/prospectStore.js";
+  beginCompanyDealAction,
+  completeCompanyDealAction,
+  releaseCompanyDealAction,
+  takeCompanyDeal,
+} from "../lib/companyDealStore.js";
 import { postThread } from "../lib/slackPost.js";
 
 function actionContext(body: {
@@ -41,17 +41,12 @@ async function replaceMessage(
     channel: channelId,
     ts: messageTs,
     text,
-    blocks: [
-      {
-        type: "section",
-        text: { type: "mrkdwn", text },
-      },
-    ],
+    blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
   });
 }
 
-export function registerProspectActions(app: App): void {
-  app.action("approve_add_prospect", async ({ ack, body, action, client }) => {
+export function registerCompanyDealActions(app: App): void {
+  app.action("approve_create_company_deal", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -60,7 +55,7 @@ export function registerProspectActions(app: App): void {
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
     const pendingId = action.value;
-    const result = beginProspectAction(pendingId, userId);
+    const result = beginCompanyDealAction(pendingId, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -68,7 +63,7 @@ export function registerProspectActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This prospect preview expired. Mention me again to add the prospect.",
+          "This company deal preview expired. Mention me again to create the deal.",
         );
       }
       return;
@@ -80,7 +75,7 @@ export function registerProspectActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who created this prospect can approve or discard it.",
+          "Only the person who requested this deal can approve or discard it.",
         );
       }
       return;
@@ -89,59 +84,34 @@ export function registerProspectActions(app: App): void {
     const pending = result.pending;
 
     try {
-      const input = {
-        firstName: pending.firstName,
-        lastName: pending.lastName,
-        ...(pending.companyName ? { companyName: pending.companyName } : {}),
-        ...pending.fields,
-      };
+      const created = await createDealForCompany({
+        companyId: pending.companyId,
+        companyName: pending.companyName,
+        contactIds: pending.contacts.map((c) => c.id),
+        stageLabel: pending.stageLabel,
+      });
+      completeCompanyDealAction(pendingId);
 
-      if (pending.createDeal) {
-        const created = await createProspect(input);
-        completeProspectAction(pendingId);
-
-        const contactUrl = hubspotRecordUrl("contact", created.contactId);
-        const dealUrl = hubspotRecordUrl("deal", created.dealId);
-        const companyPart = created.companyId
-          ? ` · company <${hubspotRecordUrl("company", created.companyId)}|${created.companyName}>`
-          : "";
-
-        const successText = `Prospect created: contact <${contactUrl}|${created.contactName}> · deal <${dealUrl}|${created.dealName}> (${created.stageLabel})${companyPart}`;
-        await replaceMessage(client, channelId, messageTs, successText);
-
-        if (channelId && !messageTs) {
-          await postThread(client, channelId, threadTs, successText);
-        }
-        return;
-      }
-
-      const created = await createContact(input);
-      completeProspectAction(pendingId);
-
-      const contactUrl = hubspotRecordUrl("contact", created.contactId);
-      const companyPart = created.companyId
-        ? ` · company <${hubspotRecordUrl("company", created.companyId)}|${created.companyName}>`
-        : "";
-
-      const successText = `Contact added: <${contactUrl}|${created.contactName}>${companyPart}`;
+      const dealUrl = hubspotRecordUrl("deal", created.dealId);
+      const companyUrl = hubspotRecordUrl("company", created.companyId);
+      const contactCount = created.associatedContactIds.length;
+      const successText = `Deal created: <${dealUrl}|${created.dealName}> (${created.stageLabel}) · company <${companyUrl}|${created.companyName}> · ${contactCount} contact${contactCount === 1 ? "" : "s"} associated`;
       await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
         await postThread(client, channelId, threadTs, successText);
       }
     } catch (error) {
-      releaseProspectAction(pendingId);
-
+      releaseCompanyDealAction(pendingId);
       const message =
-        error instanceof Error ? error.message : "Failed to create prospect";
-
+        error instanceof Error ? error.message : "Failed to create company deal";
       if (channelId) {
         await postThread(client, channelId, threadTs, message);
       }
     }
   });
 
-  app.action("discard_add_prospect", async ({ ack, body, action, client }) => {
+  app.action("discard_create_company_deal", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -149,7 +119,7 @@ export function registerProspectActions(app: App): void {
     }
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
-    const result = takeProspect(action.value, userId);
+    const result = takeCompanyDeal(action.value, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -157,7 +127,7 @@ export function registerProspectActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This prospect preview already expired or was discarded.",
+          "This company deal preview already expired or was discarded.",
         );
       }
       return;
@@ -169,13 +139,13 @@ export function registerProspectActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who created this prospect can approve or discard it.",
+          "Only the person who requested this deal can approve or discard it.",
         );
       }
       return;
     }
 
-    const discardText = `Prospect for *${result.pending.displayName}* discarded.`;
+    const discardText = `Deal for *${result.pending.companyName}* discarded.`;
     await replaceMessage(client, channelId, messageTs, discardText);
 
     if (channelId && !messageTs) {

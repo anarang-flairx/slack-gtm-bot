@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { App } from "@slack/bolt";
 import OpenAI from "openai";
+import { registerCompanyDealActions } from "./handlers/companyDealActions.js";
 import { registerDigestActions } from "./handlers/digestActions.js";
 import { registerEmailActions } from "./handlers/emailActions.js";
 import { registerMentionHandler } from "./handlers/mention.js";
@@ -45,6 +46,7 @@ registerMentionHandler(app, echoMode, openai);
 registerEmailActions(app);
 registerNoteActions(app);
 registerProspectActions(app);
+registerCompanyDealActions(app);
 registerStageMoveActions(app);
 registerReminderActions(app);
 registerLeadStatusActions(app);

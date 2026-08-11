@@ -71,23 +71,58 @@ export function buildProspectPreviewBlocks(
   companyName: string | undefined,
   fields: ProspectFields,
   pendingId: string,
+  createDeal = false,
 ): KnownBlock[] {
+  const header = createDeal ? "Add prospect preview" : "Add contact preview";
+  const approveLabel = createDeal
+    ? "Approve → create prospect"
+    : "Approve → add contact";
+
+  const fieldsSection: KnownBlock[] = createDeal
+    ? [
+        {
+          type: "section",
+          fields: [
+            { type: "mrkdwn", text: `*Contact:*\n${displayName}` },
+            {
+              type: "mrkdwn",
+              text: `*Company:*\n${companyName || "— (contact + deal only)"}`,
+            },
+            {
+              type: "mrkdwn",
+              text: `*Deal name:*\n${companyName ? `${companyName} - FlairX` : `${displayName} - FlairX`}`,
+            },
+            { type: "mrkdwn", text: `*Deal stage:*\nProspecting` },
+          ],
+        },
+      ]
+    : [
+        {
+          type: "section",
+          fields: [
+            { type: "mrkdwn", text: `*Contact:*\n${displayName}` },
+            {
+              type: "mrkdwn",
+              text: `*Company:*\n${companyName || "—"}`,
+            },
+          ],
+        },
+      ];
+
+  const approveText = createDeal
+    ? companyName
+      ? "On approve: create HubSpot *contact*, *company* (or reuse exact name match), and *deal* named `[Company] - FlairX` in Prospecting, then associate them."
+      : "On approve: create HubSpot *contact* and *deal* named `[Contact] - FlairX` in Prospecting, then associate them."
+    : companyName
+      ? "On approve: create HubSpot *contact* and *company* (or reuse exact name match), then associate them. No deal is created."
+      : "On approve: create HubSpot *contact* only. No deal is created.";
+
   return [
     {
       type: "header",
-      text: { type: "plain_text", text: "Add prospect preview" },
+      text: { type: "plain_text", text: header },
     },
-    {
-      type: "section",
-      fields: [
-        { type: "mrkdwn", text: `*Contact:*\n${displayName}` },
-        {
-          type: "mrkdwn",
-          text: `*Company:*\n${companyName || "— (contact + deal only)"}`,
-        },
-        { type: "mrkdwn", text: `*Deal stage:*\nProspecting` },
-      ],
-    },
+    ...fieldsSection,
     {
       type: "section",
       text: {
@@ -97,19 +132,14 @@ export function buildProspectPreviewBlocks(
     },
     {
       type: "section",
-      text: {
-        type: "mrkdwn",
-        text: companyName
-          ? "On approve: create HubSpot *contact*, *company* (or reuse exact name match), and *deal* in Prospecting, then associate them."
-          : "On approve: create HubSpot *contact* and *deal* in Prospecting, then associate them.",
-      },
+      text: { type: "mrkdwn", text: approveText },
     },
     {
       type: "actions",
       elements: [
         {
           type: "button",
-          text: { type: "plain_text", text: "Approve → HubSpot" },
+          text: { type: "plain_text", text: approveLabel },
           style: "primary",
           action_id: "approve_add_prospect",
           value: pendingId,
@@ -278,6 +308,82 @@ export function buildStageMovePreviewBlocks(
           text: { type: "plain_text", text: "Discard" },
           style: "danger",
           action_id: "discard_stage_move",
+          value: pendingId,
+        },
+      ],
+    },
+  ];
+}
+
+export function buildCompanyDealPreviewBlocks(
+  companyName: string,
+  companyId: string,
+  dealName: string,
+  stageLabel: string,
+  contacts: Array<{ id: string; name: string; email: string }>,
+  pendingId: string,
+): KnownBlock[] {
+  const companyUrl = hubspotRecordUrl("company", companyId);
+  const contactLines =
+    contacts.length === 0
+      ? "_No contacts on this company yet — deal will be associated to the company only._"
+      : contacts
+          .map((contact) => {
+            const url = hubspotRecordUrl("contact", contact.id);
+            const email = contact.email ? ` · ${contact.email}` : "";
+            return `• <${url}|${contact.name}>${email}`;
+          })
+          .join("\n");
+
+  return [
+    {
+      type: "header",
+      text: { type: "plain_text", text: "Create company deal preview" },
+    },
+    {
+      type: "section",
+      fields: [
+        {
+          type: "mrkdwn",
+          text: `*Company:*\n<${companyUrl}|${companyName}>`,
+        },
+        { type: "mrkdwn", text: `*Deal name:*\n${dealName}` },
+        { type: "mrkdwn", text: `*Stage:*\n${stageLabel}` },
+        {
+          type: "mrkdwn",
+          text: `*Contacts to associate:*\n${contacts.length}`,
+        },
+      ],
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Contacts*\n${contactLines}`,
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "On approve: create the HubSpot *deal*, associate the *company*, and associate *all* listed contacts.",
+      },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Approve → create deal" },
+          style: "primary",
+          action_id: "approve_create_company_deal",
+          value: pendingId,
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Discard" },
+          style: "danger",
+          action_id: "discard_create_company_deal",
           value: pendingId,
         },
       ],

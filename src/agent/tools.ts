@@ -2,15 +2,17 @@ import type { App } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
 import type OpenAI from "openai";
 import {
-  createProspect,
   findCompaniesByName,
   findContactsByName,
   getAssociatedCompany,
+  getCompanyLifecycleStageMap,
   getCompanyStatus,
   getLeadStatusMap,
   getObjectProperties,
   getPipelineMeta,
   findNoteRecords,
+  formatCompanyDealName,
+  listCompaniesByLifecycleStage,
   resolveDealsForStageMove,
   type NoteRecordMatch,
 } from "../integrations/hubspot.js";
@@ -21,12 +23,14 @@ import {
 import { buildDailyDigest } from "../digest/buildDailyDigest.js";
 import { createDraftByContactId } from "../lib/createDraft.js";
 import { saveDraft } from "../lib/draftStore.js";
+import { savePendingCompanyDeal } from "../lib/companyDealStore.js";
 import { savePendingLeadStatus } from "../lib/leadStatusStore.js";
 import { savePendingNoteUpdate } from "../lib/noteUpdateStore.js";
 import { savePendingProspect } from "../lib/prospectStore.js";
 import { savePendingReminder } from "../lib/reminderStore.js";
 import { savePendingStageMove } from "../lib/stageMoveStore.js";
 import {
+  buildCompanyDealPreviewBlocks,
   buildCompanyStatusBlocks,
   buildCustomEmailDraftPreviewBlocks,
   buildEmailDraftPreviewBlocks,
@@ -105,6 +109,33 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "get_company_lifecycle_stages",
+      description:
+        "List the HubSpot company lifecycle stage options (e.g. Lead, Opportunity, Customer). Use before listing companies by stage if the user’s wording is unclear.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_companies_by_lifecycle_stage",
+      description:
+        "List HubSpot companies in a given lifecycle stage (e.g. Customer, Lead, Opportunity). Use for 'show me all customers' or 'which companies are in the Customer stage'.",
+      parameters: {
+        type: "object",
+        properties: {
+          stage: {
+            type: "string",
+            description: "Lifecycle stage label, e.g. 'Customer'",
+          },
+        },
+        required: ["stage"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "search_records",
       description:
         "Search HubSpot for contacts, deals, and companies matching a name. Use to look up records or disambiguate before another action.",
@@ -163,9 +194,36 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "add_contact",
+      description:
+        "Prepare a new HubSpot contact (+ optional company). No deal is created. Posts an approval card; records are only created after approval. Use for 'add <person> to HubSpot/contacts', badge scans, and screenshot leads unless the user explicitly asks for a deal or prospect.",
+      parameters: {
+        type: "object",
+        properties: {
+          first_name: { type: "string" },
+          last_name: { type: "string" },
+          company_name: { type: "string" },
+          email: { type: "string" },
+          phone: { type: "string" },
+          mobile: { type: "string" },
+          title: { type: "string" },
+          source: {
+            type: "string",
+            description: "Where you met them (stored in contact notes)",
+          },
+          notes: { type: "string" },
+          linkedin: { type: "string" },
+        },
+        required: ["first_name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "add_prospect",
       description:
-        "Prepare a new HubSpot contact (+ optional company) and a deal in the Prospecting stage. Posts an approval card; records are only created after approval. Use for 'add <person> to HubSpot'.",
+        "Prepare a new HubSpot contact (+ optional company) AND a deal in the Prospecting stage. Posts an approval card; records are only created after approval. Use only when the user explicitly wants a deal/prospect in the pipeline for a *new person* — not for a simple 'add to contacts', and not for creating a deal on an existing company (use create_company_deal for that).",
       parameters: {
         type: "object",
         properties: {
@@ -181,6 +239,34 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           linkedin: { type: "string" },
         },
         required: ["first_name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_company_deal",
+      description:
+        "Prepare a new HubSpot deal on an *existing* company. Deal name is always '[Company] - FlairX'. Associates the company and ALL of its existing contacts. Posts an approval card; the deal is only created after approval. Use for 'move X to deals', 'create a deal for X', 'add X to the pipeline' when X is a company. Do not ask which contacts to include. Default stage is Prospecting unless the user names another stage.",
+      parameters: {
+        type: "object",
+        properties: {
+          company_name: {
+            type: "string",
+            description: "Existing HubSpot company name",
+          },
+          company_id: {
+            type: "string",
+            description:
+              "HubSpot company id to disambiguate when the name matched multiple companies. Optional.",
+          },
+          stage: {
+            type: "string",
+            description:
+              "Pipeline stage label (default Prospecting), e.g. 'Prospecting' or 'Qualification'",
+          },
+        },
+        required: ["company_name"],
       },
     },
   },
@@ -430,9 +516,10 @@ async function runUpdateLeadStatus(
   return `Posted an approval card to set ${contact.name}'s lead status to "${statusLabel}". Waiting for the user to Approve or Discard.`;
 }
 
-async function runAddProspect(
+async function runAddPerson(
   ctx: ToolContext,
   args: Record<string, unknown>,
+  createDeal: boolean,
 ): Promise<string> {
   const firstName = String(args.first_name ?? "").trim();
   if (!firstName) {
@@ -466,18 +553,138 @@ async function runAddProspect(
     ...(companyName ? { companyName } : {}),
     displayName,
     fields,
+    createDeal,
     createdBy: ctx.userId,
     channelId: ctx.channel,
     threadTs: ctx.threadTs,
   });
 
+  const cardLabel = createDeal ? "Prospect" : "Contact";
   await postCard(
     ctx,
-    `Prospect ready for ${displayName}`,
-    buildProspectPreviewBlocks(displayName, companyName, fields, pending.id),
+    `${cardLabel} ready for ${displayName}`,
+    buildProspectPreviewBlocks(
+      displayName,
+      companyName,
+      fields,
+      pending.id,
+      createDeal,
+    ),
   );
 
-  return `Posted an approval card to add ${displayName}${companyName ? ` at ${companyName}` : ""} as a prospect. Waiting for the user to Approve or Discard.`;
+  const action = createDeal
+    ? `add ${displayName}${companyName ? ` at ${companyName}` : ""} as a prospect (contact + deal)`
+    : `add ${displayName}${companyName ? ` at ${companyName}` : ""} as a contact`;
+  return `Posted an approval card to ${action}. Waiting for the user to Approve or Discard.`;
+}
+
+async function runAddProspect(
+  ctx: ToolContext,
+  args: Record<string, unknown>,
+): Promise<string> {
+  return runAddPerson(ctx, args, true);
+}
+
+async function runAddContact(
+  ctx: ToolContext,
+  args: Record<string, unknown>,
+): Promise<string> {
+  return runAddPerson(ctx, args, false);
+}
+
+async function runCreateCompanyDeal(
+  ctx: ToolContext,
+  args: Record<string, unknown>,
+): Promise<string> {
+  const companyName = String(args.company_name ?? "").trim();
+  if (!companyName) {
+    return "Missing company_name.";
+  }
+
+  const companyIdArg = args.company_id
+    ? String(args.company_id).trim()
+    : "";
+  const requestedStage = args.stage
+    ? String(args.stage).trim()
+    : "Prospecting";
+
+  const pipeline = await getPipelineMeta();
+  const stage =
+    pipeline.stageByLabel.get(requestedStage.toLowerCase()) ??
+    (requestedStage.toLowerCase() === "prospecting"
+      ? pipeline.stages[0]
+      : undefined);
+  if (!stage) {
+    const valid = pipeline.stages.map((s) => s.label).join(", ");
+    return `"${requestedStage}" is not a valid stage. Valid stages: ${valid}.`;
+  }
+
+  let company: { id: string; name: string; domain: string };
+
+  if (companyIdArg) {
+    const props = await getObjectProperties("companies", companyIdArg, [
+      "name",
+      "domain",
+    ]);
+    company = {
+      id: companyIdArg,
+      name: props.name?.trim() || companyName,
+      domain: props.domain?.trim() ?? "",
+    };
+  } else {
+    const matches = await findCompaniesByName(companyName);
+    if (matches.length === 0) {
+      return `No HubSpot company matching "${companyName}".`;
+    }
+    if (matches.length > 1) {
+      const options = matches
+        .map(
+          (m, i) =>
+            `${i + 1}. ${m.name}${m.domain ? ` — ${m.domain}` : ""} (company_id: ${m.id})`,
+        )
+        .join("\n");
+      return `Multiple companies match "${companyName}". Show the user this NUMBERED list (do not show the company_id) and ask them to reply with just the number. When they pick one, call create_company_deal again with that company_id. Do not ask about contacts or deal name.\n${options}`;
+    }
+    company = matches[0];
+  }
+
+  const status = await getCompanyStatus(company.id);
+  const contacts = status.contacts.map((c) => ({
+    id: c.id,
+    name: c.name,
+    email: c.email,
+  }));
+  const dealName = formatCompanyDealName(company.name);
+
+  const pending = savePendingCompanyDeal({
+    companyId: company.id,
+    companyName: company.name,
+    dealName,
+    stageLabel: stage.label,
+    contacts,
+    createdBy: ctx.userId,
+    channelId: ctx.channel,
+    ...(ctx.threadTs ? { threadTs: ctx.threadTs } : {}),
+  });
+
+  await postCard(
+    ctx,
+    `Company deal ready for ${company.name}`,
+    buildCompanyDealPreviewBlocks(
+      company.name,
+      company.id,
+      dealName,
+      stage.label,
+      contacts,
+      pending.id,
+    ),
+  );
+
+  const contactSummary =
+    contacts.length === 0
+      ? "no contacts to associate yet"
+      : `${contacts.length} contact(s) will be associated`;
+  return `Posted an approval card to create deal "${dealName}" in ${stage.label} for ${company.name} (${contactSummary}). Waiting for the user to Approve or Discard. Do not ask about contacts or deal name — both are already set.`;
 }
 
 async function runMoveDealStage(
@@ -789,6 +996,34 @@ export async function executeTool(
         : "No lead statuses configured.";
     }
 
+    case "get_company_lifecycle_stages": {
+      const map = await getCompanyLifecycleStageMap();
+      const labels = [...map.keys()];
+      return labels.length > 0
+        ? labels.join(", ")
+        : "No company lifecycle stages configured.";
+    }
+
+    case "list_companies_by_lifecycle_stage": {
+      const stage = String(args.stage ?? "").trim();
+      if (!stage) {
+        return "Missing lifecycle stage.";
+      }
+      const companies = await listCompaniesByLifecycleStage(stage);
+      if (companies.length === 0) {
+        return `No companies found in lifecycle stage "${stage}".`;
+      }
+      const lines = companies.map((c, i) => {
+        const domain = c.domain ? ` — ${c.domain}` : "";
+        return `${i + 1}. ${c.name}${domain}`;
+      });
+      const suffix =
+        companies.length >= 50
+          ? "\n\n(Showing first 50. Ask me to narrow the list if needed.)"
+          : "";
+      return `Companies in *${stage}* (${companies.length}):\n${lines.join("\n")}${suffix}`;
+    }
+
     case "search_records": {
       const result = await findNoteRecords(String(args.query ?? "")).catch(
         (error: unknown) =>
@@ -849,8 +1084,14 @@ export async function executeTool(
         args.contact_id ? String(args.contact_id) : "",
       );
 
+    case "add_contact":
+      return runAddContact(ctx, args);
+
     case "add_prospect":
       return runAddProspect(ctx, args);
+
+    case "create_company_deal":
+      return runCreateCompanyDeal(ctx, args);
 
     case "move_deal_stage":
       return runMoveDealStage(ctx, args);

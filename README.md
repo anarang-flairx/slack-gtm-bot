@@ -89,9 +89,15 @@ The CEO also has Codex connected to HubSpot (MCP) and Gmail, which covers the sa
 
 1. Create an app at [api.slack.com](https://api.slack.com/apps)
 2. Enable **Socket Mode** and create an app-level token (`connections:write`)
-3. Add bot scopes: `app_mentions:read`, `chat:write`, `channels:history`, `groups:history`
-4. Subscribe to bot event: `app_mention`
+3. Add bot scopes: `app_mentions:read`, `chat:write`, `channels:history`, `groups:history`, `im:history`, `mpim:history`
+4. Subscribe to bot events:
+   - `app_mention`
+   - `message.channels` (public channels)
+   - `message.groups` (private channels)
+   - `message.im` / `message.mpim` (if you use the bot in DMs)
 5. Install to workspace
+
+Thread follow-ups work **without** another `@mention` once the bot has replied in that thread — that requires the `message.*` subscriptions above. If you only subscribe to `app_mention`, users must tag the bot on every message.
 
 No slash commands are needed. If you're upgrading from an older version, **delete the old slash commands** (`/intro-draft`, `/event-follow-up`, `/update-notes`, `/digest`, `/current-status`, `/add-prospect`) in the Slack app settings so they don't show `dispatch_failed` — everything now runs through `@mention`.
 
