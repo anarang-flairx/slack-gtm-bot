@@ -1182,6 +1182,15 @@ export async function createContact(
 ): Promise<CreateContactResult> {
   const contactName = `${input.firstName} ${input.lastName}`.trim();
 
+  if (input.email?.trim()) {
+    const existing = await findContactByEmail(input.email);
+    if (existing) {
+      throw new Error(
+        `Contact already exists: ${existing.name} <${input.email.trim()}>. Not creating a duplicate.`,
+      );
+    }
+  }
+
   let notes = input.notes?.trim() ?? "";
   if (input.source?.trim()) {
     const sourceLine = `Source: ${input.source.trim()}`;
@@ -1241,6 +1250,26 @@ export async function createProspect(
     throw new Error("No Prospecting stage found in HubSpot deal pipeline");
   }
 
+  // Resolve company first so we can refuse a duplicate FlairX deal before
+  // creating the contact.
+  if (input.companyName) {
+    const existing = await findCompaniesByName(input.companyName);
+    const exact = existing.find(
+      (c) => c.name.toLowerCase() === input.companyName!.toLowerCase(),
+    );
+    if (exact) {
+      const status = await getCompanyStatus(exact.id);
+      if (status.deals.length > 0) {
+        const existingDeals = status.deals
+          .map((d) => `"${d.name}" (${d.stage})`)
+          .join(", ");
+        throw new Error(
+          `${exact.name} already has deal(s): ${existingDeals}. Not creating a duplicate deal. Add the contact with add_contact instead, or use the existing deal.`,
+        );
+      }
+    }
+  }
+
   const { contactId, companyId, contactName, companyName } =
     await createContact(input);
 
@@ -1279,6 +1308,8 @@ export type CreateCompanyDealInput = {
   contactIds: string[];
   /** Pipeline stage label; defaults to Prospecting. */
   stageLabel?: string;
+  /** When true, create even if the company already has deals. */
+  force?: boolean;
 };
 
 export type CreateCompanyDealResult = {
@@ -1293,6 +1324,7 @@ export type CreateCompanyDealResult = {
 /**
  * Create a deal on an existing company, named "[Company] - FlairX", and
  * associate the company plus every provided contact.
+ * Refuses if the company already has deals unless `force` is set.
  */
 export async function createDealForCompany(
   input: CreateCompanyDealInput,
@@ -1309,6 +1341,19 @@ export async function createDealForCompany(
   }
 
   const dealName = formatCompanyDealName(input.companyName);
+
+  if (!input.force) {
+    const status = await getCompanyStatus(input.companyId);
+    if (status.deals.length > 0) {
+      const existing = status.deals
+        .map((d) => `"${d.name}" (${d.stage})`)
+        .join(", ");
+      throw new Error(
+        `${input.companyName} already has deal(s): ${existing}. Not creating a duplicate.`,
+      );
+    }
+  }
+
   const deal = await createCrmObject("deals", {
     dealname: dealName,
     dealstage: stage.id,

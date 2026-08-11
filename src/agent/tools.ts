@@ -3,6 +3,7 @@ import type { KnownBlock } from "@slack/types";
 import type OpenAI from "openai";
 import {
   findCompaniesByName,
+  findContactByEmail,
   findContactsByName,
   getAssociatedCompany,
   getCompanyLifecycleStageMap,
@@ -21,6 +22,7 @@ import {
   listThreadsAwaitingReply,
 } from "../integrations/gmail.js";
 import { buildDailyDigest } from "../digest/buildDailyDigest.js";
+import { hubspotRecordUrl } from "../digest/format.js";
 import { createDraftByContactId } from "../lib/createDraft.js";
 import { saveDraft } from "../lib/draftStore.js";
 import { savePendingCompanyDeal } from "../lib/companyDealStore.js";
@@ -196,7 +198,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "add_contact",
       description:
-        "Prepare a new HubSpot contact (+ optional company). No deal is created. Posts an approval card; records are only created after approval. Use for 'add <person> to HubSpot/contacts', badge scans, and screenshot leads unless the user explicitly asks for a deal or prospect.",
+        "Prepare a new HubSpot contact (+ optional company). No deal is created. Checks for an existing contact by email/name first and refuses duplicates. Reuses an exact-match company if one exists. Posts an approval card; records are only created after approval. Use for 'add <person> to HubSpot/contacts', badge scans, and screenshot leads unless the user explicitly asks for a deal or prospect.",
       parameters: {
         type: "object",
         properties: {
@@ -223,7 +225,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "add_prospect",
       description:
-        "Prepare a new HubSpot contact (+ optional company) AND a deal in the Prospecting stage. Posts an approval card; records are only created after approval. Use only when the user explicitly wants a deal/prospect in the pipeline for a *new person* — not for a simple 'add to contacts', and not for creating a deal on an existing company (use create_company_deal for that).",
+        "Prepare a new HubSpot contact (+ optional company) AND a deal in the Prospecting stage. Checks for existing contacts/companies/deals first and refuses duplicates. Use only when the user explicitly wants a deal/prospect in the pipeline for a *new person* — not for a simple 'add to contacts', and not for creating a deal on an existing company (use create_company_deal for that).",
       parameters: {
         type: "object",
         properties: {
@@ -247,7 +249,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "create_company_deal",
       description:
-        "Create a NEW HubSpot deal on an *existing* company. THIS is the tool for 'move X to deals', 'add X to deals/pipeline', 'create a deal for X', 'new deal for X', or thread follow-ups like 'new deal' / 'create a new one' about a company. Deal name is always '[Company] - FlairX'. Associates the company and ALL existing contacts automatically — never ask for contacts, deal name, first name, or email. Posts an approval card. Default stage is Prospecting unless the user names another stage. Do NOT use move_deal_stage or add_prospect for these requests.",
+        "Create a NEW HubSpot deal on an *existing* company. THIS is the tool for 'move X to deals', 'add X to deals/pipeline', 'create a deal for X', 'new deal for X', or thread follow-ups like 'new deal' / 'create a new one' about a company. Deal name is always '[Company] - FlairX'. Associates the company and ALL existing contacts automatically — never ask for contacts, deal name, first name, or email. Posts an approval card. Default stage is Prospecting unless the user names another stage. Checks for existing deals first and refuses duplicates unless force=true. Do NOT use move_deal_stage or add_prospect for these requests.",
       parameters: {
         type: "object",
         properties: {
@@ -264,6 +266,11 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
             type: "string",
             description:
               "Pipeline stage label (default Prospecting), e.g. 'Prospecting' or 'Qualification'",
+          },
+          force: {
+            type: "boolean",
+            description:
+              "Set true only when the user explicitly asks to create another deal even though the company already has one(s).",
           },
         },
         required: ["company_name"],
@@ -547,6 +554,64 @@ async function runAddPerson(
   }
 
   const displayName = `${firstName} ${lastName}`.trim();
+
+  // Dedupe contact by email (strongest) then by name.
+  if (fields.email) {
+    const existingByEmail = await findContactByEmail(fields.email);
+    if (existingByEmail) {
+      const url = hubspotRecordUrl("contact", existingByEmail.id);
+      return `Contact already exists: <${url}|${existingByEmail.name}> (${fields.email}). Do NOT create a duplicate. Tell the user this contact is already in HubSpot. If they wanted a company deal, call create_company_deal for the company instead.`;
+    }
+  }
+
+  const nameMatches = await findContactsByName(displayName);
+  const sameName = nameMatches.filter(
+    (m) => m.name.toLowerCase() === displayName.toLowerCase(),
+  );
+  if (sameName.length > 0) {
+    const lines = sameName
+      .map((m) => {
+        const url = hubspotRecordUrl("contact", m.id);
+        const bits = [m.email, m.company].filter(Boolean).join(" · ");
+        return `• <${url}|${m.name}>${bits ? ` — ${bits}` : ""}`;
+      })
+      .join("\n");
+    return `Contact(s) named "${displayName}" already exist:\n${lines}\nDo NOT create a duplicate. Tell the user and ask whether to use the existing record (e.g. update notes) instead.`;
+  }
+
+  let companyReuseNote: string | undefined;
+  if (companyName) {
+    const companies = await findCompaniesByName(companyName);
+    const exact = companies.find(
+      (c) => c.name.toLowerCase() === companyName.toLowerCase(),
+    );
+    if (exact) {
+      const url = hubspotRecordUrl("company", exact.id);
+      companyReuseNote = `Company already exists — will reuse <${url}|${exact.name}> (not create a new company).`;
+
+      if (createDeal) {
+        const status = await getCompanyStatus(exact.id);
+        if (status.deals.length > 0) {
+          const dealLines = status.deals
+            .map((d) => {
+              const dealUrl = hubspotRecordUrl("deal", d.id);
+              return `• <${dealUrl}|${d.name}> — ${d.stage}`;
+            })
+            .join("\n");
+          return `${exact.name} already has deal(s):\n${dealLines}\nDo NOT create a duplicate prospect/deal. Tell the user. If they only need the person in HubSpot, call add_contact instead. If they insist on another deal, call create_company_deal with force=true.`;
+        }
+      }
+    } else if (companies.length > 0) {
+      const options = companies
+        .map(
+          (c, i) =>
+            `${i + 1}. ${c.name}${c.domain ? ` — ${c.domain}` : ""}`,
+        )
+        .join("\n");
+      return `No exact company named "${companyName}", but similar companies exist:\n${options}\nAsk the user whether to reuse one of these (reply with the number / name) or create a new company with the exact name they gave.`;
+    }
+  }
+
   const pending = savePendingProspect({
     firstName,
     lastName,
@@ -569,13 +634,18 @@ async function runAddPerson(
       fields,
       pending.id,
       createDeal,
+      companyReuseNote,
     ),
   );
 
   const action = createDeal
     ? `add ${displayName}${companyName ? ` at ${companyName}` : ""} as a prospect (contact + deal)`
     : `add ${displayName}${companyName ? ` at ${companyName}` : ""} as a contact`;
-  return `Posted an approval card to ${action}. Waiting for the user to Approve or Discard.`;
+  const reuse =
+    companyReuseNote != null
+      ? " Existing company will be reused."
+      : "";
+  return `Posted an approval card to ${action}.${reuse} Waiting for the user to Approve or Discard.`;
 }
 
 async function runAddProspect(
@@ -607,6 +677,7 @@ async function runCreateCompanyDeal(
   const requestedStage = args.stage
     ? String(args.stage).trim()
     : "Prospecting";
+  const force = args.force === true;
 
   const pipeline = await getPipelineMeta();
   const stage =
@@ -634,7 +705,7 @@ async function runCreateCompanyDeal(
   } else {
     const matches = await findCompaniesByName(companyName);
     if (matches.length === 0) {
-      return `No HubSpot company matching "${companyName}".`;
+      return `No HubSpot company matching "${companyName}". A company must already exist before creating a deal — do not invent one. Tell the user no company was found.`;
     }
     if (matches.length > 1) {
       const options = matches
@@ -656,12 +727,23 @@ async function runCreateCompanyDeal(
   }));
   const dealName = formatCompanyDealName(company.name);
 
+  if (status.deals.length > 0 && !force) {
+    const dealLines = status.deals
+      .map((d) => {
+        const url = hubspotRecordUrl("deal", d.id);
+        return `• <${url}|${d.name}> — ${d.stage}`;
+      })
+      .join("\n");
+    return `${company.name} already has ${status.deals.length} deal(s):\n${dealLines}\nDo NOT create a duplicate. Tell the user these deals already exist. Only call create_company_deal again with force=true if they explicitly ask to create another deal anyway.`;
+  }
+
   const pending = savePendingCompanyDeal({
     companyId: company.id,
     companyName: company.name,
     dealName,
     stageLabel: stage.label,
     contacts,
+    force,
     createdBy: ctx.userId,
     channelId: ctx.channel,
     ...(ctx.threadTs ? { threadTs: ctx.threadTs } : {}),
@@ -677,6 +759,7 @@ async function runCreateCompanyDeal(
       stage.label,
       contacts,
       pending.id,
+      force && status.deals.length > 0 ? status.deals : undefined,
     ),
   );
 
@@ -684,7 +767,11 @@ async function runCreateCompanyDeal(
     contacts.length === 0
       ? "no contacts to associate yet"
       : `${contacts.length} contact(s) will be associated`;
-  return `Posted an approval card to create deal "${dealName}" in ${stage.label} for ${company.name} (${contactSummary}). Waiting for the user to Approve or Discard. Do not ask about contacts or deal name — both are already set.`;
+  const forceNote =
+    force && status.deals.length > 0
+      ? " (force=true — creating an additional deal despite existing ones)"
+      : "";
+  return `Posted an approval card to create deal "${dealName}" in ${stage.label} for ${company.name} (${contactSummary})${forceNote}. Waiting for the user to Approve or Discard. Do not ask about contacts or deal name — both are already set.`;
 }
 
 async function runMoveDealStage(

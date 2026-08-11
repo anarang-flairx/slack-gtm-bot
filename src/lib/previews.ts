@@ -72,6 +72,7 @@ export function buildProspectPreviewBlocks(
   fields: ProspectFields,
   pendingId: string,
   createDeal = false,
+  companyReuseNote?: string,
 ): KnownBlock[] {
   const header = createDeal ? "Add prospect preview" : "Add contact preview";
   const approveLabel = createDeal
@@ -130,6 +131,14 @@ export function buildProspectPreviewBlocks(
         text: `*Details*\n${formatProspectFields(fields)}`,
       },
     },
+    ...(companyReuseNote
+      ? [
+          {
+            type: "section" as const,
+            text: { type: "mrkdwn" as const, text: companyReuseNote },
+          },
+        ]
+      : []),
     {
       type: "section",
       text: { type: "mrkdwn", text: approveText },
@@ -322,6 +331,7 @@ export function buildCompanyDealPreviewBlocks(
   stageLabel: string,
   contacts: Array<{ id: string; name: string; email: string }>,
   pendingId: string,
+  existingDeals?: Array<{ id: string; name: string; stage: string }>,
 ): KnownBlock[] {
   const companyUrl = hubspotRecordUrl("company", companyId);
   const contactLines =
@@ -334,6 +344,16 @@ export function buildCompanyDealPreviewBlocks(
             return `• <${url}|${contact.name}>${email}`;
           })
           .join("\n");
+
+  const existingDealLines =
+    existingDeals && existingDeals.length > 0
+      ? existingDeals
+          .map((deal) => {
+            const url = hubspotRecordUrl("deal", deal.id);
+            return `• <${url}|${deal.name}> — ${deal.stage}`;
+          })
+          .join("\n")
+      : "";
 
   return [
     {
@@ -362,6 +382,17 @@ export function buildCompanyDealPreviewBlocks(
         text: `*Contacts*\n${contactLines}`,
       },
     },
+    ...(existingDealLines
+      ? [
+          {
+            type: "section" as const,
+            text: {
+              type: "mrkdwn" as const,
+              text: `*Existing deals (creating another anyway)*\n${existingDealLines}`,
+            },
+          },
+        ]
+      : []),
     {
       type: "section",
       text: {

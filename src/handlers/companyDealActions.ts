@@ -89,6 +89,7 @@ export function registerCompanyDealActions(app: App): void {
         companyName: pending.companyName,
         contactIds: pending.contacts.map((c) => c.id),
         stageLabel: pending.stageLabel,
+        force: pending.force === true,
       });
       completeCompanyDealAction(pendingId);
 

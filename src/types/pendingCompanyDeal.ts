@@ -11,6 +11,8 @@ export type PendingCompanyDeal = {
   dealName: string;
   stageLabel: string;
   contacts: PendingCompanyDealContact[];
+  /** When true, create even if the company already has deals. */
+  force?: boolean;
   createdBy: string;
   channelId: string;
   threadTs?: string;
