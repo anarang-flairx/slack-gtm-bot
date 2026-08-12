@@ -289,6 +289,48 @@ export async function getCompanyLifecycleStageOptions(): Promise<
   return loadCompanyLifecycleStages();
 }
 
+/** Internal name of the company relationship-type property (Partnership pipeline). */
+export function relationshipTypeProperty(): string {
+  return process.env.HUBSPOT_RELATIONSHIP_TYPE_PROPERTY ?? "relationship_type";
+}
+
+/** True when the deal belongs to the Partnership pipeline (env id or label match). */
+export function isPartnershipPipeline(
+  pipelineId: string,
+  pipelineLabel: string,
+): boolean {
+  const configuredId = process.env.HUBSPOT_PARTNERSHIP_PIPELINE_ID?.trim();
+  if (configuredId && pipelineId === configuredId) {
+    return true;
+  }
+  return pipelineLabel.trim().toLowerCase().includes("partnership");
+}
+
+let relationshipTypeOptionsCache: TimedCache<
+  Array<{ label: string; value: string }>
+> | null = null;
+
+/** Options for the company relationship-type property (Partnership pipeline). */
+export async function getRelationshipTypeOptions(): Promise<
+  Array<{ label: string; value: string }>
+> {
+  if (cacheFresh(relationshipTypeOptionsCache)) {
+    return relationshipTypeOptionsCache.value;
+  }
+
+  const prop = relationshipTypeProperty();
+  const data = await hubspotFetch<{
+    options?: Array<{ label: string; value: string }>;
+  }>(`/crm/v3/properties/companies/${encodeURIComponent(prop)}`);
+
+  const options = (data.options ?? []).map((option) => ({
+    label: option.label,
+    value: option.value,
+  }));
+  relationshipTypeOptionsCache = { value: options, fetchedAt: Date.now() };
+  return options;
+}
+
 export type CompanyLifecycleMatch = {
   id: string;
   name: string;
@@ -1557,8 +1599,10 @@ export type CreateCompanyDealInput = {
   stageLabel: string;
   /** HubSpot deal pipeline id (optional; falls back to env / default). */
   pipelineId?: string;
-  /** Company lifecycle stage label to set on the company. */
+  /** Company lifecycle stage label to set on the company (sales pipelines). */
   lifecycleStageLabel?: string;
+  /** Relationship type label to set on the company (Partnership pipeline). */
+  relationshipTypeLabel?: string;
   /** When true, create even if the company already has deals. */
   force?: boolean;
 };
@@ -1571,13 +1615,14 @@ export type CreateCompanyDealResult = {
   stageLabel: string;
   pipelineLabel: string;
   lifecycleStageLabel: string | null;
+  relationshipTypeLabel: string | null;
   associatedContactIds: string[];
 };
 
 /**
  * Create a deal on an existing company, named "[Company] - FlairX", and
  * associate the company plus every provided contact.
- * Optionally updates the company's lifecycle stage.
+ * Optionally updates lifecycle stage (sales) or relationship type (Partnership).
  * Refuses if the company already has deals unless `force` is set.
  */
 export async function createDealForCompany(
@@ -1610,6 +1655,24 @@ export async function createDealForCompany(
     lifecycleLabel = match.label;
   }
 
+  let relationshipValue: string | null = null;
+  let relationshipLabel: string | null = null;
+  if (input.relationshipTypeLabel?.trim()) {
+    const options = await getRelationshipTypeOptions();
+    const match = options.find(
+      (o) =>
+        o.label.toLowerCase() ===
+        input.relationshipTypeLabel!.trim().toLowerCase(),
+    );
+    if (!match) {
+      throw new Error(
+        `Unknown relationship type "${input.relationshipTypeLabel}"`,
+      );
+    }
+    relationshipValue = match.value;
+    relationshipLabel = match.label;
+  }
+
   const dealName = formatCompanyDealName(input.companyName);
 
   if (!input.force) {
@@ -1636,10 +1699,15 @@ export async function createDealForCompany(
     await associateDefault("contacts", contactId, "deals", deal.id);
   }
 
+  const companyUpdates: Record<string, string> = {};
   if (lifecycleValue) {
-    await updateObjectProperties("companies", input.companyId, {
-      lifecyclestage: lifecycleValue,
-    });
+    companyUpdates.lifecyclestage = lifecycleValue;
+  }
+  if (relationshipValue) {
+    companyUpdates[relationshipTypeProperty()] = relationshipValue;
+  }
+  if (Object.keys(companyUpdates).length > 0) {
+    await updateObjectProperties("companies", input.companyId, companyUpdates);
   }
 
   return {
@@ -1650,6 +1718,7 @@ export async function createDealForCompany(
     stageLabel: stage.label,
     pipelineLabel: pipeline.label,
     lifecycleStageLabel: lifecycleLabel,
+    relationshipTypeLabel: relationshipLabel,
     associatedContactIds: [...input.contactIds],
   };
 }

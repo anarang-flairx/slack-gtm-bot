@@ -69,6 +69,7 @@ Create these if they don't already exist:
 | Contract type | `contract_type` | Dropdown (set by team during sales process) |
 | Company Notes | `company_notes` | Multi-line text |
 | Last Activity Date | `notes_last_updated` | Date |
+| Relationship type | `relationship_type` | Dropdown: Referral, Partner, Investor, Advisor (Partnership pipeline only) |
 
 ### Deal properties
 

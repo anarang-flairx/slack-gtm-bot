@@ -330,11 +330,20 @@ export function buildCompanyDealPreviewBlocks(
   dealName: string,
   pipelineLabel: string,
   stageLabel: string,
-  lifecycleStageLabel: string,
+  companyFieldKind: "lifecycle" | "relationship",
+  companyFieldLabel: string,
   contacts: Array<{ id: string; name: string; email: string }>,
   pendingId: string,
   existingDeals?: Array<{ id: string; name: string; stage: string }>,
 ): KnownBlock[] {
+  const companyFieldTitle =
+    companyFieldKind === "relationship"
+      ? "Relationship type"
+      : "Company lifecycle";
+  const approveDetail =
+    companyFieldKind === "relationship"
+      ? "On approve: create the HubSpot *deal*, associate the *company* + *all* listed contacts, and set the company *relationship type*."
+      : "On approve: create the HubSpot *deal*, associate the *company* + *all* listed contacts, and set the company *lifecycle stage*.";
   const companyUrl = hubspotRecordUrl("company", companyId);
   const contactLines =
     contacts.length === 0
@@ -374,7 +383,7 @@ export function buildCompanyDealPreviewBlocks(
         { type: "mrkdwn", text: `*Deal stage:*\n${stageLabel}` },
         {
           type: "mrkdwn",
-          text: `*Company lifecycle:*\n${lifecycleStageLabel}`,
+          text: `*${companyFieldTitle}:*\n${companyFieldLabel}`,
         },
         {
           type: "mrkdwn",
@@ -404,7 +413,7 @@ export function buildCompanyDealPreviewBlocks(
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "On approve: create the HubSpot *deal*, associate the *company* + *all* listed contacts, and set the company *lifecycle stage*.",
+        text: approveDetail,
       },
     },
     {

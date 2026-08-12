@@ -11,8 +11,10 @@ import {
   getLeadStatusMap,
   getObjectProperties,
   getPipelineMeta,
+  getRelationshipTypeOptions,
   findNoteRecords,
   formatCompanyDealName,
+  isPartnershipPipeline,
   listCompaniesByLifecycleStage,
   listDealPipelines,
   resolveDealsForStageMove,
@@ -250,7 +252,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "create_company_deal",
       description:
-        "Create a NEW HubSpot deal on an *existing* company. THIS is the tool for 'move X to deals', 'add X to deals/pipeline', 'create a deal for X', 'new deal for X', or thread follow-ups like 'new deal' / 'create a new one' about a company. Deal name is always '[Company] - FlairX'. Associates the company and ALL existing contacts automatically — never ask for contacts, deal name, first name, or email. If multiple deal pipelines exist, the tool may return a numbered pipeline list first — show it and ask for one number, then call again with pipeline_id. Then it requires deal stage AND company lifecycle stage as numbered lists; ask for two numbers (deal stage first, lifecycle second) and call again with those labels. Checks for existing deals first and refuses duplicates unless force=true. Do NOT use move_deal_stage or add_prospect for these requests.",
+        "Create a NEW HubSpot deal on an *existing* company. THIS is the tool for 'move X to deals', 'add X to deals/pipeline', 'create a deal for X', 'new deal for X', or thread follow-ups like 'new deal' / 'create a new one' about a company. Deal name is always '[Company] - FlairX'. Associates the company and ALL existing contacts automatically — never ask for contacts, deal name, first name, or email. If multiple deal pipelines exist, the tool may return a numbered pipeline list first — show it and ask for one number, then call again with pipeline_id. Then it requires deal stage AND either company lifecycle stage (sales pipelines) OR relationship type (Partnership pipeline) as numbered lists; ask for two numbers (deal stage first, second field second) and call again with those labels. Checks for existing deals first and refuses duplicates unless force=true. Do NOT use move_deal_stage or add_prospect for these requests.",
       parameters: {
         type: "object",
         properties: {
@@ -276,7 +278,12 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           lifecycle_stage: {
             type: "string",
             description:
-              "Company lifecycle stage label chosen by the user (e.g. 'Opportunity'). Required before an approval card is posted.",
+              "Company lifecycle stage label (sales pipelines only). Required with stage before an approval card is posted.",
+          },
+          relationship_type: {
+            type: "string",
+            description:
+              "Relationship type label (Partnership pipeline only: e.g. Referral, Partner, Investor, Advisor). Required with stage before an approval card is posted.",
           },
           force: {
             type: "boolean",
@@ -692,9 +699,13 @@ async function runCreateCompanyDeal(
   const requestedLifecycle = args.lifecycle_stage
     ? String(args.lifecycle_stage).trim()
     : "";
+  const requestedRelationship = args.relationship_type
+    ? String(args.relationship_type).trim()
+    : "";
   const force = args.force === true;
 
   const lifecycleOptions = await getCompanyLifecycleStageOptions();
+  const relationshipOptions = await getRelationshipTypeOptions();
   const pipelines = await listDealPipelines();
   const envPipelineId = process.env.HUBSPOT_PIPELINE_ID?.trim() || "";
 
@@ -763,12 +774,87 @@ async function runCreateCompanyDeal(
   }
 
   const pipeline = await getPipelineMeta(resolvedPipelineId || undefined);
+  const partnershipPipeline = isPartnershipPipeline(pipeline.id, pipeline.label);
 
-  // Always collect deal stage + company lifecycle via numbered lists first.
+  const dealStageLines = pipeline.stages
+    .map((s, i) => `${i + 1}. ${s.label}`)
+    .join("\n");
+
+  if (partnershipPipeline) {
+    if (!requestedStage || !requestedRelationship) {
+      const relationshipLines = relationshipOptions
+        .map((s, i) => `${i + 1}. ${s.label}`)
+        .join("\n");
+      return (
+        `Before creating a deal for ${company.name} in the *Partnership* pipeline (company_id: ${company.id}, pipeline_id: ${pipeline.id}), the user must pick a deal stage AND a relationship type.\n\n` +
+        `*Deal stages (${pipeline.label})*\n${dealStageLines}\n\n` +
+        `*Relationship types*\n${relationshipLines}\n\n` +
+        `Show BOTH numbered lists to the user exactly like this (do not show company_id or pipeline_id). Ask them to reply with two numbers, e.g. "1 2" (first = deal stage, second = relationship type). ` +
+        `When they reply, call create_company_deal again with company_id "${company.id}", company_name "${company.name}", pipeline_id "${pipeline.id}", stage set to the chosen deal-stage label, and relationship_type set to the chosen relationship label. ` +
+        `Do NOT ask for lifecycle stage on the Partnership pipeline.`
+      );
+    }
+
+    const stage = pipeline.stageByLabel.get(requestedStage.toLowerCase());
+    if (!stage) {
+      const valid = pipeline.stages.map((s) => s.label).join(", ");
+      return `"${requestedStage}" is not a valid deal stage in pipeline "${pipeline.label}". Valid stages: ${valid}.`;
+    }
+
+    const relationship = relationshipOptions.find(
+      (o) => o.label.toLowerCase() === requestedRelationship.toLowerCase(),
+    );
+    if (!relationship) {
+      const valid = relationshipOptions.map((s) => s.label).join(", ");
+      return `"${requestedRelationship}" is not a valid relationship type. Valid options: ${valid}.`;
+    }
+
+    const pending = savePendingCompanyDeal({
+      companyId: company.id,
+      companyName: company.name,
+      dealName,
+      pipelineId: pipeline.id,
+      pipelineLabel: pipeline.label,
+      stageLabel: stage.label,
+      companyFieldKind: "relationship",
+      companyFieldLabel: relationship.label,
+      contacts,
+      force,
+      createdBy: ctx.userId,
+      channelId: ctx.channel,
+      ...(ctx.threadTs ? { threadTs: ctx.threadTs } : {}),
+    });
+
+    await postCard(
+      ctx,
+      `Company deal ready for ${company.name}`,
+      buildCompanyDealPreviewBlocks(
+        company.name,
+        company.id,
+        dealName,
+        pipeline.label,
+        stage.label,
+        "relationship",
+        relationship.label,
+        contacts,
+        pending.id,
+        force && status.deals.length > 0 ? status.deals : undefined,
+      ),
+    );
+
+    const contactSummary =
+      contacts.length === 0
+        ? "no contacts to associate yet"
+        : `${contacts.length} contact(s) will be associated`;
+    const forceNote =
+      force && status.deals.length > 0
+        ? " (force=true — creating an additional deal despite existing ones)"
+        : "";
+    return `Posted an approval card to create deal "${dealName}" in ${pipeline.label} / ${stage.label} for ${company.name}, set relationship type to ${relationship.label} (${contactSummary})${forceNote}. Waiting for the user to Approve or Discard.`;
+  }
+
+  // Sales pipelines: deal stage + company lifecycle.
   if (!requestedStage || !requestedLifecycle) {
-    const dealStageLines = pipeline.stages
-      .map((s, i) => `${i + 1}. ${s.label}`)
-      .join("\n");
     const lifecycleLines = lifecycleOptions
       .map((s, i) => `${i + 1}. ${s.label}`)
       .join("\n");
@@ -803,7 +889,8 @@ async function runCreateCompanyDeal(
     pipelineId: pipeline.id,
     pipelineLabel: pipeline.label,
     stageLabel: stage.label,
-    lifecycleStageLabel: lifecycle.label,
+    companyFieldKind: "lifecycle",
+    companyFieldLabel: lifecycle.label,
     contacts,
     force,
     createdBy: ctx.userId,
@@ -820,6 +907,7 @@ async function runCreateCompanyDeal(
       dealName,
       pipeline.label,
       stage.label,
+      "lifecycle",
       lifecycle.label,
       contacts,
       pending.id,

@@ -90,7 +90,9 @@ export function registerCompanyDealActions(app: App): void {
         contactIds: pending.contacts.map((c) => c.id),
         pipelineId: pending.pipelineId,
         stageLabel: pending.stageLabel,
-        lifecycleStageLabel: pending.lifecycleStageLabel,
+        ...(pending.companyFieldKind === "lifecycle"
+          ? { lifecycleStageLabel: pending.companyFieldLabel }
+          : { relationshipTypeLabel: pending.companyFieldLabel }),
         force: pending.force === true,
       });
       completeCompanyDealAction(pendingId);
@@ -98,10 +100,15 @@ export function registerCompanyDealActions(app: App): void {
       const dealUrl = hubspotRecordUrl("deal", created.dealId);
       const companyUrl = hubspotRecordUrl("company", created.companyId);
       const contactCount = created.associatedContactIds.length;
-      const lifecyclePart = created.lifecycleStageLabel
-        ? ` · lifecycle *${created.lifecycleStageLabel}*`
-        : "";
-      const successText = `Deal created: <${dealUrl}|${created.dealName}> (${created.pipelineLabel} / ${created.stageLabel}) · company <${companyUrl}|${created.companyName}>${lifecyclePart} · ${contactCount} contact${contactCount === 1 ? "" : "s"} associated`;
+      const fieldPart =
+        pending.companyFieldKind === "relationship"
+          ? created.relationshipTypeLabel
+            ? ` · relationship *${created.relationshipTypeLabel}*`
+            : ""
+          : created.lifecycleStageLabel
+            ? ` · lifecycle *${created.lifecycleStageLabel}*`
+            : "";
+      const successText = `Deal created: <${dealUrl}|${created.dealName}> (${created.pipelineLabel} / ${created.stageLabel}) · company <${companyUrl}|${created.companyName}>${fieldPart} · ${contactCount} contact${contactCount === 1 ? "" : "s"} associated`;
       await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
