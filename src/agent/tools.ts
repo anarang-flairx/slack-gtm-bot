@@ -72,9 +72,18 @@ async function postCard(
 const CARD_READY =
   "[card ready] User reply only: Review the card above — Approve or Discard.";
 
-/** Numbered pick — model shows title + list; hint is for the model only. */
-function pickPrompt(title: string, lines: string, hint: string): string {
-  return `[pick] ${hint}\n→ User: "${title}" + list (no ids, no extra text)\n${lines}`;
+/**
+ * Numbered pick — model shows title + list to the user.
+ * `hint` and optional `idMap` are for the model only (never show ids to the user).
+ */
+function pickPrompt(
+  title: string,
+  lines: string,
+  hint: string,
+  idMap?: string,
+): string {
+  const mapLine = idMap ? `\nids (model only): ${idMap}` : "";
+  return `[pick] ${hint}${mapLine}\n→ User: "${title}" + list (no ids, no extra text)\n${lines}`;
 }
 
 export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
@@ -261,7 +270,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "create_company_deal",
       description:
-        "Create a NEW HubSpot deal on an *existing* company. THIS is the tool for 'move X to deals', 'add X to deals/pipeline', 'create a deal for X', 'new deal for X', or thread follow-ups like 'new deal' / 'create a new one' about a company. Deal name is always '[Company] - FlairX'. Associates the company and ALL existing contacts automatically — never ask for contacts, deal name, first name, or email. If multiple deal pipelines exist, the tool may return a numbered pipeline list first — show it and ask for one number, then call again with pipeline_id. Then ask for deal stage (numbered list). Partnership pipeline also requires relationship type (deal stage + relationship type, two numbers). Sales pipelines: deal stage only — never ask for company lifecycle. Checks for existing deals first and refuses duplicates unless force=true. Do NOT use move_deal_stage or add_prospect for these requests.",
+        "Create a NEW HubSpot deal on an *existing* company. Flow: (1) if multiple pipelines, ask Sales vs Partnerships; (2) ask deal stage only for that pipeline (HubSpot dealstage) — NEVER company lifecycle; (3) Partnerships only: also ask relationship type (HubSpot company property relationship_type). Deal name is always '[Company] - FlairX'. Associates company + all contacts. Refuse duplicates unless force=true. Do NOT use move_deal_stage or add_prospect for these requests.",
       parameters: {
         type: "object",
         properties: {
@@ -277,12 +286,17 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           pipeline_id: {
             type: "string",
             description:
-              "HubSpot deal pipeline id when multiple pipelines exist (from a prior numbered list).",
+              "HubSpot deal pipeline id when multiple pipelines exist (from a prior numbered list / id map).",
+          },
+          pipeline_label: {
+            type: "string",
+            description:
+              "Deal pipeline label when the user replies with a name (e.g. 'Sales', 'Partnerships') instead of a number.",
           },
           stage: {
             type: "string",
             description:
-              "Deal pipeline stage label chosen by the user (e.g. 'Prospecting'). Required before an approval card is posted.",
+              "Deal pipeline stage label chosen by the user (e.g. 'Prospecting'). Required before an approval card is posted. Sales pipelines: stage only — never lifecycle.",
           },
           relationship_type: {
             type: "string",
@@ -701,6 +715,9 @@ async function runCreateCompanyDeal(
   const pipelineIdArg = args.pipeline_id
     ? String(args.pipeline_id).trim()
     : "";
+  const pipelineLabelArg = args.pipeline_label
+    ? String(args.pipeline_label).trim()
+    : "";
   const requestedStage = args.stage ? String(args.stage).trim() : "";
   const requestedRelationship = args.relationship_type
     ? String(args.relationship_type).trim()
@@ -710,6 +727,35 @@ async function runCreateCompanyDeal(
   const relationshipOptions = await getRelationshipTypeOptions();
   const pipelines = await listDealPipelines();
   const envPipelineId = process.env.HUBSPOT_PIPELINE_ID?.trim() || "";
+
+  // Resolve pipeline by explicit id, env default, or label (e.g. user said "sales").
+  let resolvedPipelineId = pipelineIdArg || envPipelineId;
+  if (!resolvedPipelineId && pipelineLabelArg) {
+    const byLabel = pipelines.find(
+      (p) => p.label.toLowerCase() === pipelineLabelArg.toLowerCase(),
+    );
+    if (byLabel) {
+      resolvedPipelineId = byLabel.id;
+    } else {
+      const partial = pipelines.filter((p) =>
+        p.label.toLowerCase().includes(pipelineLabelArg.toLowerCase()),
+      );
+      if (partial.length === 1) {
+        resolvedPipelineId = partial[0].id;
+      } else if (partial.length > 1) {
+        return pickPrompt(
+          "Pick a pipeline:",
+          partial
+            .map((p, i) => `${i + 1}. ${p.label} (${p.stageCount} stages)`)
+            .join("\n"),
+          `create_company_deal company_id=${companyIdArg || "(set)"} pipeline_id=<id>`,
+          partial.map((p, i) => `${i + 1}=${p.id}`).join(", "),
+        );
+      } else {
+        return `No pipeline matching "${pipelineLabelArg}". Valid: ${pipelines.map((p) => p.label).join(", ")}.`;
+      }
+    }
+  }
 
   let company: { id: string; name: string; domain: string };
 
@@ -738,6 +784,7 @@ async function runCreateCompanyDeal(
           )
           .join("\n"),
         `create_company_deal company_id=<id>`,
+        matches.map((m, i) => `${i + 1}=${m.id}`).join(", "),
       );
     }
     company = matches[0];
@@ -762,14 +809,14 @@ async function runCreateCompanyDeal(
   }
 
   // If HubSpot has multiple deal pipelines and none was chosen yet, ask first.
-  const resolvedPipelineId = pipelineIdArg || envPipelineId;
   if (!resolvedPipelineId && pipelines.length > 1) {
     return pickPrompt(
       "Pick a pipeline:",
       pipelines
         .map((p, i) => `${i + 1}. ${p.label} (${p.stageCount} stages)`)
         .join("\n"),
-      `create_company_deal company_id=${company.id} pipeline_id=<id>`,
+      `create_company_deal company_id=${company.id} pipeline_id=<id> OR pipeline_label=<label>`,
+      pipelines.map((p, i) => `${i + 1}=${p.id} (${p.label})`).join(", "),
     );
   }
 
@@ -781,14 +828,12 @@ async function runCreateCompanyDeal(
     .join("\n");
 
   if (partnershipPipeline) {
-    if (!requestedStage || !requestedRelationship) {
-      const relationshipLines = relationshipOptions
-        .map((s, i) => `${i + 1}. ${s.label}`)
-        .join("\n");
-      return (
-        `[pick] create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label> relationship_type=<label>\n` +
-        `→ User: "Pick deal stage + relationship type (e.g. 1 2):" + both lists\n` +
-        `Deal stages (${pipeline.label}):\n${dealStageLines}\n\nRelationship types:\n${relationshipLines}`
+    // Step 1: deal stage only (dealstage) — never lifecycle.
+    if (!requestedStage) {
+      return pickPrompt(
+        "Pick deal stage:",
+        dealStageLines,
+        `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label>. Then ask relationship_type. NEVER ask lifecycle.`,
       );
     }
 
@@ -796,6 +841,21 @@ async function runCreateCompanyDeal(
     if (!stage) {
       const valid = pipeline.stages.map((s) => s.label).join(", ");
       return `"${requestedStage}" is not a valid deal stage in pipeline "${pipeline.label}". Valid stages: ${valid}.`;
+    }
+
+    // Step 2: relationship type (company property relationship_type).
+    if (!requestedRelationship) {
+      const relationshipLines = relationshipOptions
+        .map((s, i) => `${i + 1}. ${s.label}`)
+        .join("\n");
+      if (relationshipOptions.length === 0) {
+        return `Partnership pipeline selected but company property "relationship_type" has no options configured in HubSpot.`;
+      }
+      return pickPrompt(
+        "Pick relationship type:",
+        relationshipLines,
+        `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage="${stage.label}" relationship_type=<label>. Do NOT ask lifecycle.`,
+      );
     }
 
     const relationship = relationshipOptions.find(
@@ -842,12 +902,12 @@ async function runCreateCompanyDeal(
     return CARD_READY;
   }
 
-  // Sales pipelines: deal stage only.
+  // Sales pipelines: deal stage only — never company lifecycle.
   if (!requestedStage) {
     return pickPrompt(
       "Pick deal stage:",
       dealStageLines,
-      `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label>`,
+      `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label>. NEVER ask for lifecycle. Do NOT call get_company_lifecycle_stages.`,
     );
   }
 
