@@ -72,9 +72,14 @@ async function postCard(
 const CARD_READY =
   "[card ready] User reply only: Review the card above — Approve or Discard.";
 
+/** After posting a numbered pick list to Slack — model must not restate it. */
+const PICK_POSTED =
+  "[pick posted] Do not restate or reformat the list. Wait for the user's number/name.";
+
 /**
  * Numbered pick — model shows title + list to the user.
  * `hint` and optional `idMap` are for the model only (never show ids to the user).
+ * Each option must stay on its own line when echoed.
  */
 function pickPrompt(
   title: string,
@@ -83,7 +88,28 @@ function pickPrompt(
   idMap?: string,
 ): string {
   const mapLine = idMap ? `\nids (model only): ${idMap}` : "";
-  return `[pick] ${hint}${mapLine}\n→ User: "${title}" + list (no ids, no extra text)\n${lines}`;
+  return (
+    `[pick] ${hint}${mapLine}\n` +
+    `→ User reply MUST be exactly:\n${title}\n${lines}\n` +
+    `(each option on its own line — never collapse into one line)`
+  );
+}
+
+/** Post a numbered pick to Slack with real newlines so formatting stays intact. */
+async function postPick(
+  ctx: ToolContext,
+  title: string,
+  lines: string,
+  hint: string,
+  idMap?: string,
+): Promise<string> {
+  await ctx.client.chat.postMessage({
+    channel: ctx.channel,
+    ...(ctx.threadTs ? { thread_ts: ctx.threadTs } : {}),
+    text: `${title}\n${lines}`,
+  });
+  const mapLine = idMap ? `\nids (model only): ${idMap}` : "";
+  return `${PICK_POSTED}\n[pick] ${hint}${mapLine}`;
 }
 
 export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
@@ -724,12 +750,12 @@ async function runCreateCompanyDeal(
     : "";
   const force = args.force === true;
 
-  const relationshipOptions = await getRelationshipTypeOptions();
   const pipelines = await listDealPipelines();
   const envPipelineId = process.env.HUBSPOT_PIPELINE_ID?.trim() || "";
 
-  // Resolve pipeline by explicit id, env default, or label (e.g. user said "sales").
-  let resolvedPipelineId = pipelineIdArg || envPipelineId;
+  // Resolve from explicit id or label first — do NOT use env yet when multiple
+  // pipelines exist (Flow 1 must ask Sales vs Partnerships).
+  let resolvedPipelineId = pipelineIdArg;
   if (!resolvedPipelineId && pipelineLabelArg) {
     const byLabel = pipelines.find(
       (p) => p.label.toLowerCase() === pipelineLabelArg.toLowerCase(),
@@ -743,12 +769,11 @@ async function runCreateCompanyDeal(
       if (partial.length === 1) {
         resolvedPipelineId = partial[0].id;
       } else if (partial.length > 1) {
+        // company may not be resolved yet; ask with label list only
         return pickPrompt(
-          "Pick a pipeline:",
-          partial
-            .map((p, i) => `${i + 1}. ${p.label} (${p.stageCount} stages)`)
-            .join("\n"),
-          `create_company_deal company_id=${companyIdArg || "(set)"} pipeline_id=<id>`,
+          "What pipeline?",
+          partial.map((p, i) => `${i + 1}. ${p.label}`).join("\n"),
+          `create_company_deal company_name="${companyName}" company_id=${companyIdArg || "<id>"} pipeline_id=<id>`,
           partial.map((p, i) => `${i + 1}=${p.id}`).join(", "),
         );
       } else {
@@ -810,15 +835,15 @@ async function runCreateCompanyDeal(
 
   // If HubSpot has multiple deal pipelines and none was chosen yet, ask first.
   if (!resolvedPipelineId && pipelines.length > 1) {
-    return pickPrompt(
-      "Pick a pipeline:",
-      pipelines
-        .map((p, i) => `${i + 1}. ${p.label} (${p.stageCount} stages)`)
-        .join("\n"),
+    return postPick(
+      ctx,
+      "What pipeline?",
+      pipelines.map((p, i) => `${i + 1}. ${p.label}`).join("\n"),
       `create_company_deal company_id=${company.id} pipeline_id=<id> OR pipeline_label=<label>`,
       pipelines.map((p, i) => `${i + 1}=${p.id} (${p.label})`).join(", "),
     );
   }
+  resolvedPipelineId = resolvedPipelineId || envPipelineId;
 
   const pipeline = await getPipelineMeta(resolvedPipelineId || undefined);
   const partnershipPipeline = isPartnershipPipeline(pipeline.id, pipeline.label);
@@ -828,9 +853,20 @@ async function runCreateCompanyDeal(
     .join("\n");
 
   if (partnershipPipeline) {
+    // relationship_type is Partnership-only — never fetch on Sales.
+    let relationshipOptions: Array<{ label: string; value: string }> = [];
+    try {
+      relationshipOptions = await getRelationshipTypeOptions();
+    } catch (error) {
+      const detail =
+        error instanceof Error ? error.message : "property lookup failed";
+      return `Partnership deals need HubSpot company property "relationship_type". ${detail}`;
+    }
+
     // Step 1: deal stage only (dealstage) — never lifecycle.
     if (!requestedStage) {
-      return pickPrompt(
+      return postPick(
+        ctx,
         "Pick deal stage:",
         dealStageLines,
         `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label>. Then ask relationship_type. NEVER ask lifecycle.`,
@@ -845,13 +881,14 @@ async function runCreateCompanyDeal(
 
     // Step 2: relationship type (company property relationship_type).
     if (!requestedRelationship) {
-      const relationshipLines = relationshipOptions
-        .map((s, i) => `${i + 1}. ${s.label}`)
-        .join("\n");
       if (relationshipOptions.length === 0) {
         return `Partnership pipeline selected but company property "relationship_type" has no options configured in HubSpot.`;
       }
-      return pickPrompt(
+      const relationshipLines = relationshipOptions
+        .map((s, i) => `${i + 1}. ${s.label}`)
+        .join("\n");
+      return postPick(
+        ctx,
         "Pick relationship type:",
         relationshipLines,
         `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage="${stage.label}" relationship_type=<label>. Do NOT ask lifecycle.`,
@@ -902,12 +939,13 @@ async function runCreateCompanyDeal(
     return CARD_READY;
   }
 
-  // Sales pipelines: deal stage only — never company lifecycle.
+  // Sales pipelines: deal stage only — never company lifecycle / relationship_type.
   if (!requestedStage) {
-    return pickPrompt(
+    return postPick(
+      ctx,
       "Pick deal stage:",
       dealStageLines,
-      `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label>. NEVER ask for lifecycle. Do NOT call get_company_lifecycle_stages.`,
+      `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label>. NEVER ask for lifecycle or relationship_type.`,
     );
   }
 
