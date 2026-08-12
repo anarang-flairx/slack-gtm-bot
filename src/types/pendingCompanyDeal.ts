@@ -12,9 +12,9 @@ export type PendingCompanyDeal = {
   pipelineId: string;
   pipelineLabel: string;
   stageLabel: string;
-  /** lifecycle for sales pipelines; relationship for Partnership pipeline */
-  companyFieldKind: "lifecycle" | "relationship";
-  companyFieldLabel: string;
+  /** relationship for Partnership pipeline; none for sales pipelines */
+  companyFieldKind: "relationship" | "none";
+  companyFieldLabel?: string;
   contacts: PendingCompanyDealContact[];
   /** When true, create even if the company already has deals. */
   force?: boolean;

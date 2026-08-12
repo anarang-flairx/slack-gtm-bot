@@ -330,20 +330,16 @@ export function buildCompanyDealPreviewBlocks(
   dealName: string,
   pipelineLabel: string,
   stageLabel: string,
-  companyFieldKind: "lifecycle" | "relationship",
-  companyFieldLabel: string,
+  companyFieldKind: "relationship" | "none",
   contacts: Array<{ id: string; name: string; email: string }>,
   pendingId: string,
   existingDeals?: Array<{ id: string; name: string; stage: string }>,
+  companyFieldLabel?: string,
 ): KnownBlock[] {
-  const companyFieldTitle =
-    companyFieldKind === "relationship"
-      ? "Relationship type"
-      : "Company lifecycle";
   const approveDetail =
     companyFieldKind === "relationship"
       ? "On approve: create the HubSpot *deal*, associate the *company* + *all* listed contacts, and set the company *relationship type*."
-      : "On approve: create the HubSpot *deal*, associate the *company* + *all* listed contacts, and set the company *lifecycle stage*.";
+      : "On approve: create the HubSpot *deal* and associate the *company* + *all* listed contacts.";
   const companyUrl = hubspotRecordUrl("company", companyId);
   const contactLines =
     contacts.length === 0
@@ -381,10 +377,14 @@ export function buildCompanyDealPreviewBlocks(
         { type: "mrkdwn", text: `*Deal name:*\n${dealName}` },
         { type: "mrkdwn", text: `*Pipeline:*\n${pipelineLabel}` },
         { type: "mrkdwn", text: `*Deal stage:*\n${stageLabel}` },
-        {
-          type: "mrkdwn",
-          text: `*${companyFieldTitle}:*\n${companyFieldLabel}`,
-        },
+        ...(companyFieldKind === "relationship" && companyFieldLabel
+          ? [
+              {
+                type: "mrkdwn" as const,
+                text: `*Relationship type:*\n${companyFieldLabel}`,
+              },
+            ]
+          : []),
         {
           type: "mrkdwn",
           text: `*Contacts to associate:*\n${contacts.length}`,
