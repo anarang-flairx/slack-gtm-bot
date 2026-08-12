@@ -83,12 +83,33 @@ Create these if they don't already exist:
 
 `/digest` watches deal `notes_last_updated` for stalled deals and contact `last_contact_date` for follow-ups (including empty dates). `/update-notes` appends to the notes field and sets the matching date to today.
 
-## 4. Verify
+## 4. Pipeline IDs (Sales + Partnerships)
 
-Run a quick check from the repo once `.env` is filled in:
+Find each pipeline’s internal id (needed when you have more than one deal pipeline):
+
+**Option A — ask the bot:** `@FlairX GTM Bot what are the sales pipeline stages?`  
+The reply includes `(pipeline_id: …)` under each pipeline name.
+
+**Option B — HubSpot UI:** Settings → Objects → Deals → Pipelines → open **Partnerships** (or Sales).  
+The URL often looks like:
+`…/sales-products-settings/*/pipelines/deals/{PIPELINE_ID}`  
+Copy `{PIPELINE_ID}`.
+
+**Option C — API** (from the repo with `.env` loaded):
 
 ```bash
-node -e "fetch('https://api.hubapi.com/crm/v3/pipelines/deals', {headers:{Authorization:'Bearer '+process.env.HUBSPOT_ACCESS_TOKEN}}).then(r=>r.json()).then(d=>console.log(d.results.map(p=>({id:p.id,stages:p.stages.map(s=>s.label)}))))" --env-file=.env
+node -e "fetch('https://api.hubapi.com/crm/v3/pipelines/deals', {headers:{Authorization:'Bearer '+process.env.HUBSPOT_ACCESS_TOKEN}}).then(r=>r.json()).then(d=>console.log(d.results.map(p=>({id:p.id,label:p.label,stages:p.stages.map(s=>s.label)}))))" --env-file=.env
 ```
 
-You should see the 8 stage labels above. If your pipeline isn't the `default` one, set its `id` as `HUBSPOT_PIPELINE_ID`.
+Put the ids in `.env`:
+
+```bash
+HUBSPOT_PIPELINE_ID=<sales-pipeline-id>
+HUBSPOT_PARTNERSHIP_PIPELINE_ID=<partnerships-pipeline-id>
+```
+
+Partnerships stages should match HubSpot (e.g. New, Engaged, Active Relationship, …). If the bot shows different stages, the wrong pipeline id is selected — set `HUBSPOT_PARTNERSHIP_PIPELINE_ID`.
+
+## 5. Verify
+
+Run the same API one-liner above and confirm Sales and Partnerships labels + stage lists match the HubSpot UI.

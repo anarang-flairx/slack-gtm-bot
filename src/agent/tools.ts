@@ -72,9 +72,10 @@ async function postCard(
 const CARD_READY =
   "[card ready] User reply only: Review the card above — Approve or Discard.";
 
-/** After posting a numbered pick list to Slack — model must not restate it. */
-const PICK_POSTED =
-  "[pick posted] Do not restate or reformat the list. Wait for the user's number/name.";
+/** Marker for a pick that should be shown as-is (not model-restated). */
+const PICK_POSTED = "[pick posted]";
+const PICK_USER_START = "<<<PICK_USER>>>";
+const PICK_USER_END = "<<<END_PICK_USER>>>";
 
 /** Resolve "1" / "2" style picks to a 0-based index item. */
 function resolveByNumber<T>(raw: string, items: T[]): T | undefined {
@@ -96,29 +97,26 @@ function pickPrompt(
   hint: string,
   idMap?: string,
 ): string {
+  const userText = `${title}\n${lines}\n\nReply with a number.`;
   const mapLine = idMap ? `\nids (model only): ${idMap}` : "";
   return (
-    `[pick] ${hint}${mapLine}\n` +
-    `→ User reply MUST be exactly:\n${title}\n${lines}\n` +
-    `(each option on its own line — never collapse into one line)`
+    `${PICK_POSTED}\n${PICK_USER_START}\n${userText}\n${PICK_USER_END}\n` +
+    `[pick] ${hint}${mapLine}`
   );
 }
 
-/** Post a numbered pick to Slack with real newlines so formatting stays intact. */
+/**
+ * Format a numbered pick for Slack. Does not post itself — the agent loop
+ * posts the user block once so history can keep the id map for the next turn.
+ */
 async function postPick(
-  ctx: ToolContext,
+  _ctx: ToolContext,
   title: string,
   lines: string,
   hint: string,
   idMap?: string,
 ): Promise<string> {
-  await ctx.client.chat.postMessage({
-    channel: ctx.channel,
-    ...(ctx.threadTs ? { thread_ts: ctx.threadTs } : {}),
-    text: `${title}\n${lines}`,
-  });
-  const mapLine = idMap ? `\nids (model only): ${idMap}` : "";
-  return `${PICK_POSTED}\n[pick] ${hint}${mapLine}`;
+  return pickPrompt(title, lines, hint, idMap);
 }
 
 export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
@@ -764,6 +762,8 @@ async function runCreateCompanyDeal(
 
   // Resolve from explicit id, label, or list number ("1") — do NOT use env yet
   // when multiple pipelines exist (Flow 1 must ask Sales vs Partnerships).
+  const partnershipEnvId =
+    process.env.HUBSPOT_PARTNERSHIP_PIPELINE_ID?.trim() || "";
   let resolvedPipelineId = "";
   if (pipelineIdArg) {
     const byId = pipelines.find((p) => p.id === pipelineIdArg);
@@ -780,32 +780,52 @@ async function runCreateCompanyDeal(
     }
   }
   if (!resolvedPipelineId && pipelineLabelArg) {
-    const byLabel = pipelines.find(
-      (p) => p.label.toLowerCase() === pipelineLabelArg.toLowerCase(),
-    );
-    if (byLabel) {
-      resolvedPipelineId = byLabel.id;
+    // Prefer configured Partnership pipeline id when user said "Partnerships".
+    if (
+      partnershipEnvId &&
+      pipelineLabelArg.toLowerCase().includes("partnership")
+    ) {
+      resolvedPipelineId = partnershipEnvId;
     } else {
-      const byNum = resolveByNumber(pipelineLabelArg, pipelines);
-      if (byNum) {
-        resolvedPipelineId = byNum.id;
+      const byLabel = pipelines.find(
+        (p) => p.label.toLowerCase() === pipelineLabelArg.toLowerCase(),
+      );
+      if (byLabel) {
+        resolvedPipelineId = byLabel.id;
       } else {
-        const partial = pipelines.filter((p) =>
-          p.label.toLowerCase().includes(pipelineLabelArg.toLowerCase()),
-        );
-        if (partial.length === 1) {
-          resolvedPipelineId = partial[0].id;
-        } else if (partial.length > 1) {
-          return pickPrompt(
-            "What pipeline?",
-            partial.map((p, i) => `${i + 1}. ${p.label}`).join("\n"),
-            `create_company_deal company_name="${companyName}" company_id=${companyIdArg || "<id>"} pipeline_id=<id>`,
-            partial.map((p, i) => `${i + 1}=${p.id}`).join(", "),
-          );
+        const byNum = resolveByNumber(pipelineLabelArg, pipelines);
+        if (byNum) {
+          resolvedPipelineId = byNum.id;
         } else {
-          return `No pipeline matching "${pipelineLabelArg}". Valid: ${pipelines.map((p) => p.label).join(", ")}.`;
+          const partial = pipelines.filter((p) =>
+            p.label.toLowerCase().includes(pipelineLabelArg.toLowerCase()),
+          );
+          if (partial.length === 1) {
+            resolvedPipelineId = partial[0].id;
+          } else if (partial.length > 1) {
+            return pickPrompt(
+              "What pipeline?",
+              partial.map((p, i) => `${i + 1}. ${p.label}`).join("\n"),
+              `create_company_deal company_name="${companyName}" company_id=${companyIdArg || "<id>"} pipeline_id=<id>`,
+              partial.map((p, i) => `${i + 1}=${p.id}`).join(", "),
+            );
+          } else {
+            return `No pipeline matching "${pipelineLabelArg}". Valid: ${pipelines.map((p) => p.label).join(", ")}.`;
+          }
         }
       }
+    }
+  }
+
+  // If number picked a pipeline labeled Partnerships, pin to env id when set.
+  if (resolvedPipelineId && partnershipEnvId) {
+    const selected = pipelines.find((p) => p.id === resolvedPipelineId);
+    if (
+      selected &&
+      selected.label.toLowerCase().includes("partnership") &&
+      resolvedPipelineId !== partnershipEnvId
+    ) {
+      resolvedPipelineId = partnershipEnvId;
     }
   }
 
@@ -900,9 +920,9 @@ async function runCreateCompanyDeal(
     if (!resolvedStageLabel) {
       return postPick(
         ctx,
-        "Pick deal stage:",
+        `Pick deal stage (${pipeline.label}):`,
         dealStageLines,
-        `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label or number>. Then ask relationship_type. NEVER ask lifecycle.`,
+        `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} pipeline_label="${pipeline.label}" stage=<label or number>. Then ask relationship_type. NEVER ask lifecycle. Stages must be from this pipeline only.`,
       );
     }
 
@@ -984,9 +1004,9 @@ async function runCreateCompanyDeal(
   if (!resolvedStageLabel) {
     return postPick(
       ctx,
-      "Pick deal stage:",
+      `Pick deal stage (${pipeline.label}):`,
       dealStageLines,
-      `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label or number>. NEVER ask for lifecycle or relationship_type.`,
+      `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} pipeline_label="${pipeline.label}" stage=<label or number>. NEVER ask for lifecycle or relationship_type. Stages must be from this pipeline only.`,
     );
   }
 
@@ -1348,9 +1368,14 @@ export async function executeTool(
               `${i + 1}. ${s.label} (${Math.round(s.probability * 100)}% win)`,
           )
           .join("\n");
-        sections.push(`*${meta.label}*\n${stages}`);
+        sections.push(
+          `*${meta.label}* (pipeline_id: ${meta.id})\n${stages}`,
+        );
       }
-      return sections.join("\n\n");
+      return (
+        sections.join("\n\n") +
+        "\n\n(For .env: set HUBSPOT_PIPELINE_ID to the Sales pipeline_id, HUBSPOT_PARTNERSHIP_PIPELINE_ID to the Partnerships pipeline_id.)"
+      );
     }
 
     case "get_lead_statuses": {

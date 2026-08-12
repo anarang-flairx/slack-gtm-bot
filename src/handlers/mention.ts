@@ -54,7 +54,7 @@ Rules:
     1. If multiple pipelines: ask "What pipeline?" with Sales / Partnerships only — wait for one answer.
     2. Sales: ask deal stage only (HubSpot dealstage). NEVER ask company lifecycle. NEVER ask relationship_type / referral_status.
     3. Partnerships: ask deal stage only first (that pipeline's stages), then ask relationship type (HubSpot company property relationship_type). NEVER ask company lifecycle.
-    When they reply, call create_company_deal again with pipeline_id or pipeline_label, plus stage, plus relationship_type for Partnerships — do not re-ask.
+    When they reply with a number/name, call create_company_deal again using company_id / pipeline_id / stage / relationship_type from the prior [pick posted] message in this thread (it includes an ids map) — do not re-ask the same question.
   • move_deal_stage is ONLY for changing an *existing* deal's pipeline stage (e.g. "move the Acme deal to Negotiation"). It is NOT for creating deals or "moving a company to deals".
 - Never create duplicates. Before creating, tools check HubSpot: if a contact (email/name), company (exact name), or deal (company already has deals) already exists, tell the user about the existing record(s) with links — do not post a create card. Only create another deal when the user explicitly asks and you call create_company_deal with force=true. Existing companies are reused (not recreated) when adding contacts.
 - When the user asks to create deals for multiple companies in one message, call create_company_deal once per company and report each result. Ask for deal stage (and relationship type on Partnership) once, then reuse those choices for every company. If a tool returns "Error: …", quote that error to the user — do not invent causes like permissions.
@@ -135,6 +135,19 @@ function isTrivialReply(text: string): boolean {
   }
   const words = trimmed.split(/\s+/).filter(Boolean);
   return words.length > 0 && words.length <= TRIVIAL_REPLY_MAX_WORDS;
+}
+
+function extractPickUserText(toolResult: string): string | null {
+  const start = toolResult.indexOf("<<<PICK_USER>>>");
+  const end = toolResult.indexOf("<<<END_PICK_USER>>>");
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+  return toolResult
+    .slice(start + "<<<PICK_USER>>>".length, end)
+    .replace(/^\n/, "")
+    .replace(/\n$/, "")
+    .trim();
 }
 
 /**
@@ -226,6 +239,7 @@ async function runAgentTurn(
     // full thread history still gives it the context it needs to act.
     const model = isTrivialReply(userMessage) ? CHEAP_MODEL : MODEL;
     let reply = "";
+    let historyReply = "";
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
       const completion = await openai!.chat.completions.create({
@@ -244,7 +258,7 @@ async function runAgentTurn(
       messages.push(choice);
 
       if (choice.tool_calls && choice.tool_calls.length > 0) {
-        let pickPosted = false;
+        let pickResult = "";
         let cardReady = false;
         let hardError = "";
         for (const call of choice.tool_calls) {
@@ -265,7 +279,7 @@ async function runAgentTurn(
                 : "Error running that action.";
           }
           if (result.startsWith("[pick posted]")) {
-            pickPosted = true;
+            pickResult = result;
           }
           if (result.startsWith("[card ready]")) {
             cardReady = true;
@@ -281,11 +295,14 @@ async function runAgentTurn(
         }
         // Don't let the model invent/restate after picks, cards, or hard errors.
         if (hardError) {
-          reply = hardError.length > 280 ? `${hardError.slice(0, 277)}…` : hardError;
+          reply =
+            hardError.length > 280 ? `${hardError.slice(0, 277)}…` : hardError;
           break;
         }
-        if (pickPosted) {
-          reply = "Reply with a number.";
+        if (pickResult) {
+          // Slack gets the clean list once; history keeps ids so the next "2" works.
+          reply = extractPickUserText(pickResult) ?? "Reply with a number.";
+          historyReply = pickResult;
           break;
         }
         if (cardReady) {
@@ -308,7 +325,11 @@ async function runAgentTurn(
 
     // Persist only plain user/assistant turns so trimming can't orphan a
     // tool message (which would break the next OpenAI request).
-    history.push({ role: "assistant", content: reply });
+    // For picks, store the full pick payload (with ids) so the next number works.
+    history.push({
+      role: "assistant",
+      content: historyReply || reply,
+    });
     if (history.length > MAX_HISTORY_MESSAGES) {
       history.splice(0, history.length - MAX_HISTORY_MESSAGES);
     }
