@@ -40,6 +40,7 @@ Rules:
   • Forbidden: "It looks like", "Would you like", "Please confirm", "Let me know if", "I will now proceed", "Before I can", re-asking something already answered, asking for company lifecycle when creating a deal.
   • After any approval card: say only "Review the card above — Approve or Discard." (or ≤8 words). Do not describe card fields.
   • Numbered disambiguation: one-line prompt, then EACH option on its own line (never "1. A 2. B 3. C" on one line). No preamble or recap. If a tool already posted the list to Slack, do not restate it.
+  • NEVER echo tool internals to the user: no "[pick posted]", "<<<PICK_USER>>>", "[pick] …", "ids (model only)", or HubSpot ids. Those are for you only.
   • Errors/blockers: one sentence — what failed + what to do next. No apologies or repetition.
   • Tool results are internal; translate them into minimal user text. Never paste tool instructions verbatim.
 - A single request can require multiple actions — call each relevant tool. For example, "update notes for Acme — demoed today, and remind me to follow up in 2 days" should call both update_notes and schedule_follow_up, producing two approval cards.
@@ -168,6 +169,28 @@ function extractPickUserText(toolResult: string): string | null {
     .trim();
 }
 
+/** Never show pick machinery / id maps in Slack. */
+function sanitizeSlackReply(text: string): string {
+  const extracted = extractPickUserText(text);
+  if (extracted) {
+    return extracted;
+  }
+  return text
+    .replace(/^\[pick posted\]\s*/gm, "")
+    .replace(/<<<PICK_USER>>>\s*/g, "")
+    .replace(/\s*<<<END_PICK_USER>>>/g, "")
+    .replace(/^\[pick\][^\n]*\n?/gm, "")
+    .replace(/^ids \(model only\):[^\n]*\n?/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function isPickToolResult(result: string): boolean {
+  return (
+    result.startsWith("[pick posted]") || result.includes("<<<PICK_USER>>>")
+  );
+}
+
 /**
  * Runs one agent turn for a conversation identified by (channel, threadTs).
  * Replies are always posted into that thread so follow-up messages in the same
@@ -198,19 +221,20 @@ async function runAgentTurn(
   let workingTs: string | undefined;
 
   const finish = async (text: string) => {
+    const slackText = sanitizeSlackReply(text);
     if (workingTs) {
       try {
         await client.chat.update({
           channel,
           ts: workingTs,
-          text,
+          text: slackText,
         });
         return;
       } catch (error) {
         console.error("[agent] failed to update working reply:", error);
       }
     }
-    await post(text);
+    await post(slackText);
   };
 
   try {
@@ -328,7 +352,7 @@ async function runAgentTurn(
                 ? `Error: ${error.message}`
                 : "Error running that action.";
           }
-          if (result.startsWith("[pick posted]")) {
+          if (isPickToolResult(result)) {
             pickResult = result;
           }
           if (result.startsWith("[card ready]")) {
@@ -364,7 +388,7 @@ async function runAgentTurn(
 
       reply =
         typeof choice.content === "string" && choice.content.trim()
-          ? choice.content
+          ? sanitizeSlackReply(choice.content)
           : "Done.";
       break;
     }

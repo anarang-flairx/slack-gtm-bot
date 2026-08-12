@@ -16,7 +16,9 @@ import {
   formatCompanyDealName,
   isPartnershipPipeline,
   listCompaniesByLifecycleStage,
+  listDealCreatePipelines,
   listDealPipelines,
+  preferFlairXSalesPipelineId,
   resolveDealsForStageMove,
   scanMarketingJunk,
   type NoteRecordMatch,
@@ -769,7 +771,7 @@ async function runCreateCompanyDeal(
     : "";
   const force = args.force === true;
 
-  const pipelines = await listDealPipelines();
+  const pipelines = await listDealCreatePipelines();
   const envPipelineId = process.env.HUBSPOT_PIPELINE_ID?.trim() || "";
 
   // Resolve from explicit id, label, or list number ("1") — do NOT use env yet
@@ -792,15 +794,15 @@ async function runCreateCompanyDeal(
     }
   }
   if (!resolvedPipelineId && pipelineLabelArg) {
-    // Prefer configured Partnership pipeline id when user said "Partnerships".
-    if (
-      partnershipEnvId &&
-      pipelineLabelArg.toLowerCase().includes("partnership")
-    ) {
+    const labelLower = pipelineLabelArg.toLowerCase();
+    // Prefer configured env ids when the user names Sales / Partnerships.
+    if (partnershipEnvId && labelLower.includes("partnership")) {
       resolvedPipelineId = partnershipEnvId;
+    } else if (envPipelineId && labelLower.includes("sales")) {
+      resolvedPipelineId = envPipelineId;
     } else {
       const byLabel = pipelines.find(
-        (p) => p.label.toLowerCase() === pipelineLabelArg.toLowerCase(),
+        (p) => p.label.toLowerCase() === labelLower,
       );
       if (byLabel) {
         resolvedPipelineId = byLabel.id;
@@ -810,7 +812,7 @@ async function runCreateCompanyDeal(
           resolvedPipelineId = byNum.id;
         } else {
           const partial = pipelines.filter((p) =>
-            p.label.toLowerCase().includes(pipelineLabelArg.toLowerCase()),
+            p.label.toLowerCase().includes(labelLower),
           );
           if (partial.length === 1) {
             resolvedPipelineId = partial[0].id;
@@ -829,15 +831,23 @@ async function runCreateCompanyDeal(
     }
   }
 
-  // If number picked a pipeline labeled Partnerships, pin to env id when set.
-  if (resolvedPipelineId && partnershipEnvId) {
+  // If number/label picked Partnerships or Sales, pin to configured env ids.
+  if (resolvedPipelineId) {
     const selected = pipelines.find((p) => p.id === resolvedPipelineId);
-    if (
-      selected &&
-      selected.label.toLowerCase().includes("partnership") &&
-      resolvedPipelineId !== partnershipEnvId
-    ) {
-      resolvedPipelineId = partnershipEnvId;
+    if (selected) {
+      if (
+        partnershipEnvId &&
+        selected.label.toLowerCase().includes("partnership") &&
+        resolvedPipelineId !== partnershipEnvId
+      ) {
+        resolvedPipelineId = partnershipEnvId;
+      } else if (
+        envPipelineId &&
+        selected.label.toLowerCase().includes("sales") &&
+        resolvedPipelineId !== envPipelineId
+      ) {
+        resolvedPipelineId = envPipelineId;
+      }
     }
   }
 
@@ -904,6 +914,17 @@ async function runCreateCompanyDeal(
   }
   resolvedPipelineId = resolvedPipelineId || envPipelineId;
 
+  // Sales: if env/default points at HubSpot's stock stages, swap to FlairX pipeline.
+  if (resolvedPipelineId && resolvedPipelineId !== partnershipEnvId) {
+    const selectedLabel =
+      pipelines.find((p) => p.id === resolvedPipelineId)?.label ??
+      (await getPipelineMeta(resolvedPipelineId).catch(() => null))?.label ??
+      "";
+    if (!isPartnershipPipeline(resolvedPipelineId, selectedLabel)) {
+      resolvedPipelineId = await preferFlairXSalesPipelineId(resolvedPipelineId);
+    }
+  }
+
   const pipeline = await getPipelineMeta(resolvedPipelineId || undefined);
   const partnershipPipeline = isPartnershipPipeline(pipeline.id, pipeline.label);
 
@@ -932,7 +953,7 @@ async function runCreateCompanyDeal(
     if (!resolvedStageLabel) {
       return postPick(
         ctx,
-        `Pick deal stage (${pipeline.label}):`,
+        "What deal stage?",
         dealStageLines,
         `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} pipeline_label="${pipeline.label}" stage=<label or number>. Then ask relationship_type. NEVER ask lifecycle. Stages must be from this pipeline only.`,
       );
@@ -962,7 +983,7 @@ async function runCreateCompanyDeal(
         .join("\n");
       return postPick(
         ctx,
-        "Pick relationship type:",
+        "What relationship type?",
         relationshipLines,
         `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage="${stage.label}" relationship_type=<label or number>. Do NOT ask lifecycle.`,
       );
@@ -1016,7 +1037,7 @@ async function runCreateCompanyDeal(
   if (!resolvedStageLabel) {
     return postPick(
       ctx,
-      `Pick deal stage (${pipeline.label}):`,
+      "What deal stage?",
       dealStageLines,
       `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} pipeline_label="${pipeline.label}" stage=<label or number>. NEVER ask for lifecycle or relationship_type. Stages must be from this pipeline only.`,
     );

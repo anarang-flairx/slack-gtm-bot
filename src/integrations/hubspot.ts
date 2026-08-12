@@ -318,6 +318,112 @@ export function isPartnershipPipeline(
   return pipelineLabel.trim().toLowerCase().includes("partnership");
 }
 
+/** Stock HubSpot Sales Pipeline stage names (not FlairX). */
+const STOCK_HUBSPOT_STAGE_MARKERS = [
+  "appointment scheduled",
+  "qualified to buy",
+  "presentation scheduled",
+  "decision maker bought-in",
+  "contract sent",
+];
+
+/** FlairX-style Sales stage markers. */
+const FLAIRX_SALES_STAGE_MARKERS = [
+  "initial contact",
+  "demo scheduled",
+  "demo completed",
+  "proposal sent",
+  "negotiation",
+];
+
+function stageLabelSet(stages: Array<{ label: string }>): Set<string> {
+  return new Set(stages.map((s) => s.label.trim().toLowerCase()));
+}
+
+export function looksLikeStockHubSpotSalesStages(
+  stages: Array<{ label: string }>,
+): boolean {
+  const labels = stageLabelSet(stages);
+  return (
+    STOCK_HUBSPOT_STAGE_MARKERS.filter((m) => labels.has(m)).length >= 2
+  );
+}
+
+export function looksLikeFlairXSalesStages(
+  stages: Array<{ label: string }>,
+): boolean {
+  const labels = stageLabelSet(stages);
+  return FLAIRX_SALES_STAGE_MARKERS.filter((m) => labels.has(m)).length >= 2;
+}
+
+/**
+ * Pipelines to offer when creating a deal: configured Sales + Partnerships
+ * when env ids are set; otherwise all HubSpot deal pipelines.
+ */
+export async function listDealCreatePipelines(): Promise<
+  Array<{ id: string; label: string; stageCount: number }>
+> {
+  const all = await listDealPipelines();
+  const salesId = process.env.HUBSPOT_PIPELINE_ID?.trim() || "";
+  const partnerId = process.env.HUBSPOT_PARTNERSHIP_PIPELINE_ID?.trim() || "";
+  if (!salesId && !partnerId) {
+    return all;
+  }
+
+  const preferred: Array<{ id: string; label: string; stageCount: number }> =
+    [];
+  const seen = new Set<string>();
+  for (const id of [salesId, partnerId]) {
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    const match = all.find((p) => p.id === id);
+    if (match) {
+      preferred.push(match);
+      seen.add(id);
+    }
+  }
+  return preferred.length > 0 ? preferred : all;
+}
+
+/**
+ * If `pipelineId` is the stock HubSpot Sales pipeline, prefer another pipeline
+ * that has FlairX-style stages (Initial Contact / Demo Scheduled / …).
+ */
+export async function preferFlairXSalesPipelineId(
+  pipelineId: string,
+): Promise<string> {
+  const meta = await getPipelineMeta(pipelineId);
+  if (!looksLikeStockHubSpotSalesStages(meta.stages)) {
+    return pipelineId;
+  }
+  if (isPartnershipPipeline(meta.id, meta.label)) {
+    return pipelineId;
+  }
+
+  const all = await fetchDealPipelines();
+  const partnerId = process.env.HUBSPOT_PARTNERSHIP_PIPELINE_ID?.trim() || "";
+  for (const candidate of all) {
+    if (candidate.id === pipelineId) {
+      continue;
+    }
+    if (partnerId && candidate.id === partnerId) {
+      continue;
+    }
+    if (isPartnershipPipeline(candidate.id, candidate.label?.trim() || "")) {
+      continue;
+    }
+    const candidateMeta = toPipelineMeta(candidate);
+    if (looksLikeFlairXSalesStages(candidateMeta.stages)) {
+      console.warn(
+        `[pipeline] "${pipelineId}" has HubSpot stock Sales stages; using "${candidateMeta.label}" (${candidateMeta.id}) for Sales instead.`,
+      );
+      return candidateMeta.id;
+    }
+  }
+  return pipelineId;
+}
+
 let relationshipTypeOptionsCache: TimedCache<
   Array<{ label: string; value: string }>
 > | null = null;
