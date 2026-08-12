@@ -34,8 +34,15 @@ You can:
 - Summarize an email thread into notes on the matching contact and its company.
 
 Rules:
+- VOICE (strict — overrides everything else for user-visible text):
+  • Default reply: 1–2 short sentences. Never write paragraphs.
+  • Forbidden: "It looks like", "Would you like", "Please confirm", "Let me know if", "I will now proceed", "Before I can", re-asking something already answered.
+  • After any approval card: say only "Review the card above — Approve or Discard." (or ≤8 words). Do not describe card fields.
+  • Numbered disambiguation: one-line prompt + the list only (e.g. "Pick a pipeline:" then 1. 2. 3.). No preamble or recap.
+  • Errors/blockers: one sentence — what failed + what to do next. No apologies or repetition.
+  • Tool results are internal; translate them into minimal user text. Never paste tool instructions verbatim.
 - A single request can require multiple actions — call each relevant tool. For example, "update notes for Acme — demoed today, and remind me to follow up in 2 days" should call both update_notes and schedule_follow_up, producing two approval cards.
-- Every action that writes to HubSpot or Gmail posts an approval card with Approve/Discard buttons. You never complete a write yourself; after calling a write tool, tell the user you posted a preview for them to approve. Do not claim a record was created, moved, or drafted — only that a preview is ready.
+- Every action that writes to HubSpot or Gmail posts an approval card with Approve/Discard buttons. You never complete a write yourself; after calling a write tool, tell the user a preview is ready (briefly). Do not claim a record was created, moved, or drafted — only that a preview is ready.
 - The bot never sends email; drafts are saved to Gmail Drafts for a human to send.
 - The approval card IS the confirmation step. Never ask the user to verbally confirm an action before you post its card (do not say "just to confirm" or "shall I proceed?"). As soon as you know what to do, call the tool so the card appears; the user confirms by clicking Approve.
 - Disambiguation happens at most once. When a tool reports multiple matches, present them to the user as a NUMBERED list exactly like "1. ...", "2. ...", and ask them to "reply with the number". Do not list the internal ids. When the user replies with a number (or otherwise names one), immediately call the tool again for that specific record — do NOT ask another clarifying or confirmation question. Never re-ask something the user already answered.
@@ -51,7 +58,7 @@ Rules:
 - When you post a card (e.g. company status), keep your text reply short since the card carries the detail.
 - To move a deal "forward" or to the "next" stage, first call get_pipeline_stages and get the current stage (via get_company_status or search_records), then pass the exact next stage label.
 - To draft a context-aware follow-up to an unanswered email, use list_unanswered_emails, then get_email_thread, then draft_custom_email with a body referencing that thread.
-- Stay within GTM scope. Be concise.`;
+- Stay within GTM scope.`;
 
 const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 
@@ -221,7 +228,7 @@ async function runAgentTurn(
 
       const choice = completion.choices[0]?.message;
       if (!choice) {
-        reply = "Sorry, I had trouble thinking of a response.";
+        reply = "Something went wrong — try again.";
         break;
       }
 
@@ -262,8 +269,7 @@ async function runAgentTurn(
     }
 
     if (!reply) {
-      reply =
-        "I wasn't able to finish that in a reasonable number of steps. Could you narrow the request?";
+      reply = "Too many steps — narrow the request.";
     }
 
     // Persist only plain user/assistant turns so trimming can't orphan a
@@ -278,7 +284,7 @@ async function runAgentTurn(
   } catch (error) {
     console.error("[agent] turn failed:", error);
     try {
-      await finish("Sorry, I hit an error handling that. Please try again.");
+      await finish("Error — try again.");
     } catch (postError) {
       console.error("[agent] failed to post error reply:", postError);
     }
@@ -312,7 +318,7 @@ async function runImageCapture(
     client.chat.postMessage({ channel, thread_ts: threadTs, text });
 
   if (!openai) {
-    await post("Image scanning needs OpenAI, which isn't configured right now.");
+    await post("Image scanning needs OpenAI configured.");
     return;
   }
 
@@ -347,14 +353,14 @@ async function runImageCapture(
     }
 
     if (dataUrls.length === 0) {
-      await finish("I couldn't download those images. Please try again.");
+      await finish("Couldn't download those images.");
       return;
     }
 
     const leads = await extractLeadsFromImages(openai, dataUrls, context);
     if (leads.length === 0) {
       await finish(
-        "I couldn't read any contact details from that. Try a clearer photo, or just type the details and I'll add them.",
+        "Couldn't read contact details — try a clearer photo or type the info.",
       );
       return;
     }
@@ -378,8 +384,8 @@ async function runImageCapture(
 
     await finish(
       leads.length === 1
-        ? "Found 1 lead — review the card above and click Approve to add the contact to HubSpot."
-        : `Found ${leads.length} leads — review the cards above and Approve the ones you want as contacts in HubSpot.`,
+        ? "Review the card above — Approve or Discard."
+        : `Review the ${leads.length} cards above — Approve or Discard.`,
     );
   } catch (error) {
     console.error("[image-capture] failed:", error);
@@ -388,13 +394,13 @@ async function runImageCapture(
         await client.chat.update({
           channel,
           ts: workingTs,
-          text: "Sorry, I hit an error reading those images. Please try again.",
+          text: "Error reading images — try again.",
         });
       } else {
-        await post("Sorry, I hit an error reading those images. Please try again.");
+        await post("Error reading images — try again.");
       }
     } catch {
-      await post("Sorry, I hit an error reading those images. Please try again.");
+      await post("Error reading images — try again.");
     }
   }
 }

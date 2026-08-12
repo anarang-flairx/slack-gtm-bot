@@ -68,6 +68,15 @@ async function postCard(
   });
 }
 
+/** After posting an approval card — model should echo this to the user. */
+const CARD_READY =
+  "[card ready] User reply only: Review the card above — Approve or Discard.";
+
+/** Numbered pick — model shows title + list; hint is for the model only. */
+function pickPrompt(title: string, lines: string, hint: string): string {
+  return `[pick] ${hint}\n→ User: "${title}" + list (no ids, no extra text)\n${lines}`;
+}
+
 export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: "function",
@@ -445,8 +454,11 @@ async function runUpdateNotes(
 ): Promise<string> {
   const result = await findNoteRecords(name);
   if (Array.isArray(result)) {
-    const options = result.map(formatMatch).join("\n");
-    return `Multiple records matched "${name}". Ask the user which one:\n${options}`;
+    return pickPrompt(
+      "Pick a record:",
+      result.map(formatMatch).join("\n"),
+      `update_notes name=<chosen>`,
+    );
   }
 
   const pending = savePendingNoteUpdate({
@@ -466,7 +478,7 @@ async function runUpdateNotes(
     buildNoteUpdatePreviewBlocks(result, note, pending.id),
   );
 
-  return `Posted an approval card to append a note to ${result.type} "${result.name}". Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 async function runUpdateLeadStatus(
@@ -505,13 +517,16 @@ async function runUpdateLeadStatus(
       return `No contact found named "${name}".`;
     }
     if (matches.length > 1) {
-      const options = matches
-        .map(
-          (m, i) =>
-            `${i + 1}. ${m.name}${m.email ? ` — ${m.email}` : " — (no email)"}${m.company ? ` @ ${m.company}` : ""} (contact_id: ${m.id})`,
-        )
-        .join("\n");
-      return `Multiple contacts match "${name}". Show the user this NUMBERED list (do not show the contact_id) and ask them to reply with just the number. When they pick one, call update_lead_status again with that contact_id and status "${statusLabel}". Do not ask for any other confirmation.\n${options}`;
+      return pickPrompt(
+        "Pick a contact:",
+        matches
+          .map(
+            (m, i) =>
+              `${i + 1}. ${m.name}${m.email ? ` — ${m.email}` : ""}${m.company ? ` @ ${m.company}` : ""}`,
+          )
+          .join("\n"),
+        `update_lead_status contact_id=<id> status="${statusLabel}"`,
+      );
     }
     contact = matches[0];
   }
@@ -538,7 +553,7 @@ async function runUpdateLeadStatus(
     ),
   );
 
-  return `Posted an approval card to set ${contact.name}'s lead status to "${statusLabel}". Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 async function runAddPerson(
@@ -578,7 +593,7 @@ async function runAddPerson(
     const existingByEmail = await findContactByEmail(fields.email);
     if (existingByEmail) {
       const url = hubspotRecordUrl("contact", existingByEmail.id);
-      return `Contact already exists: <${url}|${existingByEmail.name}> (${fields.email}). Do NOT create a duplicate. Tell the user this contact is already in HubSpot. If they wanted a company deal, call create_company_deal for the company instead.`;
+      return `Contact exists: <${url}|${existingByEmail.name}> (${fields.email}). Deal? → create_company_deal.`;
     }
   }
 
@@ -594,7 +609,7 @@ async function runAddPerson(
         return `• <${url}|${m.name}>${bits ? ` — ${bits}` : ""}`;
       })
       .join("\n");
-    return `Contact(s) named "${displayName}" already exist:\n${lines}\nDo NOT create a duplicate. Tell the user and ask whether to use the existing record (e.g. update notes) instead.`;
+    return `Contact exists:\n${lines}\n→ User: link + ask update notes or skip.`;
   }
 
   let companyReuseNote: string | undefined;
@@ -616,17 +631,20 @@ async function runAddPerson(
               return `• <${dealUrl}|${d.name}> — ${d.stage}`;
             })
             .join("\n");
-          return `${exact.name} already has deal(s):\n${dealLines}\nDo NOT create a duplicate prospect/deal. Tell the user. If they only need the person in HubSpot, call add_contact instead. If they insist on another deal, call create_company_deal with force=true.`;
+          return `${exact.name} has deal(s):\n${dealLines}\n→ add_contact for person only, or create_company_deal force=true.`;
         }
       }
     } else if (companies.length > 0) {
-      const options = companies
-        .map(
-          (c, i) =>
-            `${i + 1}. ${c.name}${c.domain ? ` — ${c.domain}` : ""}`,
-        )
-        .join("\n");
-      return `No exact company named "${companyName}", but similar companies exist:\n${options}\nAsk the user whether to reuse one of these (reply with the number / name) or create a new company with the exact name they gave.`;
+      return pickPrompt(
+        "Pick a company:",
+        companies
+          .map(
+            (c, i) =>
+              `${i + 1}. ${c.name}${c.domain ? ` — ${c.domain}` : ""}`,
+          )
+          .join("\n"),
+        `reuse chosen company or create "${companyName}"`,
+      );
     }
   }
 
@@ -656,14 +674,7 @@ async function runAddPerson(
     ),
   );
 
-  const action = createDeal
-    ? `add ${displayName}${companyName ? ` at ${companyName}` : ""} as a prospect (contact + deal)`
-    : `add ${displayName}${companyName ? ` at ${companyName}` : ""} as a contact`;
-  const reuse =
-    companyReuseNote != null
-      ? " Existing company will be reused."
-      : "";
-  return `Posted an approval card to ${action}.${reuse} Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 async function runAddProspect(
@@ -724,16 +735,19 @@ async function runCreateCompanyDeal(
   } else {
     const matches = await findCompaniesByName(companyName);
     if (matches.length === 0) {
-      return `No HubSpot company matching "${companyName}". A company must already exist before creating a deal — do not invent one. Tell the user no company was found.`;
+      return `No company "${companyName}" in HubSpot.`;
     }
     if (matches.length > 1) {
-      const options = matches
-        .map(
-          (m, i) =>
-            `${i + 1}. ${m.name}${m.domain ? ` — ${m.domain}` : ""} (company_id: ${m.id})`,
-        )
-        .join("\n");
-      return `Multiple companies match "${companyName}". Show the user this NUMBERED list (do not show the company_id) and ask them to reply with just the number. When they pick one, call create_company_deal again with that company_id. Do not ask about contacts or deal name.\n${options}`;
+      return pickPrompt(
+        "Pick a company:",
+        matches
+          .map(
+            (m, i) =>
+              `${i + 1}. ${m.name}${m.domain ? ` — ${m.domain}` : ""}`,
+          )
+          .join("\n"),
+        `create_company_deal company_id=<id>`,
+      );
     }
     company = matches[0];
   }
@@ -753,23 +767,18 @@ async function runCreateCompanyDeal(
         return `• <${url}|${d.name}> — ${d.stage}`;
       })
       .join("\n");
-    return `${company.name} already has ${status.deals.length} deal(s):\n${dealLines}\nDo NOT create a duplicate. Tell the user these deals already exist. Only call create_company_deal again with force=true if they explicitly ask to create another deal anyway.`;
+    return `${company.name} has ${status.deals.length} deal(s):\n${dealLines}\n→ force=true only if user wants another.`;
   }
 
   // If HubSpot has multiple deal pipelines and none was chosen yet, ask first.
   const resolvedPipelineId = pipelineIdArg || envPipelineId;
   if (!resolvedPipelineId && pipelines.length > 1) {
-    const lines = pipelines
-      .map(
-        (p, i) =>
-          `${i + 1}. ${p.label} (${p.stageCount} stages) (pipeline_id: ${p.id})`,
-      )
-      .join("\n");
-    return (
-      `Multiple deal pipelines exist. Before creating a deal for ${company.name} (company_id: ${company.id}), the user must pick a pipeline.\n\n` +
-      `*Deal pipelines*\n${lines}\n\n` +
-      `Show this NUMBERED list to the user (do not show pipeline_id or company_id). Ask them to reply with just the number. ` +
-      `When they pick one, call create_company_deal again with that pipeline_id and the same company_id/company_name.`
+    return pickPrompt(
+      "Pick a pipeline:",
+      pipelines
+        .map((p, i) => `${i + 1}. ${p.label} (${p.stageCount} stages)`)
+        .join("\n"),
+      `create_company_deal company_id=${company.id} pipeline_id=<id>`,
     );
   }
 
@@ -786,12 +795,9 @@ async function runCreateCompanyDeal(
         .map((s, i) => `${i + 1}. ${s.label}`)
         .join("\n");
       return (
-        `Before creating a deal for ${company.name} in the *Partnership* pipeline (company_id: ${company.id}, pipeline_id: ${pipeline.id}), the user must pick a deal stage AND a relationship type.\n\n` +
-        `*Deal stages (${pipeline.label})*\n${dealStageLines}\n\n` +
-        `*Relationship types*\n${relationshipLines}\n\n` +
-        `Show BOTH numbered lists to the user exactly like this (do not show company_id or pipeline_id). Ask them to reply with two numbers, e.g. "1 2" (first = deal stage, second = relationship type). ` +
-        `When they reply, call create_company_deal again with company_id "${company.id}", company_name "${company.name}", pipeline_id "${pipeline.id}", stage set to the chosen deal-stage label, and relationship_type set to the chosen relationship label. ` +
-        `Do NOT ask for lifecycle stage on the Partnership pipeline.`
+        `[pick] create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label> relationship_type=<label>\n` +
+        `→ User: "Pick deal stage + relationship type (e.g. 1 2):" + both lists\n` +
+        `Deal stages (${pipeline.label}):\n${dealStageLines}\n\nRelationship types:\n${relationshipLines}`
       );
     }
 
@@ -842,15 +848,7 @@ async function runCreateCompanyDeal(
       ),
     );
 
-    const contactSummary =
-      contacts.length === 0
-        ? "no contacts to associate yet"
-        : `${contacts.length} contact(s) will be associated`;
-    const forceNote =
-      force && status.deals.length > 0
-        ? " (force=true — creating an additional deal despite existing ones)"
-        : "";
-    return `Posted an approval card to create deal "${dealName}" in ${pipeline.label} / ${stage.label} for ${company.name}, set relationship type to ${relationship.label} (${contactSummary})${forceNote}. Waiting for the user to Approve or Discard.`;
+    return CARD_READY;
   }
 
   // Sales pipelines: deal stage + company lifecycle.
@@ -859,12 +857,9 @@ async function runCreateCompanyDeal(
       .map((s, i) => `${i + 1}. ${s.label}`)
       .join("\n");
     return (
-      `Before creating a deal for ${company.name} (company_id: ${company.id}, pipeline_id: ${pipeline.id}), the user must pick a deal stage in *${pipeline.label}* AND a company lifecycle stage.\n\n` +
-      `*Deal stages (${pipeline.label})*\n${dealStageLines}\n\n` +
-      `*Company lifecycle stages*\n${lifecycleLines}\n\n` +
-      `Show BOTH numbered lists to the user exactly like this (do not show company_id or pipeline_id). Ask them to reply with two numbers, e.g. "1 3" (first = deal stage, second = lifecycle stage). ` +
-      `When they reply, call create_company_deal again with company_id "${company.id}", company_name "${company.name}", pipeline_id "${pipeline.id}", stage set to the chosen deal-stage label, and lifecycle_stage set to the chosen lifecycle label. ` +
-      `If creating deals for multiple companies with the same picks, reuse those pipeline/stage/lifecycle values for each create_company_deal call.`
+      `[pick] create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label> lifecycle_stage=<label>\n` +
+      `→ User: "Pick deal stage + lifecycle (e.g. 1 3):" + both lists\n` +
+      `Deal stages (${pipeline.label}):\n${dealStageLines}\n\nLifecycle:\n${lifecycleLines}`
     );
   }
 
@@ -915,15 +910,7 @@ async function runCreateCompanyDeal(
     ),
   );
 
-  const contactSummary =
-    contacts.length === 0
-      ? "no contacts to associate yet"
-      : `${contacts.length} contact(s) will be associated`;
-  const forceNote =
-    force && status.deals.length > 0
-      ? " (force=true — creating an additional deal despite existing ones)"
-      : "";
-  return `Posted an approval card to create deal "${dealName}" in ${pipeline.label} / ${stage.label} for ${company.name}, set company lifecycle to ${lifecycle.label} (${contactSummary})${forceNote}. Waiting for the user to Approve or Discard. Do not ask about contacts or deal name — both are already set.`;
+  return CARD_READY;
 }
 
 async function runMoveDealStage(
@@ -957,21 +944,27 @@ async function runMoveDealStage(
   });
 
   if (ambiguousCompanies && ambiguousCompanies.length > 0) {
-    const options = ambiguousCompanies
-      .map((c, i) => `${i + 1}. ${c.name}${c.domain ? ` (${c.domain})` : ""}`)
-      .join("\n");
-    return `Multiple companies matched. Ask the user which one:\n${options}`;
+    return pickPrompt(
+      "Pick a company:",
+      ambiguousCompanies
+        .map((c, i) => `${i + 1}. ${c.name}${c.domain ? ` (${c.domain})` : ""}`)
+        .join("\n"),
+      `move_deal_stage company_name=<chosen>`,
+    );
   }
 
   if (deals.length === 0) {
-    return `No existing deal found for ${companyName ?? dealName}. If the user wants to CREATE a new deal for this company (e.g. "move X to deals" / "new deal"), call create_company_deal with company_name — do not ask for contact details or a deal name.`;
+    return `No deal for ${companyName ?? dealName}. New deal? → create_company_deal.`;
   }
 
   if (deals.length > 1) {
-    const options = deals
-      .map((d, i) => `${i + 1}. ${d.name} — ${d.currentStageLabel}`)
-      .join("\n");
-    return `Multiple deals matched. Ask the user which one (pass deal_name):\n${options}`;
+    return pickPrompt(
+      "Pick a deal:",
+      deals
+        .map((d, i) => `${i + 1}. ${d.name} — ${d.currentStageLabel}`)
+        .join("\n"),
+      `move_deal_stage deal_name=<chosen>`,
+    );
   }
 
   const deal = deals[0];
@@ -1002,7 +995,7 @@ async function runMoveDealStage(
     ),
   );
 
-  return `Posted an approval card to move "${deal.name}" from ${deal.currentStageLabel} to ${stage.label}. Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 async function runDraftEmail(
@@ -1015,13 +1008,16 @@ async function runDraftEmail(
     return `No HubSpot contact matching "${contactName}".`;
   }
   if (contacts.length > 1) {
-    const options = contacts
-      .map(
-        (c, i) =>
-          `${i + 1}. ${c.name}${c.company ? ` (${c.company})` : ""}${c.email ? ` — ${c.email}` : ""}`,
-      )
-      .join("\n");
-    return `Multiple contacts matched "${contactName}". Ask the user which one:\n${options}`;
+    return pickPrompt(
+      "Pick a contact:",
+      contacts
+        .map(
+          (c, i) =>
+            `${i + 1}. ${c.name}${c.company ? ` (${c.company})` : ""}${c.email ? ` — ${c.email}` : ""}`,
+        )
+        .join("\n"),
+      `draft_email contact_name=<chosen>`,
+    );
   }
 
   const preview = await createDraftByContactId(
@@ -1045,7 +1041,7 @@ async function runDraftEmail(
     ),
   );
 
-  return `Posted an approval card for a ${template} email to ${preview.context.fullName} (${preview.draft.to}). Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 async function runDraftCustomEmail(
@@ -1090,7 +1086,7 @@ async function runDraftCustomEmail(
     ),
   );
 
-  return `Posted an approval card for a custom email to ${to}. Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 async function runScheduleFollowUp(
@@ -1101,8 +1097,11 @@ async function runScheduleFollowUp(
 ): Promise<string> {
   const result = await findNoteRecords(name);
   if (Array.isArray(result)) {
-    const options = result.map(formatMatch).join("\n");
-    return `Multiple records matched "${name}". Ask the user which one:\n${options}`;
+    return pickPrompt(
+      "Pick a record:",
+      result.map(formatMatch).join("\n"),
+      `schedule_follow_up name=<chosen>`,
+    );
   }
 
   const safeDays = Number.isFinite(days) && days > 0 ? Math.round(days) : 1;
@@ -1138,7 +1137,7 @@ async function runScheduleFollowUp(
     ),
   );
 
-  return `Posted an approval card to remind about ${result.type} "${result.name}" in ${safeDays} day(s) (due ${dueLabel}). Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 async function runSummarizeEmailToNotes(
@@ -1151,10 +1150,13 @@ async function runSummarizeEmailToNotes(
     return `No HubSpot contact matching "${contactName}".`;
   }
   if (contacts.length > 1) {
-    const options = contacts
-      .map((c, i) => `${i + 1}. ${c.name}${c.company ? ` (${c.company})` : ""}`)
-      .join("\n");
-    return `Multiple contacts matched "${contactName}". Ask the user which one:\n${options}`;
+    return pickPrompt(
+      "Pick a contact:",
+      contacts
+        .map((c, i) => `${i + 1}. ${c.name}${c.company ? ` (${c.company})` : ""}`)
+        .join("\n"),
+      `summarize_email_to_notes contact_name=<chosen>`,
+    );
   }
 
   const contact = contacts[0];
@@ -1182,7 +1184,6 @@ async function runSummarizeEmailToNotes(
     buildNoteUpdatePreviewBlocks(contactMatch, summary, contactPending.id),
   );
 
-  let companyLine = "";
   if (company) {
     const companyMatch: NoteRecordMatch = {
       type: "company",
@@ -1205,10 +1206,9 @@ async function runSummarizeEmailToNotes(
       `Email summary ready for ${company.name}`,
       buildNoteUpdatePreviewBlocks(companyMatch, summary, companyPending.id),
     );
-    companyLine = ` and its company "${company.name}"`;
   }
 
-  return `Posted approval card(s) to attach the summary to ${contact.name}${companyLine}. Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 export async function executeTool(
@@ -1265,9 +1265,7 @@ export async function executeTool(
         return `${i + 1}. ${c.name}${domain}`;
       });
       const suffix =
-        companies.length >= 50
-          ? "\n\n(Showing first 50. Ask me to narrow the list if needed.)"
-          : "";
+        companies.length >= 50 ? "\n(first 50 — ask to narrow)" : "";
       return `Companies in *${stage}* (${companies.length}):\n${lines.join("\n")}${suffix}`;
     }
 
@@ -1290,12 +1288,16 @@ export async function executeTool(
         return `No HubSpot company matching "${companyName}".`;
       }
       if (matches.length > 1) {
-        const options = matches
-          .map(
-            (m, i) => `${i + 1}. ${m.name}${m.domain ? ` — ${m.domain}` : ""}`,
-          )
-          .join("\n");
-        return `Multiple companies matched "${companyName}". Ask the user which one:\n${options}`;
+        return pickPrompt(
+          "Pick a company:",
+          matches
+            .map(
+              (m, i) =>
+                `${i + 1}. ${m.name}${m.domain ? ` — ${m.domain}` : ""}`,
+            )
+            .join("\n"),
+          `get_company_status company_name=<chosen>`,
+        );
       }
       const status = await getCompanyStatus(matches[0].id);
       await postCard(
@@ -1305,9 +1307,9 @@ export async function executeTool(
       );
       const dealHint =
         status.deals.length === 0
-          ? ` If the user wants a deal/pipeline record for this company, call create_company_deal next (do not ask for contacts or deal name).`
+          ? " [no deals — create_company_deal if user wants pipeline]"
           : "";
-      return `Posted a status card for ${status.name}: ${status.deals.length} deal(s), ${status.contacts.length} contact(s), last activity ${status.lastActivity ?? "unknown"}.${dealHint}`;
+      return `[status card posted] ${status.name}: ${status.deals.length} deal(s), ${status.contacts.length} contact(s).${dealHint} User reply: one short line or silence — card has detail.`;
     }
 
     case "post_digest": {
