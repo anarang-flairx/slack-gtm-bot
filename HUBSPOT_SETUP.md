@@ -113,3 +113,18 @@ Partnerships stages should match HubSpot (e.g. New, Engaged, Active Relationship
 ## 5. Verify
 
 Run the same API one-liner above and confirm Sales and Partnerships labels + stage lists match the HubSpot UI.
+
+## 6. Marketing cleanup (`cleanup`)
+
+`@FlairX GTM Bot cleanup` scans for Conversations / email-integration auto-created contacts with **0 deals** (plus orphan companies that only have those contacts), then posts an Approve/Discard card. Approve **archives** records in HubSpot (recycle bin, restorable ~90 days).
+
+Requires existing scopes: `crm.objects.contacts.write` and `crm.objects.companies.write`.
+
+Optional `.env`:
+
+```bash
+# Never archive contacts on these domains (comma-separated)
+INTERNAL_EMAIL_DOMAINS=flairx.ai
+```
+
+Defaults to the domain of `GMAIL_SENDER_EMAIL`, or `flairx.ai` if unset.

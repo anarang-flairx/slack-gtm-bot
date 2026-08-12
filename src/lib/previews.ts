@@ -632,3 +632,105 @@ export function buildCompanyStatusBlocks(status: CompanyStatus): KnownBlock[] {
     },
   ];
 }
+
+export function buildCleanupPreviewBlocks(
+  contacts: Array<{
+    id: string;
+    name: string;
+    email: string;
+    reason: string;
+  }>,
+  companies: Array<{
+    id: string;
+    name: string;
+    domain: string;
+    reason: string;
+  }>,
+  pendingId: string,
+  truncated: boolean,
+): KnownBlock[] {
+  const maxLines = 15;
+  const contactLines =
+    contacts.length === 0
+      ? "_None_"
+      : contacts
+          .slice(0, maxLines)
+          .map((c) => {
+            const url = hubspotRecordUrl("contact", c.id);
+            const email = c.email ? ` · ${c.email}` : "";
+            return `• <${url}|${c.name}>${email}`;
+          })
+          .join("\n") +
+        (contacts.length > maxLines
+          ? `\n_…and ${contacts.length - maxLines} more_`
+          : "");
+
+  const companyLines =
+    companies.length === 0
+      ? "_None_"
+      : companies
+          .slice(0, maxLines)
+          .map((c) => {
+            const url = hubspotRecordUrl("company", c.id);
+            const domain = c.domain ? ` · ${c.domain}` : "";
+            return `• <${url}|${c.name}>${domain}`;
+          })
+          .join("\n") +
+        (companies.length > maxLines
+          ? `\n_…and ${companies.length - maxLines} more_`
+          : "");
+
+  const truncateNote = truncated
+    ? "\n_Scan capped — run cleanup again after approving to continue._"
+    : "";
+
+  return [
+    {
+      type: "header",
+      text: { type: "plain_text", text: "Marketing cleanup preview" },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          `Archive *${contacts.length}* contact(s) and *${companies.length}* company(ies) that look like inbound marketing / Conversations auto-creates (0 deals).` +
+          truncateNote,
+      },
+    },
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `*Contacts*\n${contactLines}` },
+    },
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `*Companies*\n${companyLines}` },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "On approve: *archive* these records in HubSpot (recycle bin, restorable ~90 days). Skips anything with deals.",
+      },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Approve → archive" },
+          style: "primary",
+          action_id: "approve_cleanup_marketing",
+          value: pendingId,
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Discard" },
+          style: "danger",
+          action_id: "discard_cleanup_marketing",
+          value: pendingId,
+        },
+      ],
+    },
+  ];
+}

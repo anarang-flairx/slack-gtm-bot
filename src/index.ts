@@ -2,6 +2,7 @@ import "dotenv/config";
 import { App } from "@slack/bolt";
 import OpenAI from "openai";
 import { registerCompanyDealActions } from "./handlers/companyDealActions.js";
+import { registerCleanupActions } from "./handlers/cleanupActions.js";
 import { registerDigestActions } from "./handlers/digestActions.js";
 import { registerEmailActions } from "./handlers/emailActions.js";
 import { registerMentionHandler } from "./handlers/mention.js";
@@ -50,6 +51,7 @@ registerCompanyDealActions(app);
 registerStageMoveActions(app);
 registerReminderActions(app);
 registerLeadStatusActions(app);
+registerCleanupActions(app);
 registerDigestActions(app);
 
 function startEmailNoteLogger(): void {

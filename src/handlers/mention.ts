@@ -1,6 +1,6 @@
 import type { App } from "@slack/bolt";
 import type OpenAI from "openai";
-import { executeTool, toolDefinitions, type ToolContext } from "../agent/tools.js";
+import { executeTool, runCleanupMarketing, toolDefinitions, type ToolContext } from "../agent/tools.js";
 import {
   fetchSlackImageAsDataUrl,
   imageFilesFrom,
@@ -32,6 +32,7 @@ You can:
 - Set a follow-up reminder in N days (creates a HubSpot task + a scheduled Slack nudge).
 - Draft templated or custom emails into Gmail Drafts, and find sent emails that have not been replied to.
 - Summarize an email thread into notes on the matching contact and its company.
+- Clean up inbound marketing / Conversations auto-created contacts and orphan companies (cleanup_marketing_records — approval required).
 
 Rules:
 - VOICE (strict — overrides everything else for user-visible text):
@@ -90,6 +91,9 @@ const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 *Reminders*
 • Follow-up reminder — _"remind me to follow up with Acme in 2 days"_ (creates a HubSpot task + a scheduled Slack nudge)
 
+*Cleanup*
+• Marketing junk — type _cleanup_ (or _"clean up marketing emails"_) to scan Conversations auto-creates / spam contacts + orphan companies, then Approve to archive
+
 *Email (drafts only — I never send)*
 • Templated draft — _"draft an intro email to Jane Doe"_ or _"event follow-up to Jane Doe"_
 • Custom draft — _"draft a follow-up to jane@acme.com about scheduling the demo"_
@@ -111,6 +115,20 @@ function isHelpRequest(text: string): boolean {
     normalized === "menu" ||
     normalized === "what can you do" ||
     normalized === "what can you do for me"
+  );
+}
+
+function isCleanupRequest(text: string): boolean {
+  const normalized = text.trim().toLowerCase().replace(/[?!.]+$/, "");
+  return (
+    normalized === "cleanup" ||
+    normalized === "clean up" ||
+    normalized === "cleanup marketing" ||
+    normalized === "clean up marketing" ||
+    normalized === "cleanup marketing emails" ||
+    normalized === "clean up marketing emails" ||
+    normalized === "delete marketing contacts" ||
+    normalized === "delete spam contacts"
   );
 }
 
@@ -211,6 +229,38 @@ async function runAgentTurn(
     // Fast-path: "help" is deterministic, so skip the model entirely.
     if (isHelpRequest(userMessage)) {
       await post(HELP_TEXT);
+      return;
+    }
+
+    // Fast-path: "cleanup" scans marketing junk and posts an approval card.
+    if (isCleanupRequest(userMessage)) {
+      const working = await client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: "⏳ Scanning HubSpot for marketing junk…",
+      });
+      try {
+        const result = await runCleanupMarketing({
+          client,
+          channel,
+          threadTs,
+          userId,
+        });
+        const text =
+          result.startsWith("[card ready]")
+            ? "Review the card above — Approve or Discard."
+            : result;
+        await client.chat.update({ channel, ts: working.ts!, text });
+      } catch (error) {
+        console.error("[cleanup] failed:", error);
+        const message =
+          error instanceof Error ? error.message : "Cleanup scan failed.";
+        await client.chat.update({
+          channel,
+          ts: working.ts!,
+          text: message.length > 280 ? `${message.slice(0, 277)}…` : message,
+        });
+      }
       return;
     }
 

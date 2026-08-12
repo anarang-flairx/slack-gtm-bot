@@ -44,7 +44,19 @@ async function hubspotFetch<T>(path: string, init?: RequestInit): Promise<T> {
       throw lastError;
     }
 
-    return response.json() as Promise<T>;
+    if (
+      response.status === 204 ||
+      response.headers.get("content-length") === "0"
+    ) {
+      return undefined as T;
+    }
+
+    const text = await response.text();
+    if (!text.trim()) {
+      return undefined as T;
+    }
+
+    return JSON.parse(text) as T;
   }
 
   throw lastError ?? new Error("HubSpot request failed after retries");
@@ -1821,3 +1833,360 @@ export async function resolveDealsForStageMove(opts: {
 }
 
 export { parseContactName };
+
+export type MarketingJunkContact = {
+  id: string;
+  name: string;
+  email: string;
+  companyId: string | null;
+  companyName: string;
+  sourceLabel: string;
+  reason: string;
+};
+
+export type MarketingJunkCompany = {
+  id: string;
+  name: string;
+  domain: string;
+  reason: string;
+};
+
+export type MarketingJunkScan = {
+  contacts: MarketingJunkContact[];
+  companies: MarketingJunkCompany[];
+  truncated: boolean;
+};
+
+const MARKETING_EMAIL_LOCAL_PARTS = [
+  "noreply",
+  "no-reply",
+  "donotreply",
+  "do-not-reply",
+  "newsletter",
+  "marketing",
+  "updates",
+  "notifications",
+  "mailer-daemon",
+];
+
+function internalEmailDomains(): string[] {
+  const raw =
+    process.env.INTERNAL_EMAIL_DOMAINS?.trim() ||
+    process.env.GMAIL_SENDER_EMAIL?.split("@")[1] ||
+    "flairx.ai";
+  return raw
+    .split(",")
+    .map((d) => d.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isInternalEmail(email: string): boolean {
+  const domain = email.split("@")[1]?.toLowerCase();
+  if (!domain) {
+    return false;
+  }
+  return internalEmailDomains().some(
+    (d) => domain === d || domain.endsWith(`.${d}`),
+  );
+}
+
+function isMarketingLocalPart(email: string): boolean {
+  const local = email.split("@")[0]?.toLowerCase() ?? "";
+  return MARKETING_EMAIL_LOCAL_PARTS.some(
+    (p) =>
+      local === p || local.startsWith(`${p}+`) || local.startsWith(`${p}.`),
+  );
+}
+
+function looksLikeConversationsSource(
+  source: string,
+  sourceLabel: string,
+  detail: string,
+): boolean {
+  const blob = `${source} ${sourceLabel} ${detail}`.toLowerCase();
+  return (
+    blob.includes("conversation") ||
+    source.toUpperCase() === "CONVERSATIONS" ||
+    source.toUpperCase() === "EMAIL_INTEGRATION"
+  );
+}
+
+async function contactHasDeals(contactId: string): Promise<boolean> {
+  const associations = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/contacts/${contactId}/associations/deals`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+  return associations.results.length > 0;
+}
+
+async function searchContactsForMarketingScan(
+  maxResults: number,
+): Promise<HubSpotSearchResult[]> {
+  const properties = [
+    "firstname",
+    "lastname",
+    "email",
+    "company",
+    "hs_lead_status",
+    "hs_object_source",
+    "hs_object_source_label",
+    "hs_object_source_detail_1",
+  ];
+
+  const filterGroups = [
+    {
+      filters: [
+        {
+          propertyName: "hs_object_source",
+          operator: "EQ",
+          value: "CONVERSATIONS",
+        },
+      ],
+    },
+    {
+      filters: [
+        {
+          propertyName: "hs_object_source",
+          operator: "EQ",
+          value: "EMAIL_INTEGRATION",
+        },
+      ],
+    },
+    {
+      filters: [
+        {
+          propertyName: "hs_object_source_label",
+          operator: "CONTAINS_TOKEN",
+          value: "Conversations",
+        },
+      ],
+    },
+  ];
+
+  const results: HubSpotSearchResult[] = [];
+  let after: string | undefined;
+
+  while (results.length < maxResults) {
+    const page = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/contacts/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups,
+          properties,
+          limit: Math.min(100, maxResults - results.length),
+          ...(after ? { after } : {}),
+        }),
+      },
+    );
+    results.push(...page.results);
+    after = page.paging?.next?.after;
+    if (!after || page.results.length === 0) {
+      break;
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Find auto-created inbound marketing / cold-outreach contacts (Conversations /
+ * email integration, no deals) and companies that only have those contacts.
+ */
+export async function scanMarketingJunk(
+  maxContacts = 40,
+): Promise<MarketingJunkScan> {
+  const scanCap = Math.max(maxContacts * 3, 60);
+  let raw: HubSpotSearchResult[] = [];
+  try {
+    raw = await searchContactsForMarketingScan(scanCap);
+  } catch (error) {
+    console.warn("[cleanup] primary contact search failed:", error);
+    const page = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/contacts/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: [
+            {
+              filters: [
+                {
+                  propertyName: "hs_object_source",
+                  operator: "EQ",
+                  value: "CONVERSATIONS",
+                },
+              ],
+            },
+            {
+              filters: [
+                {
+                  propertyName: "hs_object_source",
+                  operator: "EQ",
+                  value: "EMAIL_INTEGRATION",
+                },
+              ],
+            },
+          ],
+          properties: [
+            "firstname",
+            "lastname",
+            "email",
+            "company",
+            "hs_lead_status",
+            "hs_object_source",
+            "hs_object_source_label",
+            "hs_object_source_detail_1",
+          ],
+          limit: scanCap,
+        }),
+      },
+    );
+    raw = page.results;
+  }
+
+  const contacts: MarketingJunkContact[] = [];
+  const junkContactIds = new Set<string>();
+  const companyIdsFromJunk = new Set<string>();
+
+  for (const contact of raw) {
+    if (contacts.length >= maxContacts) {
+      break;
+    }
+
+    const email = contact.properties.email?.trim() ?? "";
+    if (email && isInternalEmail(email)) {
+      continue;
+    }
+
+    const source = contact.properties.hs_object_source?.trim() ?? "";
+    const sourceLabel =
+      contact.properties.hs_object_source_label?.trim() ?? "";
+    const detail =
+      contact.properties.hs_object_source_detail_1?.trim() ?? "";
+
+    const marketingLocal = email ? isMarketingLocalPart(email) : false;
+    const conversations = looksLikeConversationsSource(
+      source,
+      sourceLabel,
+      detail,
+    );
+    if (!conversations && !marketingLocal) {
+      continue;
+    }
+
+    if (await contactHasDeals(contact.id)) {
+      continue;
+    }
+
+    const first = contact.properties.firstname?.trim() ?? "";
+    const last = contact.properties.lastname?.trim() ?? "";
+    const name = `${first} ${last}`.trim() || email || "Unknown contact";
+
+    let companyId: string | null = null;
+    let companyName = contact.properties.company?.trim() ?? "";
+    try {
+      const company = await getAssociatedCompany(contact.id);
+      if (company) {
+        companyId = company.id;
+        companyName = company.name || companyName;
+        companyIdsFromJunk.add(company.id);
+      }
+    } catch {
+      // ignore association failures
+    }
+
+    const reason = conversations
+      ? `auto-created (${sourceLabel || source || "Conversations"}) · 0 deals`
+      : `marketing-style email · 0 deals`;
+
+    contacts.push({
+      id: contact.id,
+      name,
+      email,
+      companyId,
+      companyName,
+      sourceLabel: sourceLabel || source || "—",
+      reason,
+    });
+    junkContactIds.add(contact.id);
+  }
+
+  const companies: MarketingJunkCompany[] = [];
+  for (const companyId of companyIdsFromJunk) {
+    if (companies.length >= maxContacts) {
+      break;
+    }
+    try {
+      const status = await getCompanyStatus(companyId);
+      if (status.deals.length > 0) {
+        continue;
+      }
+      const otherContacts = status.contacts.filter(
+        (c) => !junkContactIds.has(c.id),
+      );
+      if (otherContacts.length > 0) {
+        continue;
+      }
+      companies.push({
+        id: companyId,
+        name: status.name,
+        domain: status.domain,
+        reason: "0 deals · only marketing/auto-created contacts",
+      });
+    } catch {
+      // skip company on lookup failure
+    }
+  }
+
+  return {
+    contacts,
+    companies,
+    truncated: raw.length >= scanCap || contacts.length >= maxContacts,
+  };
+}
+
+/** Soft-delete (archive) a HubSpot contact or company. Restorable ~90 days. */
+export async function archiveCrmObject(
+  objectType: "contacts" | "companies",
+  id: string,
+): Promise<void> {
+  await hubspotFetch(`/crm/v3/objects/${objectType}/${id}`, {
+    method: "DELETE",
+  });
+}
+
+export async function archiveMarketingJunk(input: {
+  contactIds: string[];
+  companyIds: string[];
+}): Promise<{
+  archivedContacts: number;
+  archivedCompanies: number;
+  errors: string[];
+}> {
+  const errors: string[] = [];
+  let archivedContacts = 0;
+  let archivedCompanies = 0;
+
+  for (const id of input.contactIds) {
+    try {
+      await archiveCrmObject("contacts", id);
+      archivedContacts += 1;
+    } catch (error) {
+      errors.push(
+        `contact ${id}: ${error instanceof Error ? error.message : "failed"}`,
+      );
+    }
+  }
+
+  for (const id of input.companyIds) {
+    try {
+      await archiveCrmObject("companies", id);
+      archivedCompanies += 1;
+    } catch (error) {
+      errors.push(
+        `company ${id}: ${error instanceof Error ? error.message : "failed"}`,
+      );
+    }
+  }
+
+  return { archivedContacts, archivedCompanies, errors };
+}

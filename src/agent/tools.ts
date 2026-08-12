@@ -18,6 +18,7 @@ import {
   listCompaniesByLifecycleStage,
   listDealPipelines,
   resolveDealsForStageMove,
+  scanMarketingJunk,
   type NoteRecordMatch,
 } from "../integrations/hubspot.js";
 import {
@@ -28,6 +29,7 @@ import { buildDailyDigest } from "../digest/buildDailyDigest.js";
 import { hubspotRecordUrl } from "../digest/format.js";
 import { createDraftByContactId } from "../lib/createDraft.js";
 import { saveDraft } from "../lib/draftStore.js";
+import { savePendingCleanup } from "../lib/cleanupStore.js";
 import { savePendingCompanyDeal } from "../lib/companyDealStore.js";
 import { savePendingLeadStatus } from "../lib/leadStatusStore.js";
 import { savePendingNoteUpdate } from "../lib/noteUpdateStore.js";
@@ -35,6 +37,7 @@ import { savePendingProspect } from "../lib/prospectStore.js";
 import { savePendingReminder } from "../lib/reminderStore.js";
 import { savePendingStageMove } from "../lib/stageMoveStore.js";
 import {
+  buildCleanupPreviewBlocks,
   buildCompanyDealPreviewBlocks,
   buildCompanyStatusBlocks,
   buildCustomEmailDraftPreviewBlocks,
@@ -430,6 +433,15 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
         },
         required: ["name", "days"],
       },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "cleanup_marketing_records",
+      description:
+        "Scan HubSpot for inbound marketing / Conversations auto-created contacts (and orphan companies with 0 deals) and post an Approve/Discard card to archive them. Use for 'cleanup', 'clean up marketing emails', or 'delete spam contacts'. Never archives without approval.",
+      parameters: { type: "object", properties: {} },
     },
   },
   {
@@ -1348,6 +1360,46 @@ async function runSummarizeEmailToNotes(
   return CARD_READY;
 }
 
+/** Scan marketing junk and post an approval card. Used by tool + deterministic cleanup. */
+export async function runCleanupMarketing(ctx: ToolContext): Promise<string> {
+  const scan = await scanMarketingJunk(40);
+  if (scan.contacts.length === 0 && scan.companies.length === 0) {
+    return "No marketing/auto-created junk contacts or companies found.";
+  }
+
+  const pending = savePendingCleanup({
+    contacts: scan.contacts.map((c) => ({
+      id: c.id,
+      name: c.name,
+      email: c.email,
+      reason: c.reason,
+    })),
+    companies: scan.companies.map((c) => ({
+      id: c.id,
+      name: c.name,
+      domain: c.domain,
+      reason: c.reason,
+    })),
+    truncated: scan.truncated,
+    createdBy: ctx.userId,
+    channelId: ctx.channel,
+    ...(ctx.threadTs ? { threadTs: ctx.threadTs } : {}),
+  });
+
+  await postCard(
+    ctx,
+    `Marketing cleanup ready (${scan.contacts.length} contacts, ${scan.companies.length} companies)`,
+    buildCleanupPreviewBlocks(
+      pending.contacts,
+      pending.companies,
+      pending.id,
+      pending.truncated,
+    ),
+  );
+
+  return CARD_READY;
+}
+
 export async function executeTool(
   name: string,
   args: Record<string, unknown>,
@@ -1498,6 +1550,9 @@ export async function executeTool(
         typeof args.days === "number" ? args.days : Number(args.days ?? 0),
         args.note ? String(args.note) : "",
       );
+
+    case "cleanup_marketing_records":
+      return runCleanupMarketing(ctx);
 
     case "draft_email":
       return runDraftEmail(
