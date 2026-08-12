@@ -648,6 +648,7 @@ export function buildCleanupPreviewBlocks(
   }>,
   pendingId: string,
   truncated: boolean,
+  options: { windowLabel?: string } = {},
 ): KnownBlock[] {
   const maxLines = 15;
   const contactLines =
@@ -683,6 +684,9 @@ export function buildCleanupPreviewBlocks(
   const truncateNote = truncated
     ? "\n_Scan capped — run cleanup again after approving to continue._"
     : "";
+  const windowNote = options.windowLabel
+    ? ` Created in the *${options.windowLabel}*.`
+    : "";
 
   return [
     {
@@ -695,6 +699,7 @@ export function buildCleanupPreviewBlocks(
         type: "mrkdwn",
         text:
           `Archive *${contacts.length}* contact(s) and *${companies.length}* company(ies) that look like inbound marketing / Conversations auto-creates (0 deals).` +
+          windowNote +
           truncateNote,
       },
     },

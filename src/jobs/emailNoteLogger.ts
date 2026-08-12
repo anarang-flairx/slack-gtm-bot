@@ -13,6 +13,10 @@ import {
   getAssociatedCompany,
 } from "../integrations/hubspot.js";
 import { appendNotesToRecord } from "../lib/updateNotes.js";
+import {
+  isNeverLogDomain,
+  isNeverLogEmail,
+} from "../lib/neverLogStore.js";
 
 const STATE_PATH =
   process.env.EMAIL_LOG_STATE_PATH ?? ".data/email-log-state.json";
@@ -85,6 +89,9 @@ async function processSentEmail(
   const companies = new Map<string, { id: string; name: string }>();
 
   for (const address of email.recipients) {
+    if (await isNeverLogEmail(address)) {
+      continue;
+    }
     const contact = await findContactByEmail(address);
     if (contact) {
       contacts.set(contact.id, contact);
@@ -97,6 +104,9 @@ async function processSentEmail(
     // No contact on file: fall back to matching the company by email domain.
     const domain = address.split("@")[1] ?? "";
     if (domain) {
+      if (await isNeverLogDomain(domain)) {
+        continue;
+      }
       const company = await findCompanyByDomain(domain);
       if (company) {
         companies.set(company.id, company);

@@ -1918,50 +1918,82 @@ async function contactHasDeals(contactId: string): Promise<boolean> {
   return associations.results.length > 0;
 }
 
-async function searchContactsForMarketingScan(
-  maxResults: number,
-): Promise<HubSpotSearchResult[]> {
-  const properties = [
-    "firstname",
-    "lastname",
-    "email",
-    "company",
-    "hs_lead_status",
-    "hs_object_source",
-    "hs_object_source_label",
-    "hs_object_source_detail_1",
-  ];
+export type ScanMarketingJunkOptions = {
+  /** Only include contacts created at/after this unix ms timestamp. */
+  createdAfterMs?: number;
+};
 
-  const filterGroups = [
+type HubSpotSearchFilter = {
+  propertyName: string;
+  operator: string;
+  value: string;
+};
+
+function marketingSourceFilterGroups(
+  createdAfterMs?: number,
+): Array<{ filters: HubSpotSearchFilter[] }> {
+  const createdFilter: HubSpotSearchFilter | null =
+    createdAfterMs != null
+      ? {
+          propertyName: "createdate",
+          operator: "GTE",
+          value: String(createdAfterMs),
+        }
+      : null;
+
+  const withCreated = (
+    filters: HubSpotSearchFilter[],
+  ): HubSpotSearchFilter[] =>
+    createdFilter ? [...filters, createdFilter] : filters;
+
+  return [
     {
-      filters: [
+      filters: withCreated([
         {
           propertyName: "hs_object_source",
           operator: "EQ",
           value: "CONVERSATIONS",
         },
-      ],
+      ]),
     },
     {
-      filters: [
+      filters: withCreated([
         {
           propertyName: "hs_object_source",
           operator: "EQ",
           value: "EMAIL_INTEGRATION",
         },
-      ],
+      ]),
     },
     {
-      filters: [
+      filters: withCreated([
         {
           propertyName: "hs_object_source_label",
           operator: "CONTAINS_TOKEN",
           value: "Conversations",
         },
-      ],
+      ]),
     },
   ];
+}
 
+const MARKETING_SCAN_PROPERTIES = [
+  "firstname",
+  "lastname",
+  "email",
+  "company",
+  "hs_lead_status",
+  "hs_object_source",
+  "hs_object_source_label",
+  "hs_object_source_detail_1",
+  "createdate",
+];
+
+async function searchContactsForMarketingScan(
+  maxResults: number,
+  createdAfterMs?: number,
+): Promise<HubSpotSearchResult[]> {
+  const filterGroups = marketingSourceFilterGroups(createdAfterMs);
   const results: HubSpotSearchResult[] = [];
   let after: string | undefined;
 
@@ -1972,8 +2004,9 @@ async function searchContactsForMarketingScan(
         method: "POST",
         body: JSON.stringify({
           filterGroups,
-          properties,
+          properties: MARKETING_SCAN_PROPERTIES,
           limit: Math.min(100, maxResults - results.length),
+          sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
           ...(after ? { after } : {}),
         }),
       },
@@ -1994,11 +2027,13 @@ async function searchContactsForMarketingScan(
  */
 export async function scanMarketingJunk(
   maxContacts = 40,
+  options: ScanMarketingJunkOptions = {},
 ): Promise<MarketingJunkScan> {
   const scanCap = Math.max(maxContacts * 3, 60);
+  const createdAfterMs = options.createdAfterMs;
   let raw: HubSpotSearchResult[] = [];
   try {
-    raw = await searchContactsForMarketingScan(scanCap);
+    raw = await searchContactsForMarketingScan(scanCap, createdAfterMs);
   } catch (error) {
     console.warn("[cleanup] primary contact search failed:", error);
     const page = await hubspotFetch<HubSpotSearchResponse>(
@@ -2006,36 +2041,9 @@ export async function scanMarketingJunk(
       {
         method: "POST",
         body: JSON.stringify({
-          filterGroups: [
-            {
-              filters: [
-                {
-                  propertyName: "hs_object_source",
-                  operator: "EQ",
-                  value: "CONVERSATIONS",
-                },
-              ],
-            },
-            {
-              filters: [
-                {
-                  propertyName: "hs_object_source",
-                  operator: "EQ",
-                  value: "EMAIL_INTEGRATION",
-                },
-              ],
-            },
-          ],
-          properties: [
-            "firstname",
-            "lastname",
-            "email",
-            "company",
-            "hs_lead_status",
-            "hs_object_source",
-            "hs_object_source_label",
-            "hs_object_source_detail_1",
-          ],
+          filterGroups: marketingSourceFilterGroups(createdAfterMs).slice(0, 2),
+          properties: MARKETING_SCAN_PROPERTIES,
+          sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
           limit: scanCap,
         }),
       },
@@ -2050,6 +2058,14 @@ export async function scanMarketingJunk(
   for (const contact of raw) {
     if (contacts.length >= maxContacts) {
       break;
+    }
+
+    if (createdAfterMs != null) {
+      const createdRaw = contact.properties.createdate?.trim() ?? "";
+      const createdMs = Number(createdRaw);
+      if (Number.isFinite(createdMs) && createdMs < createdAfterMs) {
+        continue;
+      }
     }
 
     const email = contact.properties.email?.trim() ?? "";
@@ -2190,3 +2206,170 @@ export async function archiveMarketingJunk(input: {
 
   return { archivedContacts, archivedCompanies, errors };
 }
+
+export type UnnamedCompanyCleanupResult = {
+  archivedCompanies: number;
+  archivedContacts: number;
+  neverLogEmails: string[];
+  neverLogDomains: string[];
+  errors: string[];
+  items: Array<{
+    companyId: string;
+    domain: string;
+    contactIds: string[];
+    emails: string[];
+  }>;
+};
+
+function isBlankCompanyName(name: string | null | undefined): boolean {
+  return !name?.trim();
+}
+
+/**
+ * Find companies with no name (optionally created after `createdAfterMs`),
+ * archive them and their associated contacts (skip if any deals), and return
+ * emails/domains for Never Log.
+ */
+export async function cleanupUnnamedCompanies(
+  options: { createdAfterMs?: number; maxCompanies?: number } = {},
+): Promise<UnnamedCompanyCleanupResult> {
+  const maxCompanies = options.maxCompanies ?? 40;
+  const createdAfterMs = options.createdAfterMs;
+  const createdFilter =
+    createdAfterMs != null
+      ? {
+          propertyName: "createdate",
+          operator: "GTE",
+          value: String(createdAfterMs),
+        }
+      : null;
+
+  const filterGroups = [
+    {
+      filters: [
+        { propertyName: "name", operator: "NOT_HAS_PROPERTY" },
+        ...(createdFilter ? [createdFilter] : []),
+      ],
+    },
+    {
+      filters: [
+        { propertyName: "name", operator: "EQ", value: "" },
+        ...(createdFilter ? [createdFilter] : []),
+      ],
+    },
+  ];
+
+  let raw: HubSpotSearchResult[] = [];
+  try {
+    const page = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/companies/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups,
+          properties: ["name", "domain", "createdate"],
+          sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+          limit: Math.min(100, maxCompanies * 2),
+        }),
+      },
+    );
+    raw = page.results;
+  } catch (error) {
+    console.warn("[cleanup] unnamed company search failed:", error);
+    // Fallback: recent companies, filter blank names client-side.
+    const filters = createdFilter ? [createdFilter] : [];
+    const page = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/companies/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: filters.length > 0 ? [{ filters }] : undefined,
+          properties: ["name", "domain", "createdate"],
+          sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+          limit: 100,
+        }),
+      },
+    );
+    raw = page.results.filter((c) =>
+      isBlankCompanyName(c.properties.name),
+    );
+  }
+
+  const result: UnnamedCompanyCleanupResult = {
+    archivedCompanies: 0,
+    archivedContacts: 0,
+    neverLogEmails: [],
+    neverLogDomains: [],
+    errors: [],
+    items: [],
+  };
+
+  for (const company of raw) {
+    if (result.items.length >= maxCompanies) {
+      break;
+    }
+    if (!isBlankCompanyName(company.properties.name)) {
+      continue;
+    }
+    if (createdAfterMs != null) {
+      const createdMs = Number(company.properties.createdate ?? "");
+      if (Number.isFinite(createdMs) && createdMs < createdAfterMs) {
+        continue;
+      }
+    }
+
+    try {
+      const status = await getCompanyStatus(company.id);
+      if (status.deals.length > 0) {
+        continue;
+      }
+
+      const emails = status.contacts
+        .map((c) => c.email.trim().toLowerCase())
+        .filter(Boolean);
+      const domain = status.domain.trim().toLowerCase();
+      const contactIds = status.contacts.map((c) => c.id);
+
+      for (const contactId of contactIds) {
+        try {
+          await archiveCrmObject("contacts", contactId);
+          result.archivedContacts += 1;
+        } catch (error) {
+          result.errors.push(
+            `contact ${contactId}: ${error instanceof Error ? error.message : "failed"}`,
+          );
+        }
+      }
+
+      try {
+        await archiveCrmObject("companies", company.id);
+        result.archivedCompanies += 1;
+      } catch (error) {
+        result.errors.push(
+          `company ${company.id}: ${error instanceof Error ? error.message : "failed"}`,
+        );
+        continue;
+      }
+
+      result.items.push({
+        companyId: company.id,
+        domain,
+        contactIds,
+        emails,
+      });
+      result.neverLogEmails.push(...emails);
+      if (domain) {
+        result.neverLogDomains.push(domain);
+      }
+    } catch (error) {
+      result.errors.push(
+        `company ${company.id}: ${error instanceof Error ? error.message : "failed"}`,
+      );
+    }
+  }
+
+  result.neverLogEmails = [...new Set(result.neverLogEmails)];
+  result.neverLogDomains = [...new Set(result.neverLogDomains)];
+  return result;
+}
+

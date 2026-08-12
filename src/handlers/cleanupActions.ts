@@ -79,7 +79,7 @@ export function registerCleanupActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who requested this cleanup can approve or discard it.",
+          "Only the person who requested this cleanup can approve or discard it (daily auto-posts can be approved by anyone).",
         );
       }
       return;
@@ -151,7 +151,7 @@ export function registerCleanupActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who requested this cleanup can approve or discard it.",
+          "Only the person who requested this cleanup can approve or discard it (daily auto-posts can be approved by anyone).",
         );
       }
       return;

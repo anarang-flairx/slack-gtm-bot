@@ -114,17 +114,30 @@ Partnerships stages should match HubSpot (e.g. New, Engaged, Active Relationship
 
 Run the same API one-liner above and confirm Sales and Partnerships labels + stage lists match the HubSpot UI.
 
-## 6. Marketing cleanup (`cleanup`)
+## 6. Marketing cleanup (daily + `cleanup`)
 
-`@FlairX GTM Bot cleanup` scans for Conversations / email-integration auto-created contacts with **0 deals** (plus orphan companies that only have those contacts), then posts an Approve/Discard card. Approve **archives** records in HubSpot (recycle bin, restorable ~90 days).
+Every day at **8:00** (`CLEANUP_TZ`, default `America/Los_Angeles`) the bot:
 
-Requires existing scopes: `crm.objects.contacts.write` and `crm.objects.companies.write`.
+1. **Unnamed companies (auto):** finds companies with a blank/missing name from the last 24 hours, **archives** them and their associated contacts (skips any with deals), and adds those emails/domains to the **Never Log** (`data/never-log.json`) so email auto-logging never writes notes for them. Posts a short FYI to Slack.
+2. **Marketing junk (Approve):** scans Conversations / email-integration auto-created contacts from the last 24 hours with **0 deals** (plus orphan companies). If any are found, posts an Approve/Discard card. Anyone can approve a daily card.
+
+You can also run the marketing-junk scan on demand: `@FlairX GTM Bot cleanup` (same 24h window).
+
+Requires existing scopes: `crm.objects.contacts.write` and `crm.objects.companies.write`. Invite the bot to the target Slack channel.
 
 Optional `.env`:
 
 ```bash
 # Never archive contacts on these domains (comma-separated)
 INTERNAL_EMAIL_DOMAINS=flairx.ai
+
+# Daily scheduler (on by default when DIGEST_CHANNEL or CLEANUP_CHANNEL is set)
+#CLEANUP_ENABLED=false
+#CLEANUP_CHANNEL=C0123456789
+#CLEANUP_HOUR=8
+#CLEANUP_TZ=America/Los_Angeles
+#CLEANUP_LOOKBACK_HOURS=24
+#NEVER_LOG_PATH=data/never-log.json
 ```
 
 Defaults to the domain of `GMAIL_SENDER_EMAIL`, or `flairx.ai` if unset.

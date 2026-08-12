@@ -4,14 +4,26 @@ import type {
   TakeCleanupResult,
 } from "../types/pendingCleanup.js";
 
-/** Pending marketing cleanups expire after 30 minutes. */
+/** Pending marketing cleanups expire after 30 minutes (manual). */
 export const CLEANUP_TTL_MS = 30 * 60 * 1000;
+
+/** Scheduled daily cleanups stay clickable longer. */
+export const SCHEDULED_CLEANUP_TTL_MS = 12 * 60 * 60 * 1000;
+
+/** createdBy value for the daily 8am job — any user may approve/discard. */
+export const SCHEDULED_CLEANUP_USER = "scheduled";
 
 const pendingCleanups = new Map<string, PendingCleanup>();
 const inFlight = new Set<string>();
 
+function ttlMs(pending: PendingCleanup): number {
+  return pending.createdBy === SCHEDULED_CLEANUP_USER
+    ? SCHEDULED_CLEANUP_TTL_MS
+    : CLEANUP_TTL_MS;
+}
+
 function isExpired(pending: PendingCleanup, now = Date.now()): boolean {
-  return now - pending.createdAt > CLEANUP_TTL_MS;
+  return now - pending.createdAt > ttlMs(pending);
 }
 
 function purgeExpired(now = Date.now()): void {
@@ -21,6 +33,13 @@ function purgeExpired(now = Date.now()): void {
       inFlight.delete(id);
     }
   }
+}
+
+function canAct(pending: PendingCleanup, userId: string): boolean {
+  return (
+    pending.createdBy === SCHEDULED_CLEANUP_USER ||
+    pending.createdBy === userId
+  );
 }
 
 export function savePendingCleanup(
@@ -47,12 +66,12 @@ export function beginCleanupAction(
   if (!pending || isExpired(pending)) {
     if (pending) {
       pendingCleanups.delete(id);
-      inFlight.delete(id);
     }
+    inFlight.delete(id);
     return { status: "not_found" };
   }
 
-  if (pending.createdBy !== userId) {
+  if (!canAct(pending, userId)) {
     return { status: "forbidden" };
   }
 

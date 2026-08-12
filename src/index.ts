@@ -12,6 +12,7 @@ import { registerProspectActions } from "./handlers/prospectActions.js";
 import { registerReminderActions } from "./handlers/reminderActions.js";
 import { registerStageMoveActions } from "./handlers/stageMoveActions.js";
 import { runEmailNoteSync } from "./jobs/emailNoteLogger.js";
+import { startMarketingCleanupScheduler } from "./jobs/marketingCleanup.js";
 
 const echoMode = process.env.DEV_ECHO_MODE === "true";
 
@@ -83,6 +84,7 @@ function startEmailNoteLogger(): void {
 (async () => {
   await app.start();
   startEmailNoteLogger();
+  startMarketingCleanupScheduler(app.client);
   console.log(
     echoMode
       ? "FlairX GTM Bot running (DEV_ECHO_MODE). Mention the bot in Slack."

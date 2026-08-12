@@ -32,7 +32,7 @@ You can:
 - Set a follow-up reminder in N days (creates a HubSpot task + a scheduled Slack nudge).
 - Draft templated or custom emails into Gmail Drafts, and find sent emails that have not been replied to.
 - Summarize an email thread into notes on the matching contact and its company.
-- Clean up inbound marketing / Conversations auto-created contacts and orphan companies (cleanup_marketing_records — approval required).
+- Clean up inbound marketing / Conversations auto-created contacts from the last 24 hours and orphan companies (cleanup_marketing_records — approval required; also runs daily at 8am).
 
 Rules:
 - VOICE (strict — overrides everything else for user-visible text):
@@ -92,7 +92,7 @@ const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 • Follow-up reminder — _"remind me to follow up with Acme in 2 days"_ (creates a HubSpot task + a scheduled Slack nudge)
 
 *Cleanup*
-• Marketing junk — type _cleanup_ (or _"clean up marketing emails"_) to scan Conversations auto-creates / spam contacts + orphan companies, then Approve to archive
+• Marketing junk — daily at 8am (last 24h): auto-archives blank-name companies (+ Never Log); posts Approve card for Conversations spam. Or type _cleanup_
 
 *Email (drafts only — I never send)*
 • Templated draft — _"draft an intro email to Jane Doe"_ or _"event follow-up to Jane Doe"_

@@ -440,7 +440,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "cleanup_marketing_records",
       description:
-        "Scan HubSpot for inbound marketing / Conversations auto-created contacts (and orphan companies with 0 deals) and post an Approve/Discard card to archive them. Use for 'cleanup', 'clean up marketing emails', or 'delete spam contacts'. Never archives without approval.",
+        "Scan HubSpot for inbound marketing / Conversations auto-created contacts from the last 24 hours (and orphan companies with 0 deals) and post an Approve/Discard card to archive them. Use for 'cleanup', 'clean up marketing emails', or 'delete spam contacts'. Never archives without approval. A daily 8am job also posts this automatically.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -1360,11 +1360,13 @@ async function runSummarizeEmailToNotes(
   return CARD_READY;
 }
 
-/** Scan marketing junk and post an approval card. Used by tool + deterministic cleanup. */
+/** Scan marketing junk (last 24h) and post an approval card. Used by tool + deterministic cleanup. */
 export async function runCleanupMarketing(ctx: ToolContext): Promise<string> {
-  const scan = await scanMarketingJunk(40);
+  const lookbackHours = Number(process.env.CLEANUP_LOOKBACK_HOURS ?? 24) || 24;
+  const createdAfterMs = Date.now() - lookbackHours * 60 * 60 * 1000;
+  const scan = await scanMarketingJunk(40, { createdAfterMs });
   if (scan.contacts.length === 0 && scan.companies.length === 0) {
-    return "No marketing/auto-created junk contacts or companies found.";
+    return `No marketing/auto-created junk contacts or companies found in the last ${lookbackHours} hours.`;
   }
 
   const pending = savePendingCleanup({
@@ -1394,6 +1396,7 @@ export async function runCleanupMarketing(ctx: ToolContext): Promise<string> {
       pending.companies,
       pending.id,
       pending.truncated,
+      { windowLabel: `last ${lookbackHours} hours` },
     ),
   );
 
