@@ -128,7 +128,12 @@ function parseArgs(raw: string): Record<string, unknown> {
 
 /** Short answers/confirmations that don't need the flagship model. */
 function isTrivialReply(text: string): boolean {
-  const words = text.trim().split(/\s+/).filter(Boolean);
+  const trimmed = text.trim();
+  // Numbered picks ("1", "2", "1 3") must use the full model + tools.
+  if (/^\d+(\s+\d+)?$/.test(trimmed)) {
+    return false;
+  }
+  const words = trimmed.split(/\s+/).filter(Boolean);
   return words.length > 0 && words.length <= TRIVIAL_REPLY_MAX_WORDS;
 }
 
@@ -239,6 +244,9 @@ async function runAgentTurn(
       messages.push(choice);
 
       if (choice.tool_calls && choice.tool_calls.length > 0) {
+        let pickPosted = false;
+        let cardReady = false;
+        let hardError = "";
         for (const call of choice.tool_calls) {
           if (call.type !== "function") {
             continue;
@@ -256,11 +264,33 @@ async function runAgentTurn(
                 ? `Error: ${error.message}`
                 : "Error running that action.";
           }
+          if (result.startsWith("[pick posted]")) {
+            pickPosted = true;
+          }
+          if (result.startsWith("[card ready]")) {
+            cardReady = true;
+          }
+          if (result.startsWith("Error:")) {
+            hardError = result.replace(/^Error:\s*/, "");
+          }
           messages.push({
             role: "tool",
             tool_call_id: call.id,
             content: result,
           });
+        }
+        // Don't let the model invent/restate after picks, cards, or hard errors.
+        if (hardError) {
+          reply = hardError.length > 280 ? `${hardError.slice(0, 277)}…` : hardError;
+          break;
+        }
+        if (pickPosted) {
+          reply = "Reply with a number.";
+          break;
+        }
+        if (cardReady) {
+          reply = "Review the card above — Approve or Discard.";
+          break;
         }
         continue;
       }

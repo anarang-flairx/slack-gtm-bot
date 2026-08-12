@@ -76,6 +76,15 @@ const CARD_READY =
 const PICK_POSTED =
   "[pick posted] Do not restate or reformat the list. Wait for the user's number/name.";
 
+/** Resolve "1" / "2" style picks to a 0-based index item. */
+function resolveByNumber<T>(raw: string, items: T[]): T | undefined {
+  const n = Number(String(raw).trim());
+  if (!Number.isInteger(n) || n < 1 || n > items.length) {
+    return undefined;
+  }
+  return items[n - 1];
+}
+
 /**
  * Numbered pick — model shows title + list to the user.
  * `hint` and optional `idMap` are for the model only (never show ids to the user).
@@ -753,9 +762,23 @@ async function runCreateCompanyDeal(
   const pipelines = await listDealPipelines();
   const envPipelineId = process.env.HUBSPOT_PIPELINE_ID?.trim() || "";
 
-  // Resolve from explicit id or label first — do NOT use env yet when multiple
-  // pipelines exist (Flow 1 must ask Sales vs Partnerships).
-  let resolvedPipelineId = pipelineIdArg;
+  // Resolve from explicit id, label, or list number ("1") — do NOT use env yet
+  // when multiple pipelines exist (Flow 1 must ask Sales vs Partnerships).
+  let resolvedPipelineId = "";
+  if (pipelineIdArg) {
+    const byId = pipelines.find((p) => p.id === pipelineIdArg);
+    if (byId) {
+      resolvedPipelineId = byId.id;
+    } else {
+      const byNum = resolveByNumber(pipelineIdArg, pipelines);
+      if (byNum) {
+        resolvedPipelineId = byNum.id;
+      } else {
+        // Keep as-is; getPipelineMeta will error with available ids if wrong.
+        resolvedPipelineId = pipelineIdArg;
+      }
+    }
+  }
   if (!resolvedPipelineId && pipelineLabelArg) {
     const byLabel = pipelines.find(
       (p) => p.label.toLowerCase() === pipelineLabelArg.toLowerCase(),
@@ -763,21 +786,25 @@ async function runCreateCompanyDeal(
     if (byLabel) {
       resolvedPipelineId = byLabel.id;
     } else {
-      const partial = pipelines.filter((p) =>
-        p.label.toLowerCase().includes(pipelineLabelArg.toLowerCase()),
-      );
-      if (partial.length === 1) {
-        resolvedPipelineId = partial[0].id;
-      } else if (partial.length > 1) {
-        // company may not be resolved yet; ask with label list only
-        return pickPrompt(
-          "What pipeline?",
-          partial.map((p, i) => `${i + 1}. ${p.label}`).join("\n"),
-          `create_company_deal company_name="${companyName}" company_id=${companyIdArg || "<id>"} pipeline_id=<id>`,
-          partial.map((p, i) => `${i + 1}=${p.id}`).join(", "),
-        );
+      const byNum = resolveByNumber(pipelineLabelArg, pipelines);
+      if (byNum) {
+        resolvedPipelineId = byNum.id;
       } else {
-        return `No pipeline matching "${pipelineLabelArg}". Valid: ${pipelines.map((p) => p.label).join(", ")}.`;
+        const partial = pipelines.filter((p) =>
+          p.label.toLowerCase().includes(pipelineLabelArg.toLowerCase()),
+        );
+        if (partial.length === 1) {
+          resolvedPipelineId = partial[0].id;
+        } else if (partial.length > 1) {
+          return pickPrompt(
+            "What pipeline?",
+            partial.map((p, i) => `${i + 1}. ${p.label}`).join("\n"),
+            `create_company_deal company_name="${companyName}" company_id=${companyIdArg || "<id>"} pipeline_id=<id>`,
+            partial.map((p, i) => `${i + 1}=${p.id}`).join(", "),
+          );
+        } else {
+          return `No pipeline matching "${pipelineLabelArg}". Valid: ${pipelines.map((p) => p.label).join(", ")}.`;
+        }
       }
     }
   }
@@ -848,6 +875,12 @@ async function runCreateCompanyDeal(
   const pipeline = await getPipelineMeta(resolvedPipelineId || undefined);
   const partnershipPipeline = isPartnershipPipeline(pipeline.id, pipeline.label);
 
+  // Accept stage as label OR list number ("2" → Initial Contact).
+  const stageFromNumber = resolveByNumber(requestedStage, pipeline.stages);
+  const resolvedStageLabel = stageFromNumber
+    ? stageFromNumber.label
+    : requestedStage;
+
   const dealStageLines = pipeline.stages
     .map((s, i) => `${i + 1}. ${s.label}`)
     .join("\n");
@@ -864,23 +897,31 @@ async function runCreateCompanyDeal(
     }
 
     // Step 1: deal stage only (dealstage) — never lifecycle.
-    if (!requestedStage) {
+    if (!resolvedStageLabel) {
       return postPick(
         ctx,
         "Pick deal stage:",
         dealStageLines,
-        `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label>. Then ask relationship_type. NEVER ask lifecycle.`,
+        `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label or number>. Then ask relationship_type. NEVER ask lifecycle.`,
       );
     }
 
-    const stage = pipeline.stageByLabel.get(requestedStage.toLowerCase());
+    const stage = pipeline.stageByLabel.get(resolvedStageLabel.toLowerCase());
     if (!stage) {
       const valid = pipeline.stages.map((s) => s.label).join(", ");
       return `"${requestedStage}" is not a valid deal stage in pipeline "${pipeline.label}". Valid stages: ${valid}.`;
     }
 
     // Step 2: relationship type (company property relationship_type).
-    if (!requestedRelationship) {
+    const relationshipFromNumber = resolveByNumber(
+      requestedRelationship,
+      relationshipOptions,
+    );
+    const resolvedRelationshipLabel = relationshipFromNumber
+      ? relationshipFromNumber.label
+      : requestedRelationship;
+
+    if (!resolvedRelationshipLabel) {
       if (relationshipOptions.length === 0) {
         return `Partnership pipeline selected but company property "relationship_type" has no options configured in HubSpot.`;
       }
@@ -891,12 +932,12 @@ async function runCreateCompanyDeal(
         ctx,
         "Pick relationship type:",
         relationshipLines,
-        `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage="${stage.label}" relationship_type=<label>. Do NOT ask lifecycle.`,
+        `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage="${stage.label}" relationship_type=<label or number>. Do NOT ask lifecycle.`,
       );
     }
 
     const relationship = relationshipOptions.find(
-      (o) => o.label.toLowerCase() === requestedRelationship.toLowerCase(),
+      (o) => o.label.toLowerCase() === resolvedRelationshipLabel.toLowerCase(),
     );
     if (!relationship) {
       const valid = relationshipOptions.map((s) => s.label).join(", ");
@@ -940,16 +981,16 @@ async function runCreateCompanyDeal(
   }
 
   // Sales pipelines: deal stage only — never company lifecycle / relationship_type.
-  if (!requestedStage) {
+  if (!resolvedStageLabel) {
     return postPick(
       ctx,
       "Pick deal stage:",
       dealStageLines,
-      `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label>. NEVER ask for lifecycle or relationship_type.`,
+      `create_company_deal company_id=${company.id} pipeline_id=${pipeline.id} stage=<label or number>. NEVER ask for lifecycle or relationship_type.`,
     );
   }
 
-  const stage = pipeline.stageByLabel.get(requestedStage.toLowerCase());
+  const stage = pipeline.stageByLabel.get(resolvedStageLabel.toLowerCase());
   if (!stage) {
     const valid = pipeline.stages.map((s) => s.label).join(", ");
     return `"${requestedStage}" is not a valid deal stage in pipeline "${pipeline.label}". Valid stages: ${valid}.`;
