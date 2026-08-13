@@ -2,6 +2,12 @@ import type { App } from "@slack/bolt";
 import type OpenAI from "openai";
 import { executeTool, runCleanupMarketing, toolDefinitions, type ToolContext } from "../agent/tools.js";
 import {
+  continueDealCreate,
+  isDealCreateCancel,
+  isDealCreatePick,
+} from "../lib/dealCreateFlow.js";
+import { getDealCreateSession } from "../lib/dealCreateStore.js";
+import {
   fetchSlackImageAsDataUrl,
   imageFilesFrom,
   type SlackFile,
@@ -52,11 +58,8 @@ Rules:
 - To add someone to HubSpot, default to add_contact (contact + optional company, no deal). Use add_prospect only when the user names a *new person* to add as a prospect (e.g. "add Jane Doe as a prospect"). Never use add_prospect to put an existing company into the pipeline.
 - CRITICAL routing for deals:
   • "move Acme to deals", "add Acme to deals/pipeline", "create a deal for Acme", "new deal for Acme", or follow-ups like "new deal" / "create a new one" after talking about a company → call create_company_deal immediately. Do NOT call move_deal_stage. Do NOT call get_company_status first unless the user asked for status. Do NOT ask for deal name, contacts, first name, or email — deal name is always "[Company] - FlairX", all company contacts are auto-associated.
-  • create_company_deal flow (strict):
-    1. If multiple pipelines: ask "What pipeline?" with Sales / Partnerships only — wait for one answer.
-    2. Sales: ask deal stage only (HubSpot dealstage). NEVER ask company lifecycle. NEVER ask relationship_type / referral_status.
-    3. Partnerships: ask deal stage only first (that pipeline's stages), then ask relationship type (HubSpot company property relationship_type). NEVER ask company lifecycle.
-    When they reply with a number/name, call create_company_deal again using company_id / pipeline_id / stage / relationship_type from the prior [pick posted] message in this thread (it includes an ids map) — do not re-ask the same question.
+  • create_company_deal flow (strict): call create_company_deal with company_name only. Do NOT pass pipeline/stage. Do NOT call get_pipeline_stages. Do NOT list stages or ids yourself. The tool asks pipeline, then that pipeline's stages, then posts the Approve/Discard card.
+    When they reply with a number/name, do nothing if the tool is already collecting the pick — the app handles it. If you must call a tool, call create_company_deal again with the same company_name only.
   • move_deal_stage is ONLY for changing an *existing* deal's pipeline stage (e.g. "move the Acme deal to Negotiation"). It is NOT for creating deals or "moving a company to deals".
 - Never create duplicates. Before creating, tools check HubSpot: if a contact (email/name), company (exact name), or deal (company already has deals) already exists, tell the user about the existing record(s) with links — do not post a create card. Only create another deal when the user explicitly asks and you call create_company_deal with force=true. Existing companies are reused (not recreated) when adding contacts.
 - When the user asks to create deals for multiple companies in one message, call create_company_deal once per company and report each result. Ask for deal stage (and relationship type on Partnership) once, then reuse those choices for every company. If a tool returns "Error: …", quote that error to the user — do not invent causes like permissions.
@@ -84,7 +87,7 @@ const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 *Update HubSpot*
 • Add a contact — _"add Jane Doe at Acme to HubSpot"_ (contact + optional company; no deal)
 • Add a full prospect — _"add Jane as a prospect with a deal"_ (contact + company + Prospecting deal)
-• Create a company deal — _"create a deal for Payoneer"_ → pipeline → deal stage (Sales) or deal stage + relationship type (Partnerships)
+• Create a company deal — _"create a deal for Payoneer"_ → pipeline → deal stage → Approve
 • Add a note — _"add a note to Acme Corp — demoed today, wants pricing"_ (also refreshes last-activity date)
 • Change lead status — _"set Navin Chugh's lead status to Connected"_
 • Move a deal stage — _"move the Acme deal to Negotiation"_
@@ -181,6 +184,7 @@ function sanitizeSlackReply(text: string): string {
     .replace(/\s*<<<END_PICK_USER>>>/g, "")
     .replace(/^\[pick\][^\n]*\n?/gm, "")
     .replace(/^ids \(model only\):[^\n]*\n?/gm, "")
+    .replace(/\n?\(ids:[^)]*\)/gi, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -286,6 +290,51 @@ async function runAgentTurn(
         });
       }
       return;
+    }
+
+    // Fast-path: continue an in-progress deal create without the model.
+    const dealSession = getDealCreateSession(channel, threadTs);
+    if (dealSession) {
+      const lowered = userMessage.trim().toLowerCase();
+      const looksLikePick =
+        isDealCreatePick(userMessage) ||
+        isDealCreateCancel(userMessage) ||
+        /^\d+$/.test(userMessage.trim()) ||
+        dealSession.stages.some((s) => s.label.toLowerCase() === lowered) ||
+        dealSession.pipelines.some((p) => p.label.toLowerCase() === lowered) ||
+        Boolean(
+          dealSession.companyOptions?.some(
+            (c) => c.name.toLowerCase() === lowered,
+          ),
+        );
+      if (looksLikePick) {
+        const working = await client.chat.postMessage({
+          channel,
+          thread_ts: threadTs,
+          text: "⏳ Working on it…",
+        });
+        try {
+          const result = await continueDealCreate(
+            { client, channel, threadTs, userId },
+            dealSession,
+            userMessage,
+          );
+          const text = result.startsWith("[card ready]")
+            ? "Review the card above — Approve or Discard."
+            : extractPickUserText(result) ?? sanitizeSlackReply(result);
+          await client.chat.update({ channel, ts: working.ts!, text });
+        } catch (error) {
+          console.error("[deal-create] continue failed:", error);
+          const message =
+            error instanceof Error ? error.message : "Deal create failed.";
+          await client.chat.update({
+            channel,
+            ts: working.ts!,
+            text: message.length > 280 ? `${message.slice(0, 277)}…` : message,
+          });
+        }
+        return;
+      }
     }
 
     const working = await client.chat.postMessage({
@@ -613,7 +662,10 @@ export function registerMentionHandler(
     }
     // Only respond in threads the bot is actively part of.
     const conversationKey = `${msg.channel}:${msg.thread_ts}`;
-    if (!conversations.has(conversationKey)) {
+    const hasDealSession = Boolean(
+      getDealCreateSession(msg.channel, msg.thread_ts),
+    );
+    if (!conversations.has(conversationKey) && !hasDealSession) {
       return;
     }
 

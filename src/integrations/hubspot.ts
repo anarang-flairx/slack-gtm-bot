@@ -394,10 +394,10 @@ export async function preferFlairXSalesPipelineId(
   pipelineId: string,
 ): Promise<string> {
   const meta = await getPipelineMeta(pipelineId);
-  if (!looksLikeStockHubSpotSalesStages(meta.stages)) {
+  if (isPartnershipPipeline(meta.id, meta.label)) {
     return pipelineId;
   }
-  if (isPartnershipPipeline(meta.id, meta.label)) {
+  if (looksLikeFlairXSalesStages(meta.stages)) {
     return pipelineId;
   }
 
@@ -416,7 +416,7 @@ export async function preferFlairXSalesPipelineId(
     const candidateMeta = toPipelineMeta(candidate);
     if (looksLikeFlairXSalesStages(candidateMeta.stages)) {
       console.warn(
-        `[pipeline] "${pipelineId}" has HubSpot stock Sales stages; using "${candidateMeta.label}" (${candidateMeta.id}) for Sales instead.`,
+        `[pipeline] "${pipelineId}" (${meta.label}) is not the FlairX Sales pipeline; using "${candidateMeta.label}" (${candidateMeta.id}) instead.`,
       );
       return candidateMeta.id;
     }
