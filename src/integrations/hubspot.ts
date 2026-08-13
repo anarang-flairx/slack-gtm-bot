@@ -124,7 +124,7 @@ const META_CACHE_TTL_MS = 30_000;
 
 type TimedCache<T> = { value: T; fetchedAt: number };
 
-let pipelineCache: TimedCache<PipelineMeta> | null = null;
+let pipelineMetaById: TimedCache<Map<string, PipelineMeta>> | null = null;
 let pipelinesListCache: TimedCache<
   Array<{ id: string; label: string; stageCount: number }>
 > | null = null;
@@ -212,6 +212,7 @@ async function loadCompanyLifecycleStages(): Promise<
 /**
  * Resolve deal pipeline metadata.
  * Prefers `pipelineId`, then `HUBSPOT_PIPELINE_ID`, then the first pipeline.
+ * Cached per pipeline id so Sales metadata cannot leak into Partnerships lookups.
  */
 export async function getPipelineMeta(
   pipelineId?: string,
@@ -219,31 +220,27 @@ export async function getPipelineMeta(
   const wantId =
     pipelineId?.trim() || process.env.HUBSPOT_PIPELINE_ID?.trim() || "";
 
-  if (
-    cacheFresh(pipelineCache) &&
-    (!wantId || pipelineCache.value.id === wantId)
-  ) {
-    return pipelineCache.value;
+  if (cacheFresh(pipelineMetaById)) {
+    if (wantId) {
+      const cached = pipelineMetaById.value.get(wantId);
+      if (cached) {
+        return cached;
+      }
+    } else {
+      const first = pipelineMetaById.value.values().next().value;
+      if (first) {
+        return first;
+      }
+    }
   }
 
   const results = await fetchDealPipelines();
-  const pipeline = wantId
-    ? results.find((p) => p.id === wantId)
-    : results[0];
-
-  if (!pipeline) {
-    const available = results
-      .map((p) => `${p.label?.trim() || p.id} (${p.id})`)
-      .join(", ");
-    throw new Error(
-      wantId
-        ? `No HubSpot deal pipeline with id "${wantId}". Available: ${available || "none"}`
-        : "No HubSpot deal pipeline found",
-    );
+  const map = new Map<string, PipelineMeta>();
+  for (const pipeline of results) {
+    const meta = toPipelineMeta(pipeline);
+    map.set(meta.id, meta);
   }
-
-  const meta = toPipelineMeta(pipeline);
-  pipelineCache = { value: meta, fetchedAt: Date.now() };
+  pipelineMetaById = { value: map, fetchedAt: Date.now() };
   pipelinesListCache = {
     value: results.map((p) => ({
       id: p.id,
@@ -252,7 +249,25 @@ export async function getPipelineMeta(
     })),
     fetchedAt: Date.now(),
   };
-  return meta;
+
+  if (wantId) {
+    const meta = map.get(wantId);
+    if (meta) {
+      return meta;
+    }
+    const available = results
+      .map((p) => `${p.label?.trim() || p.id} (${p.id})`)
+      .join(", ");
+    throw new Error(
+      `No HubSpot deal pipeline with id "${wantId}". Available: ${available || "none"}`,
+    );
+  }
+
+  const first = results[0];
+  if (!first) {
+    throw new Error("No HubSpot deal pipeline found");
+  }
+  return toPipelineMeta(first);
 }
 
 async function getStageLabels(): Promise<Map<string, string>> {
@@ -306,16 +321,50 @@ export function relationshipTypeProperty(): string {
   return process.env.HUBSPOT_RELATIONSHIP_TYPE_PROPERTY ?? "relationship_type";
 }
 
-/** True when the deal belongs to the Partnership pipeline (env id or label match). */
+const PARTNERSHIP_STAGE_MARKERS = [
+  "active relationship",
+  "referral received",
+  "inactive relationship",
+];
+
+/** Compact alphanumerics so zero-width / punctuation in HubSpot labels still match. */
+function compactLabel(label: string): string {
+  return label.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function labelLooksLikePartnership(pipelineLabel: string): boolean {
+  const compact = compactLabel(pipelineLabel);
+  if (compact.includes("partnership")) {
+    return true;
+  }
+  const tokens = pipelineLabel
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  return tokens.some((token) => token === "partner" || token === "partners");
+}
+
+export function looksLikePartnershipStages(
+  stages: Array<{ label: string }>,
+): boolean {
+  const labels = stageLabelSet(stages);
+  return PARTNERSHIP_STAGE_MARKERS.some((marker) => labels.has(marker));
+}
+
+/** True when the deal belongs to the Partnership pipeline (env id, label, or stages). */
 export function isPartnershipPipeline(
   pipelineId: string,
   pipelineLabel: string,
+  stages?: Array<{ label: string }>,
 ): boolean {
   const configuredId = process.env.HUBSPOT_PARTNERSHIP_PIPELINE_ID?.trim();
-  if (configuredId && pipelineId === configuredId) {
+  if (configuredId && pipelineId && pipelineId === configuredId) {
     return true;
   }
-  return pipelineLabel.trim().toLowerCase().includes("partnership");
+  if (labelLooksLikePartnership(pipelineLabel ?? "")) {
+    return true;
+  }
+  return Boolean(stages && looksLikePartnershipStages(stages));
 }
 
 /** Stock HubSpot Sales Pipeline stage names (not FlairX). */
@@ -394,7 +443,7 @@ export async function preferFlairXSalesPipelineId(
   pipelineId: string,
 ): Promise<string> {
   const meta = await getPipelineMeta(pipelineId);
-  if (isPartnershipPipeline(meta.id, meta.label)) {
+  if (isPartnershipPipeline(meta.id, meta.label, meta.stages)) {
     return pipelineId;
   }
   if (looksLikeFlairXSalesStages(meta.stages)) {
@@ -410,7 +459,13 @@ export async function preferFlairXSalesPipelineId(
     if (partnerId && candidate.id === partnerId) {
       continue;
     }
-    if (isPartnershipPipeline(candidate.id, candidate.label?.trim() || "")) {
+    if (
+      isPartnershipPipeline(
+        candidate.id,
+        candidate.label?.trim() || "",
+        candidate.stages,
+      )
+    ) {
       continue;
     }
     const candidateMeta = toPipelineMeta(candidate);
@@ -1776,19 +1831,27 @@ export async function createDealForCompany(
   let relationshipValue: string | null = null;
   let relationshipLabel: string | null = null;
   if (input.relationshipTypeLabel?.trim()) {
-    const options = await getRelationshipTypeOptions();
+    const wanted = input.relationshipTypeLabel.trim();
+    let options: Array<{ label: string; value: string }> = [];
+    try {
+      options = await getRelationshipTypeOptions();
+    } catch (error) {
+      console.warn("[hubspot] relationship_type options failed:", error);
+    }
     const match = options.find(
       (o) =>
-        o.label.toLowerCase() ===
-        input.relationshipTypeLabel!.trim().toLowerCase(),
+        o.label.toLowerCase() === wanted.toLowerCase() ||
+        o.value.toLowerCase() === wanted.toLowerCase(),
     );
-    if (!match) {
-      throw new Error(
-        `Unknown relationship type "${input.relationshipTypeLabel}"`,
-      );
+    if (match) {
+      relationshipValue = match.value;
+      relationshipLabel = match.label;
+    } else if (options.length === 0) {
+      relationshipValue = wanted;
+      relationshipLabel = wanted;
+    } else {
+      throw new Error(`Unknown relationship type "${wanted}"`);
     }
-    relationshipValue = match.value;
-    relationshipLabel = match.label;
   }
 
   const dealName = formatCompanyDealName(input.companyName);

@@ -15,6 +15,7 @@ import { hubspotRecordUrl } from "../digest/format.js";
 import { savePendingCompanyDeal } from "./companyDealStore.js";
 import {
   clearDealCreateSession,
+  getDealCreateSession,
   saveDealCreateSession,
   sessionKey,
 } from "./dealCreateStore.js";
@@ -106,8 +107,53 @@ async function loadRelationshipOptions(): Promise<DealCreateRelationshipOption[]
   return DEFAULT_RELATIONSHIP_OPTIONS;
 }
 
-function needsRelationshipType(pipelineId: string, pipelineLabel: string): boolean {
-  return isPartnershipPipeline(pipelineId, pipelineLabel);
+function needsRelationshipType(
+  pipelineId: string,
+  pipelineLabel: string,
+  stages: Array<{ label: string }> = [],
+): boolean {
+  return isPartnershipPipeline(pipelineId, pipelineLabel, stages);
+}
+
+function resolvePipelineFields(session: DealCreateSession): {
+  pipelineId: string;
+  pipelineLabel: string;
+} {
+  let pipelineId = session.pipelineId?.trim() || "";
+  let pipelineLabel = session.pipelineLabel?.trim() || "";
+
+  if (pipelineId) {
+    const match = session.pipelines.find((p) => p.id === pipelineId);
+    if (match) {
+      pipelineLabel = pipelineLabel || match.label;
+    }
+  }
+
+  if (!pipelineId && pipelineLabel) {
+    const match = session.pipelines.find(
+      (p) => p.label.trim().toLowerCase() === pipelineLabel.toLowerCase(),
+    );
+    if (match) {
+      pipelineId = match.id;
+      pipelineLabel = match.label;
+    }
+  }
+
+  if (!pipelineId || !pipelineLabel) {
+    const fromStages = isPartnershipPipeline(
+      pipelineId,
+      pipelineLabel,
+      session.stages,
+    )
+      ? session.pipelines.find((p) => isPartnershipPipeline(p.id, p.label))
+      : undefined;
+    if (fromStages) {
+      pipelineId = pipelineId || fromStages.id;
+      pipelineLabel = pipelineLabel || fromStages.label;
+    }
+  }
+
+  return { pipelineId, pipelineLabel };
 }
 
 async function loadStages(
@@ -179,7 +225,7 @@ async function askPipeline(
       ...session,
       step: "stage",
       pipelineId: only.id,
-      pipelineLabel: label,
+      pipelineLabel: label || only.label,
       stages,
     });
     return formatPick("What deal stage?", next.stages.map((s) => s.label));
@@ -196,16 +242,50 @@ async function askPipeline(
   );
 }
 
+async function askRelationshipType(
+  session: DealCreateSession,
+  stageLabel: string,
+): Promise<string> {
+  const relationshipOptions = await loadRelationshipOptions();
+  saveDealCreateSession({
+    ...session,
+    step: "relationship",
+    stageLabel,
+    relationshipOptions,
+  });
+  return formatPick(
+    "What relationship type?",
+    relationshipOptions.map((o) => o.label),
+  );
+}
+
 async function postApprovalCard(
   ctx: DealCreateContext,
   session: DealCreateSession,
   stageLabel: string,
   relationshipLabel?: string,
 ): Promise<string> {
-  const pipelineId = session.pipelineId;
-  const pipelineLabel = session.pipelineLabel;
+  const { pipelineId, pipelineLabel } = resolvePipelineFields(session);
   if (!pipelineId || !pipelineLabel) {
     return "Pick a pipeline first.";
+  }
+
+  const withPipeline = {
+    ...session,
+    pipelineId,
+    pipelineLabel,
+  };
+
+  if (
+    !relationshipLabel &&
+    needsRelationshipType(pipelineId, pipelineLabel, session.stages)
+  ) {
+    console.log("[deal-create] after stage", {
+      pipelineId,
+      pipelineLabel,
+      needsRelationship: true,
+    });
+    return askRelationshipType(withPipeline, stageLabel);
   }
 
   const partnership = Boolean(relationshipLabel);
@@ -252,22 +332,40 @@ async function afterStagePicked(
   session: DealCreateSession,
   stageLabel: string,
 ): Promise<string> {
-  const pipelineId = session.pipelineId ?? "";
-  const pipelineLabel = session.pipelineLabel ?? "";
-  if (needsRelationshipType(pipelineId, pipelineLabel)) {
-    const relationshipOptions = await loadRelationshipOptions();
-    saveDealCreateSession({
-      ...session,
-      step: "relationship",
-      stageLabel,
-      relationshipOptions,
-    });
-    return formatPick(
-      "What relationship type?",
-      relationshipOptions.map((o) => o.label),
-    );
+  const latest = getDealCreateSession(ctx.channel, ctx.threadTs);
+  const merged: DealCreateSession = {
+    ...session,
+    ...(latest ?? {}),
+    pipelineId: latest?.pipelineId || session.pipelineId,
+    pipelineLabel: latest?.pipelineLabel || session.pipelineLabel,
+    stages:
+      (latest?.stages.length ?? 0) > 0 ? latest!.stages : session.stages,
+    pipelines:
+      (latest?.pipelines.length ?? 0) > 0
+        ? latest!.pipelines
+        : session.pipelines,
+  };
+  const { pipelineId, pipelineLabel } = resolvePipelineFields(merged);
+  const nextSession: DealCreateSession = {
+    ...merged,
+    pipelineId,
+    pipelineLabel,
+  };
+  const needs = needsRelationshipType(
+    pipelineId,
+    pipelineLabel,
+    nextSession.stages,
+  );
+  console.log("[deal-create] after stage", {
+    pipelineId,
+    pipelineLabel,
+    needsRelationship: needs,
+  });
+
+  if (needs) {
+    return askRelationshipType(nextSession, stageLabel);
   }
-  return postApprovalCard(ctx, session, stageLabel);
+  return postApprovalCard(ctx, nextSession, stageLabel);
 }
 
 export function isDealCreateCancel(text: string): boolean {
@@ -443,15 +541,15 @@ export async function continueDealCreate(
       );
     }
     const { label, stages } = await loadStages(picked.id);
-    saveDealCreateSession({
+    const saved = saveDealCreateSession({
       ...session,
       step: "stage",
       pipelineId: picked.id,
-      pipelineLabel: label,
+      pipelineLabel: label || picked.label,
       stages,
       relationshipOptions: [],
     });
-    return formatPick("What deal stage?", stages.map((s) => s.label));
+    return formatPick("What deal stage?", saved.stages.map((s) => s.label));
   }
 
   if (session.step === "stage") {
@@ -462,7 +560,8 @@ export async function continueDealCreate(
         session.stages.map((s) => s.label),
       );
     }
-    return afterStagePicked(ctx, session, picked.label);
+    const latest = getDealCreateSession(ctx.channel, ctx.threadTs) ?? session;
+    return afterStagePicked(ctx, latest, picked.label);
   }
 
   const picked = resolvePick(
