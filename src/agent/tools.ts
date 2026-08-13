@@ -15,7 +15,6 @@ import {
   listCompaniesByLifecycleStage,
   listDealPipelines,
   resolveDealsForStageMove,
-  scanMarketingJunk,
   type NoteRecordMatch,
 } from "../integrations/hubspot.js";
 import {
@@ -26,15 +25,14 @@ import { buildDailyDigest } from "../digest/buildDailyDigest.js";
 import { hubspotRecordUrl } from "../digest/format.js";
 import { createDraftByContactId } from "../lib/createDraft.js";
 import { saveDraft } from "../lib/draftStore.js";
-import { savePendingCleanup } from "../lib/cleanupStore.js";
 import { startDealCreate } from "../lib/dealCreateFlow.js";
+import { postRecentMarketingCleanup } from "../lib/runMarketingCleanup.js";
 import { savePendingLeadStatus } from "../lib/leadStatusStore.js";
 import { savePendingNoteUpdate } from "../lib/noteUpdateStore.js";
 import { savePendingProspect } from "../lib/prospectStore.js";
 import { savePendingReminder } from "../lib/reminderStore.js";
 import { savePendingStageMove } from "../lib/stageMoveStore.js";
 import {
-  buildCleanupPreviewBlocks,
   buildCompanyStatusBlocks,
   buildCustomEmailDraftPreviewBlocks,
   buildEmailDraftPreviewBlocks,
@@ -302,7 +300,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "create_company_deal",
       description:
-        "Create a NEW HubSpot deal on an *existing* company. Call with company_name only — do NOT pass pipeline, stage, or relationship_type, and do NOT call get_pipeline_stages. The bot asks pipeline, then that pipeline's stages, then posts an Approve/Discard card. Deal name is always '[Company] - FlairX'. Associates company + all contacts. Refuse duplicates unless force=true. Do NOT use move_deal_stage or add_prospect for these requests.",
+        "Create a NEW HubSpot deal on an *existing* company. Call with company_name only — do NOT pass pipeline, stage, or relationship_type, and do NOT call get_pipeline_stages. The bot asks pipeline, then that pipeline's stages, then (Partnerships only) relationship type, then posts an Approve/Discard card. Deal name is always '[Company] - FlairX'. Associates company + all contacts. Refuse duplicates unless force=true. Do NOT use move_deal_stage or add_prospect for these requests.",
       parameters: {
         type: "object",
         properties: {
@@ -416,7 +414,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "cleanup_marketing_records",
       description:
-        "Scan HubSpot for inbound marketing / Conversations auto-created contacts from the last 24 hours (and orphan companies with 0 deals) and post an Approve/Discard card to archive them. Use for 'cleanup', 'clean up marketing emails', or 'delete spam contacts'. Never archives without approval. A daily 8am job also posts this automatically.",
+        "Scan HubSpot contacts and companies created in the last 24 hours, classify logged emails/activity as marketing junk, and post a summary plus an Approve/Discard card per record. Never archives without approval. A daily 8am job also posts this automatically.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -1035,46 +1033,13 @@ async function runSummarizeEmailToNotes(
   return CARD_READY;
 }
 
-/** Scan marketing junk (last 24h) and post an approval card. Used by tool + deterministic cleanup. */
+/** Scan last-24h records' email activity and post per-item approval cards. */
 export async function runCleanupMarketing(ctx: ToolContext): Promise<string> {
   const lookbackHours = Number(process.env.CLEANUP_LOOKBACK_HOURS ?? 24) || 24;
-  const createdAfterMs = Date.now() - lookbackHours * 60 * 60 * 1000;
-  const scan = await scanMarketingJunk(40, { createdAfterMs });
-  if (scan.contacts.length === 0 && scan.companies.length === 0) {
+  const posted = await postRecentMarketingCleanup(ctx);
+  if (posted.contacts === 0 && posted.companies === 0) {
     return `No marketing/auto-created junk contacts or companies found in the last ${lookbackHours} hours.`;
   }
-
-  const pending = savePendingCleanup({
-    contacts: scan.contacts.map((c) => ({
-      id: c.id,
-      name: c.name,
-      email: c.email,
-      reason: c.reason,
-    })),
-    companies: scan.companies.map((c) => ({
-      id: c.id,
-      name: c.name,
-      domain: c.domain,
-      reason: c.reason,
-    })),
-    truncated: scan.truncated,
-    createdBy: ctx.userId,
-    channelId: ctx.channel,
-    ...(ctx.threadTs ? { threadTs: ctx.threadTs } : {}),
-  });
-
-  await postCard(
-    ctx,
-    `Marketing cleanup ready (${scan.contacts.length} contacts, ${scan.companies.length} companies)`,
-    buildCleanupPreviewBlocks(
-      pending.contacts,
-      pending.companies,
-      pending.id,
-      pending.truncated,
-      { windowLabel: `last ${lookbackHours} hours` },
-    ),
-  );
-
   return CARD_READY;
 }
 

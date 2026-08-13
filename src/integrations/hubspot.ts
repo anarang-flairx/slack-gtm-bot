@@ -2024,6 +2024,295 @@ async function contactHasDeals(contactId: string): Promise<boolean> {
   return associations.results.length > 0;
 }
 
+async function companyHasDeals(companyId: string): Promise<boolean> {
+  const associations = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/companies/${companyId}/associations/deals`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+  return associations.results.length > 0;
+}
+
+export type CrmActivitySnippet = {
+  kind: "email" | "note" | "source";
+  title: string;
+  body: string;
+};
+
+export type RecentCrmRecord = {
+  objectType: "contacts" | "companies";
+  id: string;
+  name: string;
+  email: string;
+  domain: string;
+  companyName: string;
+  sourceLabel: string;
+  snippets: CrmActivitySnippet[];
+};
+
+export type EmailEngagement = {
+  id: string;
+  subject: string;
+  from: string;
+  to: string;
+  body: string;
+  direction: string;
+  timestampMs: number | null;
+};
+
+async function searchRecentObjects(
+  objectType: "contacts" | "companies",
+  properties: string[],
+  createdAfterMs: number,
+  maxResults: number,
+): Promise<HubSpotSearchResult[]> {
+  const results: HubSpotSearchResult[] = [];
+  let after: string | undefined;
+
+  while (results.length < maxResults) {
+    const page = await hubspotFetch<HubSpotSearchResponse>(
+      `/crm/v3/objects/${objectType}/search`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: [
+            {
+              filters: [
+                {
+                  propertyName: "createdate",
+                  operator: "GTE",
+                  value: String(createdAfterMs),
+                },
+              ],
+            },
+          ],
+          properties,
+          sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+          limit: Math.min(100, maxResults - results.length),
+          ...(after ? { after } : {}),
+        }),
+      },
+    );
+    results.push(...page.results);
+    after = page.paging?.next?.after;
+    if (!after || page.results.length === 0) {
+      break;
+    }
+  }
+
+  return results;
+}
+
+export async function getRecentEmails(
+  objectType: "contacts" | "companies",
+  id: string,
+  limit = 5,
+): Promise<EmailEngagement[]> {
+  const associations = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/${objectType}/${id}/associations/emails`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+
+  const emailIds = associations.results.map((r) => r.toObjectId);
+  if (emailIds.length === 0) {
+    return [];
+  }
+
+  const emails: EmailEngagement[] = [];
+  for (let i = 0; i < emailIds.length; i += 100) {
+    const chunk = emailIds.slice(i, i + 100);
+    const data = await hubspotFetch<{
+      results: Array<{ id: string; properties: Record<string, string | null> }>;
+    }>("/crm/v3/objects/emails/batch/read", {
+      method: "POST",
+      body: JSON.stringify({
+        properties: [
+          "hs_email_subject",
+          "hs_email_text",
+          "hs_email_html",
+          "hs_email_direction",
+          "hs_email_from_email",
+          "hs_email_to_email",
+          "hs_timestamp",
+        ],
+        inputs: chunk.map((emailId) => ({ id: emailId })),
+      }),
+    });
+
+    for (const email of data.results) {
+      const rawTimestamp = email.properties.hs_timestamp;
+      const timestampMs = rawTimestamp
+        ? Number.isFinite(Number(rawTimestamp))
+          ? Number(rawTimestamp)
+          : Date.parse(rawTimestamp) || null
+        : null;
+      const body =
+        stripHtml(email.properties.hs_email_text) ||
+        stripHtml(email.properties.hs_email_html);
+      emails.push({
+        id: email.id,
+        subject: email.properties.hs_email_subject?.trim() ?? "",
+        from: email.properties.hs_email_from_email?.trim() ?? "",
+        to: email.properties.hs_email_to_email?.trim() ?? "",
+        body,
+        direction: email.properties.hs_email_direction?.trim() ?? "",
+        timestampMs,
+      });
+    }
+  }
+
+  return emails
+    .sort((a, b) => (b.timestampMs ?? 0) - (a.timestampMs ?? 0))
+    .slice(0, limit);
+}
+
+function snippetsFromEmails(emails: EmailEngagement[]): CrmActivitySnippet[] {
+  return emails.map((email) => ({
+    kind: "email" as const,
+    title: [email.subject, email.from ? `from ${email.from}` : ""]
+      .filter(Boolean)
+      .join(" · ") || "Logged email",
+    body: email.body.slice(0, 1200),
+  }));
+}
+
+function snippetsFromNotes(
+  notes: Array<{ body: string }>,
+): CrmActivitySnippet[] {
+  return notes
+    .filter((note) => note.body.trim())
+    .map((note) => ({
+      kind: "note" as const,
+      title: "HubSpot note",
+      body: note.body.slice(0, 1200),
+    }));
+}
+
+/**
+ * Contacts and companies created after `createdAfterMs`, with logged emails /
+ * notes attached. Skips internal emails, records with deals, and blank-name
+ * companies (those are handled by the unnamed-company job).
+ */
+export async function listRecentRecordsWithActivity(
+  createdAfterMs: number,
+  maxRecords = 40,
+): Promise<{ records: RecentCrmRecord[]; truncated: boolean }> {
+  const scanCap = Math.max(maxRecords * 2, 60);
+  const [rawContacts, rawCompanies] = await Promise.all([
+    searchRecentObjects(
+      "contacts",
+      [
+        "firstname",
+        "lastname",
+        "email",
+        "company",
+        "hs_object_source",
+        "hs_object_source_label",
+        "hs_object_source_detail_1",
+        "createdate",
+      ],
+      createdAfterMs,
+      scanCap,
+    ),
+    searchRecentObjects(
+      "companies",
+      ["name", "domain", "createdate"],
+      createdAfterMs,
+      scanCap,
+    ),
+  ]);
+
+  const records: RecentCrmRecord[] = [];
+
+  for (const contact of rawContacts) {
+    if (records.length >= maxRecords) {
+      break;
+    }
+    const email = contact.properties.email?.trim() ?? "";
+    if (email && isInternalEmail(email)) {
+      continue;
+    }
+    if (await contactHasDeals(contact.id)) {
+      continue;
+    }
+
+    const first = contact.properties.firstname?.trim() ?? "";
+    const last = contact.properties.lastname?.trim() ?? "";
+    const name = `${first} ${last}`.trim() || email || "Unknown contact";
+    const source = contact.properties.hs_object_source?.trim() ?? "";
+    const sourceLabel =
+      contact.properties.hs_object_source_label?.trim() ?? "";
+    const detail =
+      contact.properties.hs_object_source_detail_1?.trim() ?? "";
+
+    const [emails, notes, company] = await Promise.all([
+      getRecentEmails("contacts", contact.id, 5).catch(() => []),
+      getRecentNotes("contacts", contact.id, 3).catch(() => []),
+      getAssociatedCompany(contact.id).catch(() => null),
+    ]);
+
+    const snippets: CrmActivitySnippet[] = [
+      ...snippetsFromEmails(emails),
+      ...snippetsFromNotes(notes),
+    ];
+    if (source || sourceLabel) {
+      snippets.push({
+        kind: "source",
+        title: "HubSpot source",
+        body: [sourceLabel || source, detail].filter(Boolean).join(" · "),
+      });
+    }
+
+    records.push({
+      objectType: "contacts",
+      id: contact.id,
+      name,
+      email,
+      domain: email.split("@")[1]?.toLowerCase() ?? "",
+      companyName: company?.name || contact.properties.company?.trim() || "",
+      sourceLabel: sourceLabel || source || "—",
+      snippets,
+    });
+  }
+
+  for (const company of rawCompanies) {
+    if (records.filter((r) => r.objectType === "companies").length >= maxRecords) {
+      break;
+    }
+    const name = company.properties.name?.trim() ?? "";
+    if (!name) {
+      continue;
+    }
+    if (await companyHasDeals(company.id)) {
+      continue;
+    }
+
+    const [emails, notes] = await Promise.all([
+      getRecentEmails("companies", company.id, 5).catch(() => []),
+      getRecentNotes("companies", company.id, 3).catch(() => []),
+    ]);
+
+    const snippets: CrmActivitySnippet[] = [
+      ...snippetsFromEmails(emails),
+      ...snippetsFromNotes(notes),
+    ];
+
+    records.push({
+      objectType: "companies",
+      id: company.id,
+      name,
+      email: "",
+      domain: company.properties.domain?.trim() ?? "",
+      companyName: name,
+      sourceLabel: "company",
+      snippets,
+    });
+  }
+
+  return {
+    records,
+    truncated:
+      rawContacts.length >= scanCap || rawCompanies.length >= scanCap,
+  };
+}
+
 export type ScanMarketingJunkOptions = {
   /** Only include contacts created at/after this unix ms timestamp. */
   createdAfterMs?: number;

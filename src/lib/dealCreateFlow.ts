@@ -6,6 +6,8 @@ import {
   getCompanyStatus,
   getObjectProperties,
   getPipelineMeta,
+  getRelationshipTypeOptions,
+  isPartnershipPipeline,
   listDealCreatePipelines,
   preferFlairXSalesPipelineId,
 } from "../integrations/hubspot.js";
@@ -20,6 +22,7 @@ import { buildCompanyDealPreviewBlocks } from "./previews.js";
 import type {
   DealCreateContact,
   DealCreatePipelineOption,
+  DealCreateRelationshipOption,
   DealCreateSession,
   DealCreateStageOption,
 } from "../types/dealCreateSession.js";
@@ -82,6 +85,29 @@ async function loadPipelines(): Promise<DealCreatePipelineOption[]> {
   }
 
   return out;
+}
+
+const DEFAULT_RELATIONSHIP_OPTIONS: DealCreateRelationshipOption[] = [
+  { label: "Partner", value: "Partner" },
+  { label: "Referral", value: "Referral" },
+  { label: "Investor", value: "Investor" },
+  { label: "Advisor", value: "Advisor" },
+];
+
+async function loadRelationshipOptions(): Promise<DealCreateRelationshipOption[]> {
+  try {
+    const options = await getRelationshipTypeOptions();
+    if (options.length > 0) {
+      return options;
+    }
+  } catch (error) {
+    console.warn("[deal-create] relationship_type options failed:", error);
+  }
+  return DEFAULT_RELATIONSHIP_OPTIONS;
+}
+
+function needsRelationshipType(pipelineId: string, pipelineLabel: string): boolean {
+  return isPartnershipPipeline(pipelineId, pipelineLabel);
 }
 
 async function loadStages(
@@ -174,6 +200,7 @@ async function postApprovalCard(
   ctx: DealCreateContext,
   session: DealCreateSession,
   stageLabel: string,
+  relationshipLabel?: string,
 ): Promise<string> {
   const pipelineId = session.pipelineId;
   const pipelineLabel = session.pipelineLabel;
@@ -181,6 +208,7 @@ async function postApprovalCard(
     return "Pick a pipeline first.";
   }
 
+  const partnership = Boolean(relationshipLabel);
   const dealName = formatCompanyDealName(session.companyName);
   const pending = savePendingCompanyDeal({
     companyId: session.companyId,
@@ -189,7 +217,8 @@ async function postApprovalCard(
     pipelineId,
     pipelineLabel,
     stageLabel,
-    companyFieldKind: "none",
+    companyFieldKind: partnership ? "relationship" : "none",
+    ...(relationshipLabel ? { companyFieldLabel: relationshipLabel } : {}),
     contacts: session.contacts,
     force: session.force,
     createdBy: ctx.userId,
@@ -206,15 +235,39 @@ async function postApprovalCard(
       dealName,
       pipelineLabel,
       stageLabel,
-      "none",
+      partnership ? "relationship" : "none",
       session.contacts,
       pending.id,
       undefined,
+      relationshipLabel,
     ),
   );
 
   clearDealCreateSession(ctx.channel, ctx.threadTs);
   return "[card ready] User reply only: Review the card above — Approve or Discard.";
+}
+
+async function afterStagePicked(
+  ctx: DealCreateContext,
+  session: DealCreateSession,
+  stageLabel: string,
+): Promise<string> {
+  const pipelineId = session.pipelineId ?? "";
+  const pipelineLabel = session.pipelineLabel ?? "";
+  if (needsRelationshipType(pipelineId, pipelineLabel)) {
+    const relationshipOptions = await loadRelationshipOptions();
+    saveDealCreateSession({
+      ...session,
+      step: "relationship",
+      stageLabel,
+      relationshipOptions,
+    });
+    return formatPick(
+      "What relationship type?",
+      relationshipOptions.map((o) => o.label),
+    );
+  }
+  return postApprovalCard(ctx, session, stageLabel);
 }
 
 export function isDealCreateCancel(text: string): boolean {
@@ -230,7 +283,11 @@ export function isDealCreatePick(text: string): boolean {
   return (
     lower === "sales" ||
     lower === "partnerships" ||
-    lower === "partnership"
+    lower === "partnership" ||
+    lower === "partner" ||
+    lower === "referral" ||
+    lower === "investor" ||
+    lower === "advisor"
   );
 }
 
@@ -263,6 +320,7 @@ export async function startDealCreate(
     existingDealCount: 0,
     pipelines,
     stages: [] as DealCreateStageOption[],
+    relationshipOptions: [] as DealCreateRelationshipOption[],
     createdBy: ctx.userId,
     channelId: ctx.channel,
     ...(ctx.threadTs ? { threadTs: ctx.threadTs } : {}),
@@ -391,16 +449,37 @@ export async function continueDealCreate(
       pipelineId: picked.id,
       pipelineLabel: label,
       stages,
+      relationshipOptions: [],
     });
     return formatPick("What deal stage?", stages.map((s) => s.label));
   }
 
-  const picked = resolvePick(userMessage, session.stages, (s) => s.label);
+  if (session.step === "stage") {
+    const picked = resolvePick(userMessage, session.stages, (s) => s.label);
+    if (!picked) {
+      return formatPick(
+        "What deal stage?",
+        session.stages.map((s) => s.label),
+      );
+    }
+    return afterStagePicked(ctx, session, picked.label);
+  }
+
+  const picked = resolvePick(
+    userMessage,
+    session.relationshipOptions,
+    (o) => o.label,
+  );
   if (!picked) {
     return formatPick(
-      "What deal stage?",
-      session.stages.map((s) => s.label),
+      "What relationship type?",
+      session.relationshipOptions.map((o) => o.label),
     );
   }
-  return postApprovalCard(ctx, session, picked.label);
+  return postApprovalCard(
+    ctx,
+    session,
+    session.stageLabel ?? session.stages[0]?.label ?? "",
+    picked.label,
+  );
 }

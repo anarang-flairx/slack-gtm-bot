@@ -3,6 +3,8 @@ export type PendingCleanupContact = {
   name: string;
   email: string;
   reason: string;
+  summary?: string;
+  activitySnippet?: string;
 };
 
 export type PendingCleanupCompany = {
@@ -10,6 +12,8 @@ export type PendingCleanupCompany = {
   name: string;
   domain: string;
   reason: string;
+  summary?: string;
+  activitySnippet?: string;
 };
 
 export type PendingCleanup = {

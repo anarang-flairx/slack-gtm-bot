@@ -633,6 +633,147 @@ export function buildCompanyStatusBlocks(status: CompanyStatus): KnownBlock[] {
   ];
 }
 
+export function buildCleanupSummaryBlocks(
+  contacts: Array<{ id: string; name: string; email: string; reason: string }>,
+  companies: Array<{ id: string; name: string; domain: string; reason: string }>,
+  windowLabel: string,
+  truncated: boolean,
+): KnownBlock[] {
+  const contactLines =
+    contacts.length === 0
+      ? "_None_"
+      : contacts
+          .slice(0, 20)
+          .map((c) => {
+            const url = hubspotRecordUrl("contact", c.id);
+            const email = c.email ? ` · ${c.email}` : "";
+            return `• <${url}|${c.name}>${email} — ${c.reason}`;
+          })
+          .join("\n");
+  const companyLines =
+    companies.length === 0
+      ? "_None_"
+      : companies
+          .slice(0, 20)
+          .map((c) => {
+            const url = hubspotRecordUrl("company", c.id);
+            const domain = c.domain ? ` · ${c.domain}` : "";
+            return `• <${url}|${c.name}>${domain} — ${c.reason}`;
+          })
+          .join("\n");
+  const truncateNote = truncated
+    ? "\n_Scan capped — run cleanup again after approving to continue._"
+    : "";
+
+  return [
+    {
+      type: "header",
+      text: { type: "plain_text", text: "Daily marketing cleanup" },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          `Found *${contacts.length}* contact(s) and *${companies.length}* company(ies) created in the *${windowLabel}* whose logged emails/activity look like marketing junk.` +
+          truncateNote +
+          "\nApprove or discard each card below.",
+      },
+    },
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `*Contacts*\n${contactLines}` },
+    },
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `*Companies*\n${companyLines}` },
+    },
+  ];
+}
+
+export function buildCleanupItemPreviewBlocks(
+  kind: "contact" | "company",
+  item: {
+    id: string;
+    name: string;
+    email?: string;
+    domain?: string;
+    reason: string;
+    summary?: string;
+    activitySnippet?: string;
+  },
+  pendingId: string,
+): KnownBlock[] {
+  const url =
+    kind === "contact"
+      ? hubspotRecordUrl("contact", item.id)
+      : hubspotRecordUrl("company", item.id);
+  const extra =
+    kind === "contact"
+      ? item.email || "—"
+      : item.domain || "—";
+  const summary = item.summary?.trim() || item.reason;
+  const activity = item.activitySnippet?.trim() || "No logged email body.";
+
+  return [
+    {
+      type: "header",
+      text: {
+        type: "plain_text",
+        text:
+          kind === "contact"
+            ? "Cleanup contact"
+            : "Cleanup company",
+      },
+    },
+    {
+      type: "section",
+      fields: [
+        { type: "mrkdwn", text: `*${kind === "contact" ? "Contact" : "Company"}:*\n<${url}|${item.name}>` },
+        {
+          type: "mrkdwn",
+          text: `*${kind === "contact" ? "Email" : "Domain"}:*\n${extra}`,
+        },
+        { type: "mrkdwn", text: `*Why:*\n${item.reason}` },
+      ],
+    },
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `*Summary*\n${summary}` },
+    },
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `*Activity*\n${activity}` },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "On approve: *archive* this record in HubSpot (recycle bin, restorable ~90 days).",
+      },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Approve → archive" },
+          style: "primary",
+          action_id: "approve_cleanup_marketing",
+          value: pendingId,
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Discard" },
+          style: "danger",
+          action_id: "discard_cleanup_marketing",
+          value: pendingId,
+        },
+      ],
+    },
+  ];
+}
+
 export function buildCleanupPreviewBlocks(
   contacts: Array<{
     id: string;

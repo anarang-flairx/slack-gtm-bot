@@ -98,7 +98,12 @@ export function registerCleanupActions(app: App): void {
         archived.errors.length > 0
           ? ` · ${archived.errors.length} error(s)`
           : "";
-      const successText = `Archived *${archived.archivedContacts}* contact(s) and *${archived.archivedCompanies}* company(ies).${errorNote}`;
+      const successText =
+        pending.contacts.length === 1 && pending.companies.length === 0
+          ? `Archived contact *${pending.contacts[0].name}*.${errorNote}`
+          : pending.companies.length === 1 && pending.contacts.length === 0
+            ? `Archived company *${pending.companies[0].name}*.${errorNote}`
+            : `Archived *${archived.archivedContacts}* contact(s) and *${archived.archivedCompanies}* company(ies).${errorNote}`;
       await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
@@ -157,7 +162,12 @@ export function registerCleanupActions(app: App): void {
       return;
     }
 
-    const discardText = "Marketing cleanup discarded — nothing archived.";
+    const discardText =
+      result.pending.contacts.length === 1 && result.pending.companies.length === 0
+        ? `Kept contact *${result.pending.contacts[0].name}* — nothing archived.`
+        : result.pending.companies.length === 1 && result.pending.contacts.length === 0
+          ? `Kept company *${result.pending.companies[0].name}* — nothing archived.`
+          : "Marketing cleanup discarded — nothing archived.";
     await replaceMessage(client, channelId, messageTs, discardText);
 
     if (channelId && !messageTs) {

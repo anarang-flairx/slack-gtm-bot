@@ -1,16 +1,10 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { App } from "@slack/bolt";
-import {
-  cleanupUnnamedCompanies,
-  scanMarketingJunk,
-} from "../integrations/hubspot.js";
-import {
-  SCHEDULED_CLEANUP_USER,
-  savePendingCleanup,
-} from "../lib/cleanupStore.js";
+import { cleanupUnnamedCompanies } from "../integrations/hubspot.js";
+import { SCHEDULED_CLEANUP_USER } from "../lib/cleanupStore.js";
 import { addToNeverLog } from "../lib/neverLogStore.js";
-import { buildCleanupPreviewBlocks } from "../lib/previews.js";
+import { postRecentMarketingCleanup } from "../lib/runMarketingCleanup.js";
 
 const STATE_PATH =
   process.env.CLEANUP_STATE_PATH ??
@@ -184,8 +178,8 @@ export async function runScheduledUnnamedCompanyCleanup(
 }
 
 /**
- * Scan last N hours of marketing junk and post an Approve/Discard card.
- * Returns whether a card was posted.
+ * Scan last N hours of new contacts/companies, classify marketing email
+ * activity, and post a summary plus one Approve/Discard card per record.
  */
 export async function runScheduledMarketingCleanup(
   client: App["client"],
@@ -197,54 +191,27 @@ export async function runScheduledMarketingCleanup(
     );
   }
 
-  const createdAfterMs = Date.now() - lookbackMs();
   const lookbackHours = Math.round(lookbackMs() / 3_600_000);
-  const scan = await scanMarketingJunk(40, { createdAfterMs });
+  const posted = await postRecentMarketingCleanup({
+    client,
+    channel,
+    userId: SCHEDULED_CLEANUP_USER,
+  });
 
-  if (scan.contacts.length === 0 && scan.companies.length === 0) {
+  if (posted.contacts === 0 && posted.companies === 0) {
     console.log(
       `[cleanup] Daily scan: nothing to clean (last ${lookbackHours}h).`,
     );
     return { posted: false, contacts: 0, companies: 0 };
   }
 
-  const pending = savePendingCleanup({
-    contacts: scan.contacts.map((c) => ({
-      id: c.id,
-      name: c.name,
-      email: c.email,
-      reason: c.reason,
-    })),
-    companies: scan.companies.map((c) => ({
-      id: c.id,
-      name: c.name,
-      domain: c.domain,
-      reason: c.reason,
-    })),
-    truncated: scan.truncated,
-    createdBy: SCHEDULED_CLEANUP_USER,
-    channelId: channel,
-  });
-
-  await client.chat.postMessage({
-    channel,
-    text: `Daily marketing cleanup (${scan.contacts.length} contacts, ${scan.companies.length} companies)`,
-    blocks: buildCleanupPreviewBlocks(
-      pending.contacts,
-      pending.companies,
-      pending.id,
-      pending.truncated,
-      { windowLabel: `last ${lookbackHours} hours` },
-    ),
-  });
-
   console.log(
-    `[cleanup] Posted daily preview: ${scan.contacts.length} contacts, ${scan.companies.length} companies → #${channel}`,
+    `[cleanup] Posted daily cleanup: ${posted.contacts} contacts, ${posted.companies} companies → #${channel}`,
   );
   return {
     posted: true,
-    contacts: scan.contacts.length,
-    companies: scan.companies.length,
+    contacts: posted.contacts,
+    companies: posted.companies,
   };
 }
 
@@ -308,6 +275,6 @@ export function startMarketingCleanupScheduler(client: App["client"]): void {
   setTimeout(tick, 15_000);
   setInterval(tick, 60_000);
   console.log(
-    `[cleanup] Daily cleanup scheduled for ${hour}:00 ${tz} → #${channel} (lookback ${lookbackHours}h; unnamed companies auto-archive + Never Log; marketing junk Approve card).`,
+    `[cleanup] Daily cleanup scheduled for ${hour}:00 ${tz} → #${channel} (lookback ${lookbackHours}h; unnamed companies auto-archive; marketing email review with per-record Approve cards).`,
   );
 }

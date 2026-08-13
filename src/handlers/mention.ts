@@ -38,7 +38,7 @@ You can:
 - Set a follow-up reminder in N days (creates a HubSpot task + a scheduled Slack nudge).
 - Draft templated or custom emails into Gmail Drafts, and find sent emails that have not been replied to.
 - Summarize an email thread into notes on the matching contact and its company.
-- Clean up inbound marketing / Conversations auto-created contacts from the last 24 hours and orphan companies (cleanup_marketing_records — approval required; also runs daily at 8am).
+- Clean up inbound marketing contacts/companies created in the last 24 hours after reviewing logged emails (cleanup_marketing_records — one approval card per record; also runs daily at 8am).
 
 Rules:
 - VOICE (strict — overrides everything else for user-visible text):
@@ -58,7 +58,7 @@ Rules:
 - To add someone to HubSpot, default to add_contact (contact + optional company, no deal). Use add_prospect only when the user names a *new person* to add as a prospect (e.g. "add Jane Doe as a prospect"). Never use add_prospect to put an existing company into the pipeline.
 - CRITICAL routing for deals:
   • "move Acme to deals", "add Acme to deals/pipeline", "create a deal for Acme", "new deal for Acme", or follow-ups like "new deal" / "create a new one" after talking about a company → call create_company_deal immediately. Do NOT call move_deal_stage. Do NOT call get_company_status first unless the user asked for status. Do NOT ask for deal name, contacts, first name, or email — deal name is always "[Company] - FlairX", all company contacts are auto-associated.
-  • create_company_deal flow (strict): call create_company_deal with company_name only. Do NOT pass pipeline/stage. Do NOT call get_pipeline_stages. Do NOT list stages or ids yourself. The tool asks pipeline, then that pipeline's stages, then posts the Approve/Discard card.
+  • create_company_deal flow (strict): call create_company_deal with company_name only. Do NOT pass pipeline/stage/relationship_type. Do NOT call get_pipeline_stages. Do NOT list stages or ids yourself. The tool asks pipeline, then stages, then (Partnerships only) relationship type, then posts the Approve/Discard card.
     When they reply with a number/name, do nothing if the tool is already collecting the pick — the app handles it. If you must call a tool, call create_company_deal again with the same company_name only.
   • move_deal_stage is ONLY for changing an *existing* deal's pipeline stage (e.g. "move the Acme deal to Negotiation"). It is NOT for creating deals or "moving a company to deals".
 - Never create duplicates. Before creating, tools check HubSpot: if a contact (email/name), company (exact name), or deal (company already has deals) already exists, tell the user about the existing record(s) with links — do not post a create card. Only create another deal when the user explicitly asks and you call create_company_deal with force=true. Existing companies are reused (not recreated) when adding contacts.
@@ -87,7 +87,7 @@ const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 *Update HubSpot*
 • Add a contact — _"add Jane Doe at Acme to HubSpot"_ (contact + optional company; no deal)
 • Add a full prospect — _"add Jane as a prospect with a deal"_ (contact + company + Prospecting deal)
-• Create a company deal — _"create a deal for Payoneer"_ → pipeline → deal stage → Approve
+• Create a company deal — _"create a deal for Payoneer"_ → pipeline → deal stage (Sales) or deal stage + relationship type (Partnerships) → Approve
 • Add a note — _"add a note to Acme Corp — demoed today, wants pricing"_ (also refreshes last-activity date)
 • Change lead status — _"set Navin Chugh's lead status to Connected"_
 • Move a deal stage — _"move the Acme deal to Negotiation"_
@@ -96,7 +96,7 @@ const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 • Follow-up reminder — _"remind me to follow up with Acme in 2 days"_ (creates a HubSpot task + a scheduled Slack nudge)
 
 *Cleanup*
-• Marketing junk — daily at 8am (last 24h): auto-archives blank-name companies (+ Never Log); posts Approve card for Conversations spam. Or type _cleanup_
+• Marketing junk — daily at 8am (last 24h emails): summary + Approve/Discard per contact/company. Or type _cleanup_
 
 *Email (drafts only — I never send)*
 • Templated draft — _"draft an intro email to Jane Doe"_ or _"event follow-up to Jane Doe"_
@@ -302,6 +302,9 @@ async function runAgentTurn(
         /^\d+$/.test(userMessage.trim()) ||
         dealSession.stages.some((s) => s.label.toLowerCase() === lowered) ||
         dealSession.pipelines.some((p) => p.label.toLowerCase() === lowered) ||
+        dealSession.relationshipOptions?.some(
+          (o) => o.label.toLowerCase() === lowered,
+        ) ||
         Boolean(
           dealSession.companyOptions?.some(
             (c) => c.name.toLowerCase() === lowered,

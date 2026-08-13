@@ -119,7 +119,7 @@ Run the same API one-liner above and confirm Sales and Partnerships labels + sta
 Every day at **8:00** (`CLEANUP_TZ`, default `America/Los_Angeles`) the bot:
 
 1. **Unnamed companies (auto):** finds companies with a blank/missing name from the last 24 hours, **archives** them and their associated contacts (skips any with deals), and adds those emails/domains to the **Never Log** (`data/never-log.json`) so email auto-logging never writes notes for them. Posts a short FYI to Slack.
-2. **Marketing junk (Approve):** scans Conversations / email-integration auto-created contacts from the last 24 hours with **0 deals** (plus orphan companies). If any are found, posts an Approve/Discard card. Anyone can approve a daily card.
+2. **Marketing junk (Approve per record):** scans contacts and companies created in the last 24 hours, reads logged emails/notes, and flags marketing/cold-outreach. Posts a Slack **summary** plus an **Approve/Discard card for each** contact and company. Anyone can approve a daily card.
 
 You can also run the marketing-junk scan on demand: `@FlairX GTM Bot cleanup` (same 24h window).
 
