@@ -180,6 +180,36 @@ export async function classifyRecentMarketing(
   return decided;
 }
 
+/**
+ * Subject lines of the logged emails, newest first. Marketing is usually
+ * obvious from the subject alone, so cards show these before anything else.
+ */
+export function emailSubjects(record: RecentCrmRecord, limit = 3): string[] {
+  const seen = new Set<string>();
+  const subjects: string[] = [];
+
+  for (const snippet of record.snippets) {
+    if (snippet.kind !== "email") {
+      continue;
+    }
+    const subject = snippet.subject?.replace(/\s+/g, " ").trim();
+    if (!subject) {
+      continue;
+    }
+    const key = subject.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    subjects.push(subject.length > 140 ? `${subject.slice(0, 137)}…` : subject);
+    if (subjects.length >= limit) {
+      break;
+    }
+  }
+
+  return subjects;
+}
+
 export function activitySnippet(record: RecentCrmRecord): string {
   const email = record.snippets.find((s) => s.kind === "email");
   const note = record.snippets.find((s) => s.kind === "note");

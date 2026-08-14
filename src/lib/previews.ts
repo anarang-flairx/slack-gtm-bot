@@ -696,6 +696,26 @@ export function buildCleanupSummaryBlocks(
   ];
 }
 
+/** Slack mrkdwn escaping, so a subject line can't inject link syntax. */
+function escapeMrkdwn(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Quoted subject lines, or null when nothing was logged. */
+function emailSubjectBlock(subjects: string[] | undefined): KnownBlock | null {
+  if (!subjects || subjects.length === 0) {
+    return null;
+  }
+  const lines = subjects.map((s) => `• “${escapeMrkdwn(s)}”`).join("\n");
+  return {
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: `*Email subject${subjects.length > 1 ? "s" : ""}*\n${lines}`,
+    },
+  };
+}
+
 export function buildCleanupItemPreviewBlocks(
   kind: "contact" | "company",
   item: {
@@ -706,6 +726,7 @@ export function buildCleanupItemPreviewBlocks(
     reason: string;
     summary?: string;
     activitySnippet?: string;
+    emailSubjects?: string[];
   },
   pendingId: string,
 ): KnownBlock[] {
@@ -719,6 +740,7 @@ export function buildCleanupItemPreviewBlocks(
       : item.domain || "—";
   const summary = item.summary?.trim() || item.reason;
   const activity = item.activitySnippet?.trim() || "No logged email body.";
+  const subjectBlock = emailSubjectBlock(item.emailSubjects);
 
   return [
     {
@@ -742,6 +764,8 @@ export function buildCleanupItemPreviewBlocks(
         { type: "mrkdwn", text: `*Why:*\n${item.reason}` },
       ],
     },
+    // Subject lines sit above the summary — usually the fastest tell.
+    ...(subjectBlock ? [subjectBlock] : []),
     {
       type: "section",
       text: { type: "mrkdwn", text: `*Summary*\n${summary}` },
@@ -755,6 +779,83 @@ export function buildCleanupItemPreviewBlocks(
       text: {
         type: "mrkdwn",
         text: "On approve: *archive* this record in HubSpot (recycle bin, restorable ~90 days).",
+      },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Approve → archive" },
+          style: "primary",
+          action_id: "approve_cleanup_marketing",
+          value: pendingId,
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Discard" },
+          style: "danger",
+          action_id: "discard_cleanup_marketing",
+          value: pendingId,
+        },
+      ],
+    },
+  ];
+}
+
+/**
+ * One blank-name company plus every contact on it. Approving archives the whole
+ * group; these used to be archived automatically with no card at all.
+ */
+export function buildUnnamedCompanyCleanupBlocks(
+  company: { id: string; domain: string; emailSubjects?: string[] },
+  contacts: Array<{ id: string; name: string; email: string }>,
+  pendingId: string,
+): KnownBlock[] {
+  const companyUrl = hubspotRecordUrl("company", company.id);
+  const contactLines =
+    contacts.length === 0
+      ? "_None_"
+      : contacts
+          .slice(0, 15)
+          .map((c) => {
+            const url = hubspotRecordUrl("contact", c.id);
+            const label = c.name?.trim() || c.email || "Unnamed contact";
+            const email = c.email ? ` · ${c.email}` : "";
+            return `• <${url}|${escapeMrkdwn(label)}>${escapeMrkdwn(email)}`;
+          })
+          .join("\n");
+  const overflow =
+    contacts.length > 15 ? `\n_+${contacts.length - 15} more_` : "";
+  const subjectBlock = emailSubjectBlock(company.emailSubjects);
+
+  return [
+    {
+      type: "header",
+      text: { type: "plain_text", text: "Cleanup unnamed company" },
+    },
+    {
+      type: "section",
+      fields: [
+        { type: "mrkdwn", text: `*Company:*\n<${companyUrl}|(no name)>` },
+        { type: "mrkdwn", text: `*Domain:*\n${company.domain || "—"}` },
+        { type: "mrkdwn", text: `*Why:*\nblank company name · no deals` },
+        { type: "mrkdwn", text: `*Contacts:*\n${contacts.length}` },
+      ],
+    },
+    ...(subjectBlock ? [subjectBlock] : []),
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Contacts to archive*\n${contactLines}${overflow}`,
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `On approve: *archive* this company and ${contacts.length} contact(s) in HubSpot (recycle bin, restorable ~90 days), and add their emails/domain to Never Log.`,
       },
     },
     {
