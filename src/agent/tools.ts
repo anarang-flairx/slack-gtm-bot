@@ -328,12 +328,17 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "move_deal_stage",
       description:
-        "Change the pipeline STAGE of an *existing* deal (e.g. Prospecting → Negotiation). NOT for creating deals. NOT for 'move company to deals' / 'add company to pipeline' — those require create_company_deal. Identify the deal by company name and/or deal name. Posts an approval card.",
+        "Change the pipeline STAGE of an *existing* deal (e.g. Prospecting → Negotiation, or Engaged on Partnerships). NOT for creating deals. NOT for 'move company to deals' / 'add company to pipeline' — those require create_company_deal. Identify the deal by company name, deal name, and/or contact name. Stages are validated against THAT deal's pipeline (Sales vs Partnerships), not a fixed list. Posts an approval card.",
       parameters: {
         type: "object",
         properties: {
           company_name: { type: "string" },
           deal_name: { type: "string" },
+          contact_name: {
+            type: "string",
+            description:
+              "Contact associated with the deal (e.g. 'Yogi Chugh'). Use when the user names a person rather than a company.",
+          },
           target_stage: {
             type: "string",
             description: "Exact pipeline stage label to move the deal to",
@@ -744,25 +749,22 @@ async function runMoveDealStage(
     return "Missing target_stage.";
   }
 
-  const pipeline = await getPipelineMeta();
-  const stage = pipeline.stageByLabel.get(targetStage.toLowerCase());
-  if (!stage) {
-    const valid = pipeline.stages.map((s) => s.label).join(", ");
-    return `"${targetStage}" is not a valid stage. Valid stages: ${valid}.`;
-  }
-
   const companyName = args.company_name
     ? String(args.company_name).trim()
     : undefined;
   const dealName = args.deal_name ? String(args.deal_name).trim() : undefined;
+  const contactName = args.contact_name
+    ? String(args.contact_name).trim()
+    : undefined;
 
-  if (!companyName && !dealName) {
-    return "Provide a company_name and/or deal_name to identify the deal.";
+  if (!companyName && !dealName && !contactName) {
+    return "Provide a company_name, deal_name, and/or contact_name to identify the deal.";
   }
 
   const { ambiguousCompanies, deals } = await resolveDealsForStageMove({
     ...(companyName ? { companyName } : {}),
     ...(dealName ? { dealName } : {}),
+    ...(contactName ? { contactName } : {}),
   });
 
   if (ambiguousCompanies && ambiguousCompanies.length > 0) {
@@ -776,20 +778,32 @@ async function runMoveDealStage(
   }
 
   if (deals.length === 0) {
-    return `No deal for ${companyName ?? dealName}. New deal? → create_company_deal.`;
+    return `No deal for ${contactName ?? companyName ?? dealName}. New deal? → create_company_deal.`;
   }
 
   if (deals.length > 1) {
     return pickPrompt(
       "Pick a deal:",
       deals
-        .map((d, i) => `${i + 1}. ${d.name} — ${d.currentStageLabel}`)
+        .map(
+          (d, i) =>
+            `${i + 1}. ${d.name} — ${d.pipelineLabel} / ${d.currentStageLabel}`,
+        )
         .join("\n"),
       `move_deal_stage deal_name=<chosen>`,
     );
   }
 
   const deal = deals[0];
+  const pipeline = await getPipelineMeta(
+    deal.pipelineId || process.env.HUBSPOT_PIPELINE_ID,
+  );
+  const stage = pipeline.stageByLabel.get(targetStage.toLowerCase());
+  if (!stage) {
+    const valid = pipeline.stages.map((s) => s.label).join(", ");
+    return `"${targetStage}" is not a valid stage in the *${pipeline.label}* pipeline (deal: ${deal.name}). Choose from: ${valid}.`;
+  }
+
   if (deal.currentStageId === stage.id) {
     return `Deal "${deal.name}" is already in ${stage.label}.`;
   }
@@ -814,6 +828,7 @@ async function runMoveDealStage(
       deal.currentStageLabel,
       stage.label,
       pending.id,
+      deal.pipelineLabel || pipeline.label,
     ),
   );
 

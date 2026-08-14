@@ -2213,59 +2213,89 @@ export type DealForStageMove = {
   name: string;
   currentStageId: string;
   currentStageLabel: string;
+  pipelineId: string;
+  pipelineLabel: string;
 };
 
+async function dealsFromIds(
+  dealIds: string[],
+): Promise<DealForStageMove[]> {
+  if (dealIds.length === 0) {
+    return [];
+  }
+
+  const stageLabels = await getStageLabels().catch(() => new Map());
+  const pipelines = await fetchDealPipelines();
+  const pipelineLabelById = new Map(
+    pipelines.map((p) => [p.id, p.label?.trim() || p.id]),
+  );
+
+  const deals: DealForStageMove[] = [];
+  for (let i = 0; i < dealIds.length; i += 100) {
+    const chunk = dealIds.slice(i, i + 100);
+    const data = await hubspotFetch<{
+      results: Array<{ id: string; properties: Record<string, string | null> }>;
+    }>("/crm/v3/objects/deals/batch/read", {
+      method: "POST",
+      body: JSON.stringify({
+        properties: ["dealname", "dealstage", "pipeline", "hs_is_closed"],
+        inputs: chunk.map((id) => ({ id })),
+      }),
+    });
+
+    for (const deal of data.results) {
+      const stageId = deal.properties.dealstage ?? "";
+      const pipelineId = deal.properties.pipeline?.trim() ?? "";
+      deals.push({
+        id: deal.id,
+        name: deal.properties.dealname?.trim() || "Untitled deal",
+        currentStageId: stageId,
+        currentStageLabel: stageLabels.get(stageId) || stageId || "—",
+        pipelineId,
+        pipelineLabel: pipelineLabelById.get(pipelineId) || pipelineId || "—",
+      });
+    }
+  }
+
+  return deals;
+}
+
 /**
- * Resolve candidate deals for a stage move, by company name and/or deal name.
- * Returns ambiguous company matches so the caller can ask for clarification.
+ * Resolve candidate deals for a stage move by company, deal, or contact name.
+ * Each deal includes its HubSpot pipeline so stage labels are validated against
+ * that pipeline (Sales vs Partnerships), not the default Sales pipeline.
  */
 export async function resolveDealsForStageMove(opts: {
   companyName?: string;
   dealName?: string;
+  contactName?: string;
 }): Promise<{
   ambiguousCompanies?: Array<{ id: string; name: string; domain: string }>;
   deals: DealForStageMove[];
 }> {
-  const stageLabels = await getStageLabels().catch(() => new Map());
-  const toDeal = (
-    id: string,
-    name: string,
-    stageId: string,
-  ): DealForStageMove => ({
-    id,
-    name,
-    currentStageId: stageId,
-    currentStageLabel: stageLabels.get(stageId) || stageId || "—",
-  });
-
   if (opts.companyName) {
     const companies = await findCompaniesByName(opts.companyName);
     if (companies.length === 0) {
-      return { deals: [] };
-    }
-    if (companies.length > 1) {
+      // Fall through: "Yogi Chugh" may be a contact, not a company.
+    } else if (companies.length > 1) {
       return { ambiguousCompanies: companies, deals: [] };
-    }
-
-    const status = await getCompanyStatus(companies[0].id);
-    let deals = status.deals.map((deal) =>
-      toDeal(
-        deal.id,
-        deal.name,
-        // getCompanyStatus already resolved stage to a label; re-resolve id
-        [...stageLabels.entries()].find(([, label]) => label === deal.stage)?.[0] ??
-          deal.stage,
-      ),
-    );
-
-    if (opts.dealName) {
-      const needle = opts.dealName.toLowerCase();
-      deals = deals.filter((deal) =>
-        deal.name.toLowerCase().includes(needle),
+    } else {
+      const associations = await hubspotFetch<HubSpotAssociationResponse>(
+        `/crm/v4/objects/companies/${companies[0].id}/associations/deals`,
+      ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+      let deals = await dealsFromIds(
+        associations.results.map((r) => r.toObjectId),
       );
+      if (opts.dealName) {
+        const needle = opts.dealName.toLowerCase();
+        deals = deals.filter((deal) =>
+          deal.name.toLowerCase().includes(needle),
+        );
+      }
+      if (deals.length > 0) {
+        return { deals };
+      }
     }
-
-    return { deals };
   }
 
   if (opts.dealName) {
@@ -2285,21 +2315,39 @@ export async function resolveDealsForStageMove(opts: {
               ],
             },
           ],
-          properties: ["dealname", "dealstage"],
+          properties: ["dealname", "dealstage", "pipeline"],
           limit: 10,
         }),
       },
     );
 
-    return {
-      deals: search.results.map((deal) =>
-        toDeal(
-          deal.id,
-          deal.properties.dealname?.trim() || "Untitled deal",
-          deal.properties.dealstage ?? "",
-        ),
-      ),
-    };
+    const deals = await dealsFromIds(search.results.map((d) => d.id));
+    if (deals.length > 0) {
+      return { deals };
+    }
+  }
+
+  const personName =
+    opts.contactName?.trim() ||
+    opts.companyName?.trim() ||
+    opts.dealName?.trim() ||
+    "";
+  if (personName) {
+    const contacts = await findContactsByName(personName);
+    const exact = contacts.filter(
+      (c) => c.name.toLowerCase() === personName.toLowerCase(),
+    );
+    const candidates = exact.length > 0 ? exact : contacts.slice(0, 5);
+    const dealIds = new Set<string>();
+    for (const contact of candidates) {
+      for (const id of await listAssociatedDealIds("contacts", contact.id)) {
+        dealIds.add(id);
+      }
+    }
+    const deals = await dealsFromIds([...dealIds]);
+    if (deals.length > 0) {
+      return { deals };
+    }
   }
 
   return { deals: [] };

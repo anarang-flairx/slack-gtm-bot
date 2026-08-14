@@ -278,6 +278,7 @@ export function buildStageMovePreviewBlocks(
   currentStageLabel: string,
   targetStageLabel: string,
   pendingId: string,
+  pipelineLabel?: string,
 ): KnownBlock[] {
   const url = hubspotRecordUrl("deal", dealId);
   return [
@@ -289,6 +290,10 @@ export function buildStageMovePreviewBlocks(
       type: "section",
       fields: [
         { type: "mrkdwn", text: `*Deal:*\n<${url}|${dealName}>` },
+        {
+          type: "mrkdwn",
+          text: `*Pipeline:*\n${pipelineLabel || "—"}`,
+        },
         {
           type: "mrkdwn",
           text: `*Stage:*\n${currentStageLabel} → *${targetStageLabel}*`,
