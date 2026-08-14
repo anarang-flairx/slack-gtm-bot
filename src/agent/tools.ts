@@ -221,7 +221,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "post_digest",
       description:
-        "Build and post the GTM daily digest to the configured digest channel: open deals that need a follow-up, each with a short why from notes/emails, plus a Draft follow-up button.",
+        "Build and post the GTM daily digest: scan open HubSpot deals, read each deal's email chain and notes, decide which need a follow-up, and post those with a short why plus a Draft follow-up button.",
       parameters: { type: "object", properties: {} },
     },
   },

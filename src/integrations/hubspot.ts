@@ -972,8 +972,8 @@ export async function getDealFollowUpBundle(
     hubspotFetch<HubSpotAssociationResponse>(
       `/crm/v4/objects/deals/${dealId}/associations/companies`,
     ).catch(() => ({ results: [] }) as HubSpotAssociationResponse),
-    getRecentNotes("deals", dealId, 5).catch(() => []),
-    getRecentEmails("deals", dealId, 5).catch(() => []),
+    getRecentNotes("deals", dealId, 8).catch(() => []),
+    getRecentEmails("deals", dealId, 8).catch(() => []),
   ]);
 
   const contactIds = contactAssoc.results.map((r) => r.toObjectId).slice(0, 8);
@@ -1021,13 +1021,13 @@ export async function getDealFollowUpBundle(
     const extra: EmailEngagement[] = [];
     if (companyId) {
       extra.push(
-        ...(await getRecentEmails("companies", companyId, 3).catch(() => [])),
+        ...(await getRecentEmails("companies", companyId, 5).catch(() => [])),
       );
     }
     const withEmail = contacts.find((c) => c.email);
     if (withEmail && extra.length === 0) {
       extra.push(
-        ...(await getRecentEmails("contacts", withEmail.id, 3).catch(() => [])),
+        ...(await getRecentEmails("contacts", withEmail.id, 5).catch(() => [])),
       );
     }
     mergedEmails = extra.sort(

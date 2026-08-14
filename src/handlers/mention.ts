@@ -40,7 +40,7 @@ You can:
 - Draft templated or custom emails into Gmail Drafts, and find sent emails that have not been replied to.
 - Summarize an email thread into notes on the matching contact and its company.
 - Clean up inbound marketing contacts/companies created in the last 24 hours after reviewing logged emails (cleanup_marketing_records — one approval card per record; also runs daily at 8am).
-- Post the daily digest: open deals that need a follow-up, with a one-line why from HubSpot activity. Each row can draft a personalized email.
+- Post the daily digest: scan open deals, read email chains/notes, and list only deals that need a follow-up (with why). Each row can draft a personalized email.
 
 Rules:
 - VOICE (strict — overrides everything else for user-visible text):
@@ -80,7 +80,7 @@ const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 • List companies by stage — _"show me all customers"_ or _"which companies are in the Customer stage?"_
 • Find a record — _"look up Acme Corp"_
 • Company status — _"what's the status of Acme Corp?"_ (deals, contacts, notes, last activity)
-• Daily digest — _"post the digest"_ (open deals that need a follow-up, with why + Draft)
+• Daily digest — _"post the digest"_ (scans open deals, reads email/activity, lists who needs a follow-up + Draft)
 
 *Capture leads from photos*
 • Send a badge or business-card photo (with an optional note like _"met at SaaStr, wants a demo"_) and I'll read the details and post an add-contact card. Say _"as a prospect"_ to also create a deal. Multiple people in one photo? I'll post one card each.

@@ -362,3 +362,45 @@ export async function getThreadContent(
     text,
   };
 }
+
+/**
+ * Find the most recent Gmail thread with a contact and return its text.
+ * Used by the digest to decide follow-ups from the real email chain.
+ */
+export async function getRecentThreadForEmail(
+  email: string,
+  maxChars = 6000,
+): Promise<ThreadContent | null> {
+  const address = email.trim().toLowerCase();
+  if (!address || !address.includes("@")) {
+    return null;
+  }
+  if (!process.env.GOOGLE_REFRESH_TOKEN) {
+    return null;
+  }
+
+  try {
+    const auth = getOAuthClient();
+    const gmail = google.gmail({ version: "v1", auth });
+    const list = await gmail.users.messages.list({
+      userId: "me",
+      q: `{to:${address} from:${address}} newer_than:90d`,
+      maxResults: 5,
+    });
+
+    const threadIds: string[] = [];
+    for (const message of list.data.messages ?? []) {
+      if (message.threadId && !threadIds.includes(message.threadId)) {
+        threadIds.push(message.threadId);
+      }
+    }
+    if (threadIds.length === 0) {
+      return null;
+    }
+
+    return await getThreadContent(threadIds[0], maxChars);
+  } catch (error) {
+    console.warn(`[gmail] thread lookup failed for ${address}:`, error);
+    return null;
+  }
+}

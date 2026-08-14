@@ -9,6 +9,7 @@ import {
   searchObjects,
   type DealFollowUpBundle,
 } from "../integrations/hubspot.js";
+import { getRecentThreadForEmail } from "../integrations/gmail.js";
 import {
   contactActivityDateProperty,
   dealActivityDateProperty,
@@ -435,85 +436,177 @@ async function mapPool<T, R>(
   return out;
 }
 
-async function polishFollowUpReasons(
-  rows: Array<{
-    id: string;
-    name: string;
-    stageLabel: string;
-    why: string;
-    activity: string;
-  }>,
-): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
+function formatActivityForModel(
+  deal: OpenDeal,
+  daysQuiet: number,
+  pastClose: boolean,
+  bundle: DealFollowUpBundle,
+  gmailThread: string,
+): string {
+  const emails = bundle.emails
+    .slice(0, 6)
+    .map((email) => {
+      const when = email.timestampMs
+        ? new Date(email.timestampMs).toISOString().slice(0, 10)
+        : "";
+      const dir = emailDirectionLabel(email.direction) || "email";
+      return `[${when}] ${dir} · ${email.subject || "(no subject)"}\nFrom: ${email.from}\nTo: ${email.to}\n${email.body.slice(0, 900)}`;
+    })
+    .join("\n\n---\n\n");
+
+  const notes = [
+    ...bundle.notes.map((n) => n.body),
+    bundle.dealNotes,
+    bundle.company?.notes ?? "",
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, 2500);
+
+  return [
+    `Deal: ${deal.name}`,
+    `Stage: ${deal.stageLabel}`,
+    `Days since last HubSpot activity: ${daysQuiet}`,
+    pastClose && deal.closeDate
+      ? `Close date past: ${formatCloseDate(deal.closeDate)}`
+      : "",
+    `Contacts: ${bundle.contacts.map((c) => `${c.name} <${c.email}>`).join("; ") || "(none)"}`,
+    `Company: ${bundle.company?.name ?? "(none)"}`,
+    "",
+    "HubSpot logged emails:",
+    emails || "(none)",
+    "",
+    "Gmail thread:",
+    gmailThread || "(none)",
+    "",
+    "Notes:",
+    notes || "(none)",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+}
+
+type FollowUpVerdict = {
+  needsFollowUp: boolean;
+  why: string;
+};
+
+/**
+ * Decide which deals need a follow-up by reading each deal's email/activity
+ * context — not by quiet-day thresholds alone.
+ */
+async function classifyDealsFromActivity(
+  rows: Array<{ id: string; activity: string }>,
+): Promise<Map<string, FollowUpVerdict>> {
+  const out = new Map<string, FollowUpVerdict>();
   if (!process.env.OPENAI_API_KEY || rows.length === 0) {
     return out;
   }
 
-  try {
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const model = process.env.OPENAI_CHEAP_MODEL ?? "gpt-4.1-mini";
-    const completion = await openai.chat.completions.create({
-      model,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            'You write one-sentence GTM follow-up reasons. Be specific to the deal\'s notes/emails. No fluff, no "it looks like". Max 140 characters. Reply JSON: {"results":[{"id":"...","why":"..."}]}',
-        },
-        {
-          role: "user",
-          content: JSON.stringify(
-            rows.map((row) => ({
-              id: row.id,
-              deal: row.name,
-              stage: row.stageLabel,
-              facts: row.why,
-              activity: row.activity.slice(0, 1200),
-            })),
-          ),
-        },
-      ],
-    });
-    const raw = completion.choices[0]?.message?.content ?? "{}";
-    const parsed = JSON.parse(raw) as {
-      results?: Array<{ id?: string; why?: string }>;
-    };
-    for (const result of parsed.results ?? []) {
-      if (result.id && result.why?.trim()) {
-        out.set(result.id, result.why.trim());
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const model = process.env.OPENAI_MODEL ?? "gpt-4.1";
+  const batchSize = 6;
+
+  for (let i = 0; i < rows.length; i += batchSize) {
+    const batch = rows.slice(i, i + batchSize);
+    try {
+      const completion = await openai.chat.completions.create({
+        model,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: `You are FlairX GTM ops. For each open deal, read the email chain and notes, then decide if a human follow-up is needed TODAY.
+
+needsFollowUp=true when:
+- We sent the last email and they haven't replied (ball in their court for too long), OR
+- They replied / asked something and we haven't answered, OR
+- A next step was promised (demo, intro, proposal, meeting) and it's overdue / unconfirmed, OR
+- Close date passed with no recent progress, OR
+- Stage is active but there is no meaningful email/note trail and outreach is needed.
+
+needsFollowUp=false when:
+- Conversation is active and recent (they or we just engaged), OR
+- They asked to pause / revisit later and that date isn't due, OR
+- Deal is intentionally waiting on an internal step with a clear recent note, OR
+- There is nothing actionable yet.
+
+why must be one specific sentence grounded in the emails/notes (max 160 chars). No fluff, no "it looks like".
+
+Reply JSON: {"results":[{"id":"...","needsFollowUp":true,"why":"..."}]}`,
+          },
+          {
+            role: "user",
+            content: JSON.stringify(
+              batch.map((row) => ({
+                id: row.id,
+                activity: row.activity.slice(0, 7000),
+              })),
+            ),
+          },
+        ],
+      });
+
+      const raw = completion.choices[0]?.message?.content ?? "{}";
+      const parsed = JSON.parse(raw) as {
+        results?: Array<{
+          id?: string;
+          needsFollowUp?: boolean;
+          why?: string;
+        }>;
+      };
+      for (const result of parsed.results ?? []) {
+        if (!result.id) {
+          continue;
+        }
+        out.set(result.id, {
+          needsFollowUp: result.needsFollowUp === true,
+          why: result.why?.trim() || "",
+        });
       }
+    } catch (error) {
+      console.warn("[digest] activity follow-up classify failed:", error);
     }
-  } catch (error) {
-    console.warn("[digest] follow-up why polish failed:", error);
   }
+
   return out;
 }
 
-function stallThresholdDays(stageLabel: string): number {
-  const lateDays = envInt("STALL_DAYS_LATE_STAGE", 7);
-  const earlyDays = envInt("STALL_DAYS_EARLY_STAGE", 14);
-  return LATE_STAGE_LABELS.has(stageLabel.trim().toLowerCase())
-    ? lateDays
-    : earlyDays;
+function fallbackNeedsFollowUp(
+  daysQuiet: number,
+  pastClose: boolean,
+  stageLabel: string,
+  hasEmailTrail: boolean,
+): boolean {
+  if (pastClose) {
+    return true;
+  }
+  // Conservative fallback if the model is unavailable: quiet + no recent trail.
+  const threshold = LATE_STAGE_LABELS.has(stageLabel.trim().toLowerCase())
+    ? envInt("STALL_DAYS_LATE_STAGE", 7)
+    : envInt("STALL_DAYS_EARLY_STAGE", 14);
+  return daysQuiet >= threshold && (!hasEmailTrail || daysQuiet >= threshold);
 }
 
 /**
- * Open deals that need a follow-up: quiet past the stage threshold, or past
- * close date. Skips intentionally paused stages (On Hold / Nurture / Inactive).
+ * Scan open deals only. Read each deal's HubSpot emails/notes (+ Gmail thread
+ * when available) and keep deals where activity analysis says a follow-up is
+ * needed. Skips paused stages (On Hold / Nurture / Inactive).
  */
 export async function queryDealsNeedingFollowUp(
   deals: OpenDeal[],
 ): Promise<DealFollowUp[]> {
   const now = Date.now();
   const todayStart = startOfTodayMs();
-  const maxRows = Math.max(envInt("DIGEST_MAX_ROWS", 8) * 2, 12);
+  const maxScan = Math.max(envInt("DIGEST_MAX_SCAN", 40), envInt("DIGEST_MAX_ROWS", 8));
 
-  const active = deals.filter(
-    (deal) => !PAUSED_STAGE_LABELS.has(deal.stageLabel.trim().toLowerCase()),
-  );
+  const active = deals
+    .filter(
+      (deal) => !PAUSED_STAGE_LABELS.has(deal.stageLabel.trim().toLowerCase()),
+    )
+    .slice(0, maxScan);
 
-  const withQuiet = await mapPool(active, 5, async (deal) => {
+  const enriched = await mapPool(active, 4, async (deal) => {
     const nativeMs = await latestNoteTimestampMs("deals", deal.id).catch(
       () => null,
     );
@@ -521,33 +614,13 @@ export async function queryDealsNeedingFollowUp(
       Math.max(deal.notesLastUpdated ?? 0, nativeMs ?? 0) ||
       deal.createdAt ||
       0;
+    const daysQuiet = daysSince(quietFrom || null, now);
     const closeMs = deal.closeDate ? Date.parse(deal.closeDate) : NaN;
     const pastClose = Number.isFinite(closeMs) && closeMs < todayStart;
-    return {
-      deal,
-      daysQuiet: daysSince(quietFrom || null, now),
-      pastClose,
-    };
-  });
 
-  const candidates = withQuiet
-    .filter(
-      (row) =>
-        row.pastClose ||
-        row.daysQuiet >= stallThresholdDays(row.deal.stageLabel),
-    )
-    .sort((a, b) => {
-      if (a.pastClose !== b.pastClose) {
-        return a.pastClose ? -1 : 1;
-      }
-      return b.daysQuiet - a.daysQuiet;
-    })
-    .slice(0, maxRows);
-
-  const enriched = await mapPool(candidates, 4, async (row) => {
-    const bundle = await getDealFollowUpBundle(row.deal.id).catch(
+    const bundle = await getDealFollowUpBundle(deal.id).catch(
       (): DealFollowUpBundle => ({
-        dealId: row.deal.id,
+        dealId: deal.id,
         dealNotes: "",
         company: null,
         contacts: [],
@@ -557,46 +630,83 @@ export async function queryDealsNeedingFollowUp(
     );
     const contact =
       bundle.contacts.find((c) => c.email) ?? bundle.contacts[0];
-    const activity = [
-      ...bundle.notes.map((n) => n.body),
-      ...bundle.emails.map(
-        (e) => `${e.subject} ${e.body}`.trim(),
-      ),
-      bundle.dealNotes,
-      bundle.company?.notes ?? "",
-    ]
-      .filter(Boolean)
-      .join("\n");
+
+    let gmailThread = "";
+    if (contact?.email) {
+      const thread = await getRecentThreadForEmail(contact.email).catch(
+        () => null,
+      );
+      if (thread?.text) {
+        gmailThread = `Subject: ${thread.subject}\n${thread.text}`.slice(
+          0,
+          5000,
+        );
+      }
+    }
+
+    const activity = formatActivityForModel(
+      deal,
+      daysQuiet,
+      pastClose,
+      bundle,
+      gmailThread,
+    );
 
     return {
-      ...row.deal,
-      daysQuiet: row.daysQuiet,
-      why: heuristicWhy(row.deal, row.daysQuiet, row.pastClose, bundle),
+      ...deal,
+      daysQuiet,
+      pastClose,
       contactId: contact?.id ?? "",
       contactName: contact?.name ?? "",
       contactEmail: contact?.email ?? "",
       canDraft: Boolean(contact?.email),
+      hasEmailTrail:
+        bundle.emails.length > 0 || gmailThread.length > 0 || Boolean(bundle.dealNotes),
       activity,
+      why: heuristicWhy(deal, daysQuiet, pastClose, bundle),
     };
   });
 
-  const polished = await polishFollowUpReasons(
-    enriched.map((row) => ({
-      id: row.id,
-      name: row.name,
-      stageLabel: row.stageLabel,
-      why: row.why,
-      activity: row.activity,
-    })),
+  const verdicts = await classifyDealsFromActivity(
+    enriched.map((row) => ({ id: row.id, activity: row.activity })),
   );
 
-  return enriched.map((row) => {
-    const { activity: _activity, ...rest } = row;
-    return {
-      ...rest,
-      why: polished.get(row.id) || row.why,
-    };
-  });
+  const needed = enriched
+    .filter((row) => {
+      const verdict = verdicts.get(row.id);
+      if (verdict) {
+        return verdict.needsFollowUp;
+      }
+      return fallbackNeedsFollowUp(
+        row.daysQuiet,
+        row.pastClose,
+        row.stageLabel,
+        row.hasEmailTrail,
+      );
+    })
+    .map((row) => {
+      const verdict = verdicts.get(row.id);
+      return {
+        id: row.id,
+        name: row.name,
+        amount: row.amount,
+        stageId: row.stageId,
+        stageLabel: row.stageLabel,
+        closeDate: row.closeDate,
+        lastModified: row.lastModified,
+        notesLastUpdated: row.notesLastUpdated,
+        createdAt: row.createdAt,
+        daysQuiet: row.daysQuiet,
+        why: verdict?.why || row.why,
+        contactId: row.contactId,
+        contactName: row.contactName,
+        contactEmail: row.contactEmail,
+        canDraft: row.canDraft,
+      };
+    })
+    .sort((a, b) => b.daysQuiet - a.daysQuiet);
+
+  return needed;
 }
 
 export async function queryFollowUpContacts(): Promise<FollowUpContact[]> {

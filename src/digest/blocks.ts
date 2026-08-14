@@ -83,7 +83,7 @@ export function buildDigestBlocks(data: DigestData): KnownBlock[] {
     type: "section",
     text: {
       type: "mrkdwn",
-      text: `*Deals to follow up (${followUps.length})*`,
+      text: `*Deals needing follow-up (${followUps.length})*`,
     },
   });
 
@@ -94,7 +94,7 @@ export function buildDigestBlocks(data: DigestData): KnownBlock[] {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `• <${url}|${deal.name}> · ${deal.stageLabel} · *${deal.daysQuiet}d quiet*\n${why}`,
+        text: `• <${url}|${deal.name}> · ${deal.stageLabel} · *${deal.daysQuiet}d since activity*\n${why}`,
       },
     };
     if (deal.canDraft) {
