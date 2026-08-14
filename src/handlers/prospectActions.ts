@@ -3,6 +3,11 @@ import type { KnownBlock } from "@slack/types";
 import { hubspotRecordUrl } from "../digest/format.js";
 import { createContact, createProspect } from "../integrations/hubspot.js";
 import {
+  companyLacksEmail,
+  createMissingEmailReminder,
+  hasNoEmail,
+} from "../lib/missingEmailReminder.js";
+import {
   beginProspectAction,
   completeProspectAction,
   releaseProspectAction,
@@ -48,6 +53,37 @@ async function replaceMessage(
       },
     ],
   });
+}
+
+/**
+ * Companies created alongside a contact are made with a name only, so a brand
+ * new one never has a domain. Reused companies are left alone — they were not
+ * created here, and may already have one.
+ */
+async function maybeCompanyReminder(
+  client: App["client"],
+  created: {
+    companyId: string | null;
+    companyName: string | null;
+    companyCreated: boolean;
+  },
+  opts: { channelId?: string; userId: string },
+): Promise<string> {
+  if (!created.companyCreated || !created.companyId) {
+    return "";
+  }
+  if (!(await companyLacksEmail(created.companyId))) {
+    return "";
+  }
+  return createMissingEmailReminder(
+    client,
+    {
+      recordType: "company",
+      recordId: created.companyId,
+      recordName: created.companyName ?? "new company",
+    },
+    opts,
+  );
 }
 
 export function registerProspectActions(app: App): void {
@@ -96,6 +132,8 @@ export function registerProspectActions(app: App): void {
         ...pending.fields,
       };
 
+      const noEmail = hasNoEmail(pending.fields.email);
+
       if (pending.createDeal) {
         const created = await createProspect(input);
         completeProspectAction(pendingId);
@@ -106,7 +144,25 @@ export function registerProspectActions(app: App): void {
           ? ` · company <${hubspotRecordUrl("company", created.companyId)}|${created.companyName}>`
           : "";
 
-        const successText = `Prospect created: contact <${contactUrl}|${created.contactName}> · deal <${dealUrl}|${created.dealName}> (${created.stageLabel})${companyPart}`;
+        // No email means neither the contact nor its new deal is reachable.
+        const reminderNote = noEmail
+          ? await createMissingEmailReminder(
+              client,
+              {
+                recordType: "contact",
+                recordId: created.contactId,
+                recordName: created.contactName,
+              },
+              { channelId, userId },
+            )
+          : "";
+        const companyReminderNote = await maybeCompanyReminder(
+          client,
+          created,
+          { channelId, userId },
+        );
+
+        const successText = `Prospect created: contact <${contactUrl}|${created.contactName}> · deal <${dealUrl}|${created.dealName}> (${created.stageLabel})${companyPart}${reminderNote}${companyReminderNote}`;
         await replaceMessage(client, channelId, messageTs, successText);
 
         if (channelId && !messageTs) {
@@ -123,7 +179,23 @@ export function registerProspectActions(app: App): void {
         ? ` · company <${hubspotRecordUrl("company", created.companyId)}|${created.companyName}>`
         : "";
 
-      const successText = `Contact added: <${contactUrl}|${created.contactName}>${companyPart}`;
+      const reminderNote = noEmail
+        ? await createMissingEmailReminder(
+            client,
+            {
+              recordType: "contact",
+              recordId: created.contactId,
+              recordName: created.contactName,
+            },
+            { channelId, userId },
+          )
+        : "";
+      const companyReminderNote = await maybeCompanyReminder(client, created, {
+        channelId,
+        userId,
+      });
+
+      const successText = `Contact added: <${contactUrl}|${created.contactName}>${companyPart}${reminderNote}${companyReminderNote}`;
       await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {

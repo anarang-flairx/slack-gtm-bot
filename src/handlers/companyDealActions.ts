@@ -8,6 +8,10 @@ import {
   releaseCompanyDealAction,
   takeCompanyDeal,
 } from "../lib/companyDealStore.js";
+import {
+  createMissingEmailReminder,
+  hasNoEmail,
+} from "../lib/missingEmailReminder.js";
 import { postThread } from "../lib/slackPost.js";
 
 function actionContext(body: {
@@ -105,7 +109,21 @@ export function registerCompanyDealActions(app: App): void {
         created.relationshipTypeLabel
           ? ` · relationship *${created.relationshipTypeLabel}*`
           : "";
-      const successText = `Deal created: <${dealUrl}|${created.dealName}> (${created.pipelineLabel} / ${created.stageLabel}) · company <${companyUrl}|${created.companyName}>${fieldPart} · ${contactCount} contact${contactCount === 1 ? "" : "s"} associated`;
+      // A deal nobody can be emailed about: no associated contact has an email.
+      const reachable = pending.contacts.some((c) => !hasNoEmail(c.email));
+      const reminderNote = reachable
+        ? ""
+        : await createMissingEmailReminder(
+            client,
+            {
+              recordType: "deal",
+              recordId: created.dealId,
+              recordName: created.dealName,
+            },
+            { channelId, userId },
+          );
+
+      const successText = `Deal created: <${dealUrl}|${created.dealName}> (${created.pipelineLabel} / ${created.stageLabel}) · company <${companyUrl}|${created.companyName}>${fieldPart} · ${contactCount} contact${contactCount === 1 ? "" : "s"} associated${reminderNote}`;
       await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
