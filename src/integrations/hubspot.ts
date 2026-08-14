@@ -1,8 +1,14 @@
 import {
   appendDatedNote,
+  activityDateProperty,
   companyActivityDateProperty,
   companyNotesProperty,
+  contactActivityDateProperty,
   contactNotesProperty,
+  dealNotesProperty,
+  isHubSpotReadOnlyActivityProperty,
+  todayDatePropertyValue,
+  WRITABLE_LAST_ACTIVITY_FALLBACK,
 } from "../lib/noteProperties.js";
 
 const HUBSPOT_BASE = "https://api.hubapi.com";
@@ -280,6 +286,10 @@ async function getStageLabels(): Promise<Map<string, string>> {
     }
   }
   return labels;
+}
+
+export async function getDealStageLabels(): Promise<Map<string, string>> {
+  return getStageLabels();
 }
 
 export async function getLeadStatusMap(): Promise<Map<string, string>> {
@@ -927,6 +937,133 @@ export async function latestNoteTimestampMs(
   return notes[0]?.timestampMs ?? null;
 }
 
+export type DealFollowUpContact = {
+  id: string;
+  name: string;
+  email: string;
+};
+
+export type DealFollowUpBundle = {
+  dealId: string;
+  dealNotes: string;
+  company: { id: string; name: string; notes: string } | null;
+  contacts: DealFollowUpContact[];
+  notes: NoteEngagement[];
+  emails: EmailEngagement[];
+};
+
+/**
+ * Notes, logged emails, company, and contacts for a deal — used by the digest
+ * follow-up table and personalized draft generation.
+ */
+export async function getDealFollowUpBundle(
+  dealId: string,
+): Promise<DealFollowUpBundle> {
+  const notesProp = dealNotesProperty();
+  const companyNotesProp = companyNotesProperty();
+
+  const [deal, contactAssoc, companyAssoc, notes, emails] = await Promise.all([
+    hubspotFetch<{ properties: Record<string, string | null> }>(
+      `/crm/v3/objects/deals/${dealId}?properties=${encodeURIComponent(notesProp)}`,
+    ),
+    hubspotFetch<HubSpotAssociationResponse>(
+      `/crm/v4/objects/deals/${dealId}/associations/contacts`,
+    ).catch(() => ({ results: [] }) as HubSpotAssociationResponse),
+    hubspotFetch<HubSpotAssociationResponse>(
+      `/crm/v4/objects/deals/${dealId}/associations/companies`,
+    ).catch(() => ({ results: [] }) as HubSpotAssociationResponse),
+    getRecentNotes("deals", dealId, 5).catch(() => []),
+    getRecentEmails("deals", dealId, 5).catch(() => []),
+  ]);
+
+  const contactIds = contactAssoc.results.map((r) => r.toObjectId).slice(0, 8);
+  const companyId = companyAssoc.results[0]?.toObjectId ?? "";
+
+  const contacts: DealFollowUpContact[] = [];
+  if (contactIds.length > 0) {
+    const data = await hubspotFetch<{
+      results: Array<{ id: string; properties: Record<string, string | null> }>;
+    }>("/crm/v3/objects/contacts/batch/read", {
+      method: "POST",
+      body: JSON.stringify({
+        properties: ["firstname", "lastname", "email"],
+        inputs: contactIds.map((id) => ({ id })),
+      }),
+    });
+    for (const contact of data.results) {
+      const first = contact.properties.firstname?.trim() ?? "";
+      const last = contact.properties.lastname?.trim() ?? "";
+      contacts.push({
+        id: contact.id,
+        name: `${first} ${last}`.trim() || "Unknown contact",
+        email: contact.properties.email?.trim() ?? "",
+      });
+    }
+  }
+
+  let company: DealFollowUpBundle["company"] = null;
+  if (companyId) {
+    const companyRecord = await hubspotFetch<{
+      id: string;
+      properties: Record<string, string | null>;
+    }>(
+      `/crm/v3/objects/companies/${companyId}?properties=name,${encodeURIComponent(companyNotesProp)}`,
+    );
+    company = {
+      id: companyRecord.id,
+      name: companyRecord.properties.name?.trim() || "Untitled company",
+      notes: companyRecord.properties[companyNotesProp]?.trim() ?? "",
+    };
+  }
+
+  let mergedEmails = emails;
+  if (mergedEmails.length === 0) {
+    const extra: EmailEngagement[] = [];
+    if (companyId) {
+      extra.push(
+        ...(await getRecentEmails("companies", companyId, 3).catch(() => [])),
+      );
+    }
+    const withEmail = contacts.find((c) => c.email);
+    if (withEmail && extra.length === 0) {
+      extra.push(
+        ...(await getRecentEmails("contacts", withEmail.id, 3).catch(() => [])),
+      );
+    }
+    mergedEmails = extra.sort(
+      (a, b) => (b.timestampMs ?? 0) - (a.timestampMs ?? 0),
+    );
+  }
+
+  let mergedNotes = notes;
+  if (mergedNotes.length === 0 && companyId) {
+    mergedNotes = await getRecentNotes("companies", companyId, 3).catch(
+      () => [],
+    );
+  }
+
+  return {
+    dealId,
+    dealNotes: deal.properties[notesProp]?.trim() ?? "",
+    company,
+    contacts,
+    notes: mergedNotes,
+    emails: mergedEmails,
+  };
+}
+
+function parseHubSpotTimestampMs(raw: string | null | undefined): number | null {
+  if (!raw?.trim()) {
+    return null;
+  }
+  const asNum = Number(raw);
+  if (Number.isFinite(asNum) && asNum > 0) {
+    return asNum;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
 /** Return the company associated with a contact, if any. */
 export async function getAssociatedCompany(
   contactId: string,
@@ -948,6 +1085,43 @@ export async function getAssociatedCompany(
     id: companyId,
     name: company.properties.name?.trim() || "Untitled company",
   };
+}
+
+/**
+ * If this contact is on a company we already have — created before
+ * `createdAfterMs`, or already has deals — return that company. Used to keep
+ * marketing cleanup from proposing people at existing accounts.
+ */
+export async function findExistingCompanyForContact(
+  contactId: string,
+  createdAfterMs: number,
+): Promise<{ id: string; name: string } | null> {
+  const associations = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/contacts/${contactId}/associations/companies`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+
+  for (const row of associations.results) {
+    const companyId = row.toObjectId;
+    const company = await hubspotFetch<{
+      properties: Record<string, string | null>;
+    }>(
+      `/crm/v3/objects/companies/${companyId}?properties=name,createdate`,
+    ).catch(() => null);
+    if (!company) {
+      continue;
+    }
+
+    const name = company.properties.name?.trim() || "Untitled company";
+    const createdateMs = parseHubSpotTimestampMs(company.properties.createdate);
+    if (createdateMs != null && createdateMs < createdAfterMs) {
+      return { id: companyId, name };
+    }
+    if (await companyHasDeals(companyId)) {
+      return { id: companyId, name };
+    }
+  }
+
+  return null;
 }
 
 async function searchNoteMatchesByName(
@@ -1546,15 +1720,96 @@ export async function createCrmObject(
 }
 
 export async function associateDefault(
-  fromType: "contacts" | "companies" | "deals",
+  fromType: "contacts" | "companies" | "deals" | "notes" | "tasks",
   fromId: string,
-  toType: "contacts" | "companies" | "deals",
+  toType: "contacts" | "companies" | "deals" | "notes" | "tasks",
   toId: string,
 ): Promise<void> {
   await hubspotFetch(
     `/crm/v4/objects/${fromType}/${fromId}/associations/default/${toType}/${toId}`,
     { method: "PUT" },
   );
+}
+
+async function stampActivityDateProperty(
+  objectType: "contacts" | "companies" | "deals",
+  id: string,
+): Promise<void> {
+  const today = todayDatePropertyValue();
+  const primary = activityDateProperty(objectType);
+  const props = isHubSpotReadOnlyActivityProperty(primary)
+    ? [WRITABLE_LAST_ACTIVITY_FALLBACK]
+    : [primary, WRITABLE_LAST_ACTIVITY_FALLBACK].filter(
+        (name, index, all) => all.indexOf(name) === index,
+      );
+
+  for (const prop of props) {
+    if (isHubSpotReadOnlyActivityProperty(prop)) {
+      continue;
+    }
+    try {
+      await updateObjectProperties(objectType, id, { [prop]: today });
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (/READ_ONLY_VALUE|read only property/i.test(message)) {
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+/**
+ * Stamp HubSpot Last Activity Date for a record.
+ * Native notes update the built-in `notes_last_updated` field; a writable
+ * date property is also PATCHed so digest urgency still works if notes.write
+ * is missing.
+ */
+export async function touchLastActivity(
+  objectType: "contacts" | "companies" | "deals",
+  id: string,
+  summary: string,
+): Promise<void> {
+  const body = summary.trim();
+  if (body) {
+    try {
+      const note = await hubspotFetch<{ id: string }>("/crm/v3/objects/notes", {
+        method: "POST",
+        body: JSON.stringify({
+          properties: {
+            hs_timestamp: String(Date.now()),
+            hs_note_body: body.slice(0, 65000),
+          },
+        }),
+      });
+      await associateDefault("notes", note.id, objectType, id);
+    } catch (error) {
+      console.warn(
+        `[hubspot] native note failed for ${objectType}/${id}:`,
+        error,
+      );
+    }
+  }
+
+  try {
+    await stampActivityDateProperty(objectType, id);
+  } catch (error) {
+    console.warn(
+      `[hubspot] Last Activity Date stamp failed for ${objectType}/${id}:`,
+      error,
+    );
+  }
+}
+
+export async function listAssociatedDealIds(
+  objectType: "contacts" | "companies",
+  id: string,
+): Promise<string[]> {
+  const data = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/${objectType}/${id}/associations/deals`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+  return data.results.map((row) => row.toObjectId);
 }
 
 const RECORD_OBJECT_TYPE: Record<
@@ -1673,6 +1928,9 @@ export async function createContact(
   if (notes) {
     contactProperties[contactNotesProperty()] = appendDatedNote("", notes);
   }
+  if (!isHubSpotReadOnlyActivityProperty(contactActivityDateProperty())) {
+    contactProperties[contactActivityDateProperty()] = todayDatePropertyValue();
+  }
 
   const contact = await createCrmObject("contacts", contactProperties);
 
@@ -1691,6 +1949,19 @@ export async function createContact(
       companyId = company.id;
     }
     await associateDefault("contacts", contact.id, "companies", companyId);
+  }
+
+  await touchLastActivity(
+    "contacts",
+    contact.id,
+    notes || `Contact created: ${contactName}`,
+  );
+  if (companyId) {
+    await touchLastActivity(
+      "companies",
+      companyId,
+      notes || `Contact added: ${contactName}`,
+    );
   }
 
   return {
@@ -1751,6 +2022,19 @@ export async function createProspect(
   await associateDefault("contacts", contactId, "deals", deal.id);
   if (companyId) {
     await associateDefault("companies", companyId, "deals", deal.id);
+  }
+
+  await touchLastActivity(
+    "deals",
+    deal.id,
+    `Deal created in ${prospecting.label}`,
+  );
+  if (companyId) {
+    await touchLastActivity(
+      "companies",
+      companyId,
+      `Deal created: ${dealName}`,
+    );
   }
 
   return {
@@ -1889,6 +2173,26 @@ export async function createDealForCompany(
   }
   if (Object.keys(companyUpdates).length > 0) {
     await updateObjectProperties("companies", input.companyId, companyUpdates);
+  }
+
+  await touchLastActivity(
+    "deals",
+    deal.id,
+    `Deal created in ${pipeline.label} / ${stage.label}`,
+  );
+  await touchLastActivity(
+    "companies",
+    input.companyId,
+    relationshipLabel
+      ? `Deal created (${stage.label}); relationship type ${relationshipLabel}`
+      : `Deal created in ${stage.label}`,
+  );
+  for (const contactId of input.contactIds) {
+    await touchLastActivity(
+      "contacts",
+      contactId,
+      `Associated to deal ${dealName}`,
+    );
   }
 
   return {
@@ -2165,7 +2469,7 @@ async function searchRecentObjects(
 }
 
 export async function getRecentEmails(
-  objectType: "contacts" | "companies",
+  objectType: "contacts" | "companies" | "deals",
   id: string,
   limit = 5,
 ): Promise<EmailEngagement[]> {
@@ -2251,7 +2555,8 @@ function snippetsFromNotes(
 /**
  * Contacts and companies created after `createdAfterMs`, with logged emails /
  * notes attached. Skips internal emails, records with deals, and blank-name
- * companies (those are handled by the unnamed-company job).
+ * companies (those are handled by the unnamed-company job). Contacts on
+ * existing companies are dropped later, before Slack, by marketing cleanup.
  */
 export async function listRecentRecordsWithActivity(
   createdAfterMs: number,

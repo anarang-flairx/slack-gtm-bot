@@ -1,6 +1,7 @@
 import {
   findNoteRecords,
   getObjectProperties,
+  touchLastActivity,
   updateObjectProperties,
   type NoteRecordMatch,
   type NoteRecordType,
@@ -13,6 +14,7 @@ import {
   contactNotesProperty,
   dealActivityDateProperty,
   dealNotesProperty,
+  isHubSpotReadOnlyActivityProperty,
   todayDatePropertyValue,
 } from "./noteProperties.js";
 
@@ -88,7 +90,9 @@ export async function appendNotesToRecord(
   try {
     await updateObjectProperties(objectType, match.id, {
       [notesProp]: nextNotes,
-      [dateProp]: todayDatePropertyValue(),
+      ...(!isHubSpotReadOnlyActivityProperty(dateProp)
+        ? { [dateProp]: todayDatePropertyValue() }
+        : {}),
     });
   } catch (error) {
     // Some portals map the activity-date env var to a read-only HubSpot
@@ -105,5 +109,6 @@ export async function appendNotesToRecord(
     }
   }
 
+  await touchLastActivity(objectType, match.id, note);
   return match;
 }

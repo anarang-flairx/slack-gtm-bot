@@ -199,14 +199,22 @@ export async function runScheduledMarketingCleanup(
   });
 
   if (posted.contacts === 0 && posted.companies === 0) {
+    const skippedNote =
+      posted.skippedExistingCompany > 0
+        ? ` Skipped ${posted.skippedExistingCompany} contact(s) on existing companies.`
+        : "";
     console.log(
-      `[cleanup] Daily scan: nothing to clean (last ${lookbackHours}h).`,
+      `[cleanup] Daily scan: nothing to clean (last ${lookbackHours}h).${skippedNote}`,
     );
     return { posted: false, contacts: 0, companies: 0 };
   }
 
+  const skippedNote =
+    posted.skippedExistingCompany > 0
+      ? ` (skipped ${posted.skippedExistingCompany} on existing companies)`
+      : "";
   console.log(
-    `[cleanup] Posted daily cleanup: ${posted.contacts} contacts, ${posted.companies} companies → #${channel}`,
+    `[cleanup] Posted daily cleanup: ${posted.contacts} contacts, ${posted.companies} companies → #${channel}${skippedNote}`,
   );
   return {
     posted: true,

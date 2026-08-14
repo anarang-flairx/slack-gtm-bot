@@ -24,6 +24,31 @@ export function companyActivityDateProperty(): string {
   return process.env.HUBSPOT_COMPANY_ACTIVITY_DATE_PROPERTY ?? "notes_last_updated";
 }
 
+/** Writable custom date used when HubSpot's Last Activity Date is read-only. */
+export const WRITABLE_LAST_ACTIVITY_FALLBACK = "last_activity_date";
+
+export function activityDateProperty(
+  objectType: "contacts" | "companies" | "deals",
+): string {
+  switch (objectType) {
+    case "contacts":
+      return contactActivityDateProperty();
+    case "companies":
+      return companyActivityDateProperty();
+    case "deals":
+      return dealActivityDateProperty();
+  }
+}
+
+export function isHubSpotReadOnlyActivityProperty(name: string): boolean {
+  const normalized = name.trim().toLowerCase();
+  return (
+    normalized === "notes_last_updated" ||
+    normalized === "hs_lastmodifieddate" ||
+    normalized === "hs_lastactivitydate"
+  );
+}
+
 /** Append a dated line to an existing notes field (PT date stamp). */
 export function appendDatedNote(
   existing: string | null | undefined,

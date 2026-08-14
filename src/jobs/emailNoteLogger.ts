@@ -11,6 +11,7 @@ import {
   findCompanyByDomain,
   findContactByEmail,
   getAssociatedCompany,
+  listAssociatedDealIds,
 } from "../integrations/hubspot.js";
 import { appendNotesToRecord } from "../lib/updateNotes.js";
 import {
@@ -130,6 +131,24 @@ async function processSentEmail(
   for (const company of companies.values()) {
     await appendNotesToRecord(
       { type: "company", id: company.id, name: company.name, detail: "" },
+      note,
+    );
+  }
+
+  const dealIds = new Set<string>();
+  for (const contact of contacts.values()) {
+    for (const id of await listAssociatedDealIds("contacts", contact.id)) {
+      dealIds.add(id);
+    }
+  }
+  for (const company of companies.values()) {
+    for (const id of await listAssociatedDealIds("companies", company.id)) {
+      dealIds.add(id);
+    }
+  }
+  for (const dealId of dealIds) {
+    await appendNotesToRecord(
+      { type: "deal", id: dealId, name: "Deal", detail: "" },
       note,
     );
   }

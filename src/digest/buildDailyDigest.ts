@@ -1,13 +1,9 @@
 import type { KnownBlock } from "@slack/types";
-import { getPipelineMeta } from "../integrations/hubspot.js";
 import { buildDigestBlocks, type DigestData } from "./blocks.js";
 import {
-  queryFollowUpContacts,
+  queryDealsNeedingFollowUp,
   queryOpenDeals,
-  queryOverdueTasks,
-  queryStalledDeals,
 } from "./queries.js";
-import { diffMovedDeals, loadDigestState, saveDigestState } from "./state.js";
 
 export type DailyDigestResult = {
   blocks: KnownBlock[];
@@ -34,60 +30,26 @@ export async function buildDailyDigest(): Promise<DailyDigestResult> {
     throw new Error("Missing DIGEST_CHANNEL in .env (use the Slack channel ID)");
   }
 
-  const [pipelineResult, stalledResult, followUpsResult, tasksResult] =
-    await Promise.all([
-      safeSection("pipeline", queryOpenDeals),
-      safeSection("stalled", queryStalledDeals),
-      safeSection("follow-ups", queryFollowUpContacts),
-      safeSection("tasks", queryOverdueTasks),
-    ]);
+  const pipelineResult = await safeSection("pipeline", queryOpenDeals);
 
-  const previous = loadDigestState();
-  let moved: DigestData["moved"] = [];
+  let followUps: DigestData["followUps"] = null;
+  let followUpsError: string | undefined;
 
   if (pipelineResult.value) {
-    const currentStages = Object.fromEntries(
-      pipelineResult.value.deals.map((deal) => [deal.id, deal.stageId]),
+    const followResult = await safeSection("deal-follow-ups", () =>
+      queryDealsNeedingFollowUp(pipelineResult.value!.deals),
     );
-
-    const movedRaw = diffMovedDeals(
-      previous?.dealStages ?? null,
-      pipelineResult.value.deals.map((deal) => ({
-        id: deal.id,
-        stageId: deal.stageId,
-        name: deal.name,
-      })),
-    );
-
-    try {
-      const pipeline = await getPipelineMeta();
-      moved = movedRaw.map((item) => ({
-        id: item.id,
-        name: item.name,
-        toStageLabel:
-          pipeline.stageById.get(item.toStageId)?.label ?? item.toStageId,
-      }));
-    } catch {
-      moved = movedRaw.map((item) => ({
-        id: item.id,
-        name: item.name,
-        toStageLabel: item.toStageId,
-      }));
-    }
-
-    saveDigestState(currentStages);
+    followUps = followResult.value;
+    followUpsError = followResult.error;
+  } else {
+    followUpsError = pipelineResult.error;
   }
 
   const data: DigestData = {
     pipeline: pipelineResult.value,
     pipelineError: pipelineResult.error,
-    stalled: stalledResult.value,
-    stalledError: stalledResult.error,
-    followUps: followUpsResult.value,
-    followUpsError: followUpsResult.error,
-    tasks: tasksResult.value,
-    tasksError: tasksResult.error,
-    moved,
+    followUps,
+    followUpsError,
   };
 
   return {

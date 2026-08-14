@@ -9,6 +9,7 @@ import {
 import { getDealCreateSession } from "../lib/dealCreateStore.js";
 import {
   fetchSlackImageAsDataUrl,
+  filterImageFiles,
   imageFilesFrom,
   type SlackFile,
 } from "../lib/slackFiles.js";
@@ -39,6 +40,7 @@ You can:
 - Draft templated or custom emails into Gmail Drafts, and find sent emails that have not been replied to.
 - Summarize an email thread into notes on the matching contact and its company.
 - Clean up inbound marketing contacts/companies created in the last 24 hours after reviewing logged emails (cleanup_marketing_records — one approval card per record; also runs daily at 8am).
+- Post the daily digest: open deals that need a follow-up, with a one-line why from HubSpot activity. Each row can draft a personalized email.
 
 Rules:
 - VOICE (strict — overrides everything else for user-visible text):
@@ -78,10 +80,10 @@ const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 • List companies by stage — _"show me all customers"_ or _"which companies are in the Customer stage?"_
 • Find a record — _"look up Acme Corp"_
 • Company status — _"what's the status of Acme Corp?"_ (deals, contacts, notes, last activity)
-• Daily digest — _"post the digest"_ (pipeline snapshot, stalled deals, follow-ups due, overdue tasks)
+• Daily digest — _"post the digest"_ (open deals that need a follow-up, with why + Draft)
 
 *Capture leads from photos*
-• Send a badge or business-card photo (with an optional note like _"met at SaaStr, wants a demo"_) and I'll read the details and post an add-contact card. Multiple people in one photo? I'll post one card each.
+• Send a badge or business-card photo (with an optional note like _"met at SaaStr, wants a demo"_) and I'll read the details and post an add-contact card. Say _"as a prospect"_ to also create a deal. Multiple people in one photo? I'll post one card each.
 • Send a screenshot of a WhatsApp/LinkedIn message and I'll pull out the sender as a new contact.
 
 *Update HubSpot*
@@ -472,11 +474,21 @@ async function runAgentTurn(
   }
 }
 
+function wantsProspectDeal(context: string): boolean {
+  const lower = context.toLowerCase();
+  return (
+    /\bas a prospect\b/.test(lower) ||
+    /\bwith a deal\b/.test(lower) ||
+    /\badd (?:them|him|her|this) to (?:the )?pipeline\b/.test(lower) ||
+    /\bcreate (?:a )?deal\b/.test(lower)
+  );
+}
+
 /**
  * Handles a mention/message that includes image attachments: downloads each
  * image, runs vision OCR to extract lead(s) from badges/business cards or
- * WhatsApp/LinkedIn screenshots, and posts an add-prospect approval card per
- * person found. Approval creates the full contact + company + deal.
+ * WhatsApp/LinkedIn screenshots, and posts an add-contact approval card per
+ * person found (or add-prospect when the caption asks for a deal).
  */
 async function runImageCapture(
   client: App["client"],
@@ -524,9 +536,25 @@ async function runImageCapture(
       await post(text);
     };
 
+    const filtered = filterImageFiles({ files });
+    if (filtered.images.length === 0) {
+      if (filtered.skippedUnsupported > 0) {
+        await finish(
+          "Those images aren't supported (use JPEG/PNG/WebP — not HEIC). Re-export or screenshot and try again.",
+        );
+        return;
+      }
+      if (filtered.skippedTooLarge > 0) {
+        await finish("Those images are too large — try a smaller photo.");
+        return;
+      }
+      await finish("No image attachments found.");
+      return;
+    }
+
     const botToken = process.env.SLACK_BOT_TOKEN ?? "";
     const dataUrls: string[] = [];
-    for (const file of files) {
+    for (const file of filtered.images) {
       const url = await fetchSlackImageAsDataUrl(file, botToken);
       if (url) {
         dataUrls.push(url);
@@ -546,7 +574,26 @@ async function runImageCapture(
       return;
     }
 
+    const toolName = wantsProspectDeal(context) ? "add_prospect" : "add_contact";
     const ctx: ToolContext = { client, channel, threadTs, userId };
+    let cardsPosted = 0;
+    const messages: string[] = [];
+    const history = conversations.get(conversationKey) ?? [];
+    if (context) {
+      history.push({
+        role: "user",
+        content: context.startsWith("[image]")
+          ? context
+          : `[image] ${context}`,
+      });
+    } else {
+      history.push({
+        role: "user",
+        content: "[image] Extracted lead(s) from attached photo(s).",
+      });
+    }
+
+    let toolCallSeq = 0;
     for (const lead of leads) {
       const args: Record<string, unknown> = {
         first_name: lead.firstName,
@@ -560,14 +607,79 @@ async function runImageCapture(
         source: lead.source || context || undefined,
         notes: lead.notes,
       };
-      await executeTool("add_contact", args, ctx);
+      let result: string;
+      try {
+        result = await executeTool(toolName, args, ctx);
+      } catch (error) {
+        result =
+          error instanceof Error
+            ? `Error: ${error.message}`
+            : "Error creating that contact.";
+      }
+
+      const toolCallId = `img_${toolCallSeq++}`;
+      history.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: toolCallId,
+            type: "function",
+            function: {
+              name: toolName,
+              arguments: JSON.stringify(args),
+            },
+          },
+        ],
+      } as OpenAI.Chat.Completions.ChatCompletionAssistantMessageParam);
+      history.push({
+        role: "tool",
+        tool_call_id: toolCallId,
+        content: result,
+      });
+
+      if (result.startsWith("[card ready]")) {
+        cardsPosted += 1;
+        continue;
+      }
+
+      const pickText = extractPickUserText(result);
+      if (pickText || isPickToolResult(result)) {
+        messages.push(pickText ?? sanitizeSlackReply(result));
+        continue;
+      }
+
+      messages.push(sanitizeSlackReply(result));
     }
 
-    await finish(
-      leads.length === 1
-        ? "Review the card above — Approve or Discard."
-        : `Review the ${leads.length} cards above — Approve or Discard.`,
-    );
+    if (history.length > MAX_HISTORY_MESSAGES) {
+      history.splice(0, history.length - MAX_HISTORY_MESSAGES);
+    }
+    conversations.set(conversationKey, history);
+
+    if (cardsPosted > 0 && messages.length === 0) {
+      await finish(
+        cardsPosted === 1
+          ? "Review the card above — Approve or Discard."
+          : `Review the ${cardsPosted} cards above — Approve or Discard.`,
+      );
+      return;
+    }
+
+    if (cardsPosted > 0) {
+      messages.unshift(
+        cardsPosted === 1
+          ? "Review the card above — Approve or Discard."
+          : `Review the ${cardsPosted} cards above — Approve or Discard.`,
+      );
+    }
+
+    if (messages.length === 0) {
+      await finish("Couldn't create contacts from those images.");
+      return;
+    }
+
+    await finish(messages.join("\n\n"));
   } catch (error) {
     console.error("[image-capture] failed:", error);
     try {

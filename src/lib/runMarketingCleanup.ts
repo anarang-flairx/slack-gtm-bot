@@ -1,5 +1,8 @@
 import type { App } from "@slack/bolt";
-import { listRecentRecordsWithActivity } from "../integrations/hubspot.js";
+import {
+  findExistingCompanyForContact,
+  listRecentRecordsWithActivity,
+} from "../integrations/hubspot.js";
 import { activitySnippet, classifyRecentMarketing } from "./classifyMarketing.js";
 import { savePendingCleanup } from "./cleanupStore.js";
 import {
@@ -29,7 +32,12 @@ function sleep(ms: number): Promise<void> {
 export async function postRecentMarketingCleanup(
   ctx: CleanupPostContext,
   maxRecords = 40,
-): Promise<{ contacts: number; companies: number; truncated: boolean }> {
+): Promise<{
+  contacts: number;
+  companies: number;
+  truncated: boolean;
+  skippedExistingCompany: number;
+}> {
   const lookbackHours = Number(process.env.CLEANUP_LOOKBACK_HOURS ?? 24) || 24;
   const createdAfterMs = Date.now() - lookbackHours * 60 * 60 * 1000;
   const { records, truncated } = await listRecentRecordsWithActivity(
@@ -40,11 +48,25 @@ export async function postRecentMarketingCleanup(
 
   const contacts: PendingCleanupContact[] = [];
   const companies: PendingCleanupCompany[] = [];
+  let skippedExistingCompany = 0;
 
   for (const record of records) {
     const verdict = classified.get(`${record.objectType}:${record.id}`);
     if (!verdict?.marketing) {
       continue;
+    }
+    if (record.objectType === "contacts") {
+      const existing = await findExistingCompanyForContact(
+        record.id,
+        createdAfterMs,
+      );
+      if (existing) {
+        skippedExistingCompany += 1;
+        console.log(
+          `[cleanup] Skipping ${record.name} (${record.email || record.id}) — associated with existing company ${existing.name}`,
+        );
+        continue;
+      }
     }
     const snippet = activitySnippet(record);
     if (record.objectType === "contacts") {
@@ -69,7 +91,12 @@ export async function postRecentMarketingCleanup(
   }
 
   if (contacts.length === 0 && companies.length === 0) {
-    return { contacts: 0, companies: 0, truncated };
+    return {
+      contacts: 0,
+      companies: 0,
+      truncated,
+      skippedExistingCompany,
+    };
   }
 
   await ctx.client.chat.postMessage({
@@ -124,5 +151,6 @@ export async function postRecentMarketingCleanup(
     contacts: contacts.length,
     companies: companies.length,
     truncated,
+    skippedExistingCompany,
   };
 }

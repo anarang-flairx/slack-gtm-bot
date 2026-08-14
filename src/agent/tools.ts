@@ -221,7 +221,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "post_digest",
       description:
-        "Build and post the GTM daily digest (pipeline snapshot, stalled deals, follow-ups due, overdue tasks) to the configured digest channel.",
+        "Build and post the GTM daily digest to the configured digest channel: open deals that need a follow-up, each with a short why from notes/emails, plus a Draft follow-up button.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -1038,6 +1038,9 @@ export async function runCleanupMarketing(ctx: ToolContext): Promise<string> {
   const lookbackHours = Number(process.env.CLEANUP_LOOKBACK_HOURS ?? 24) || 24;
   const posted = await postRecentMarketingCleanup(ctx);
   if (posted.contacts === 0 && posted.companies === 0) {
+    if (posted.skippedExistingCompany > 0) {
+      return `No marketing junk to review in the last ${lookbackHours} hours — ${posted.skippedExistingCompany} contact(s) were on companies you already have.`;
+    }
     return `No marketing/auto-created junk contacts or companies found in the last ${lookbackHours} hours.`;
   }
   return CARD_READY;

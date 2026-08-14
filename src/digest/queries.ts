@@ -1,13 +1,18 @@
+import OpenAI from "openai";
 import {
   batchReadCompanies,
+  getDealFollowUpBundle,
+  getDealStageLabels,
   getLeadStatusMap,
   getPipelineMeta,
   latestNoteTimestampMs,
   searchObjects,
+  type DealFollowUpBundle,
 } from "../integrations/hubspot.js";
 import {
   contactActivityDateProperty,
   dealActivityDateProperty,
+  WRITABLE_LAST_ACTIVITY_FALLBACK,
 } from "../lib/noteProperties.js";
 import {
   daysAgoMs,
@@ -61,6 +66,15 @@ export type StalledDeal = OpenDeal & {
   daysQuiet: number;
 };
 
+export type DealFollowUp = OpenDeal & {
+  daysQuiet: number;
+  why: string;
+  contactId: string;
+  contactName: string;
+  contactEmail: string;
+  canDraft: boolean;
+};
+
 export type FollowUpContact = {
   id: string;
   name: string;
@@ -106,7 +120,10 @@ function parseAmount(value: string | null | undefined): number | null {
 }
 
 export async function queryOpenDeals(): Promise<PipelineSnapshot> {
-  const pipeline = await getPipelineMeta();
+  const [pipeline, stageLabels] = await Promise.all([
+    getPipelineMeta(),
+    getDealStageLabels(),
+  ]);
   const results = await searchObjects("deals", {
     filterGroups: [
       {
@@ -126,6 +143,7 @@ export async function queryOpenDeals(): Promise<PipelineSnapshot> {
       "closedate",
       "hs_lastmodifieddate",
       dealActivityDateProperty(),
+      WRITABLE_LAST_ACTIVITY_FALLBACK,
       "hubspot_owner_id",
     ],
     sorts: [{ propertyName: "amount", direction: "DESCENDING" }],
@@ -136,15 +154,22 @@ export async function queryOpenDeals(): Promise<PipelineSnapshot> {
 
   const deals: OpenDeal[] = results.map((deal) => {
     const stageId = deal.properties.dealstage ?? "";
+    const activityMs = Math.max(
+      parseMs(deal.properties[activityDateProp]) ?? 0,
+      parseMs(deal.properties[WRITABLE_LAST_ACTIVITY_FALLBACK]) ?? 0,
+    );
     return {
       id: deal.id,
       name: deal.properties.dealname?.trim() || "Untitled deal",
       amount: parseAmount(deal.properties.amount),
       stageId,
-      stageLabel: pipeline.stageById.get(stageId)?.label ?? stageId,
+      stageLabel:
+        stageLabels.get(stageId) ??
+        pipeline.stageById.get(stageId)?.label ??
+        stageId,
       closeDate: deal.properties.closedate ?? null,
       lastModified: parseMs(deal.properties.hs_lastmodifieddate),
-      notesLastUpdated: parseMs(deal.properties[activityDateProp]),
+      notesLastUpdated: activityMs > 0 ? activityMs : null,
       createdAt: deal.createdAt ? Date.parse(deal.createdAt) : null,
     };
   });
@@ -305,6 +330,273 @@ export async function queryStalledDeals(): Promise<StalledDeal[]> {
         deal.daysQuiet >= (lateStageSet.has(deal.stageId) ? lateDays : earlyDays),
     )
     .sort((a, b) => b.daysQuiet - a.daysQuiet);
+}
+
+const PAUSED_STAGE_LABELS = new Set([
+  "on hold",
+  "inactive relationship",
+  "nurture",
+]);
+
+const LATE_STAGE_LABELS = new Set([
+  "demo completed",
+  "proposal sent",
+  "negotiation",
+  "active relationship",
+  "meeting complete",
+]);
+
+function snippet(text: string, max = 90): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return "";
+  }
+  return compact.length > max ? `${compact.slice(0, max - 1)}…` : compact;
+}
+
+function lastNoteLine(notes: string): string {
+  const lines = notes
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines[lines.length - 1] ?? "";
+}
+
+function emailDirectionLabel(direction: string): string {
+  const upper = direction.toUpperCase();
+  if (upper.includes("OUT")) {
+    return "outbound";
+  }
+  if (upper.includes("IN")) {
+    return "inbound";
+  }
+  return "";
+}
+
+function formatCloseDate(value: string): string {
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    return "past due";
+  }
+  return new Date(parsed).toLocaleDateString("en-US", {
+    timeZone: "America/Los_Angeles",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function heuristicWhy(
+  deal: OpenDeal,
+  daysQuiet: number,
+  pastClose: boolean,
+  bundle: DealFollowUpBundle,
+): string {
+  const parts: string[] = [];
+  if (pastClose && deal.closeDate) {
+    parts.push(
+      `Close date was ${formatCloseDate(deal.closeDate)}; still ${deal.stageLabel}`,
+    );
+  } else {
+    parts.push(`${daysQuiet}d quiet in ${deal.stageLabel}`);
+  }
+
+  const lastEmail = bundle.emails[0];
+  if (lastEmail) {
+    const dir = emailDirectionLabel(lastEmail.direction);
+    const subject = lastEmail.subject
+      ? `"${snippet(lastEmail.subject, 48)}"`
+      : "no subject";
+    parts.push(`Last email${dir ? ` ${dir}` : ""}: ${subject}`);
+  }
+
+  const noteBody =
+    bundle.notes.find((note) => note.body.trim())?.body ||
+    lastNoteLine(bundle.dealNotes) ||
+    lastNoteLine(bundle.company?.notes ?? "");
+  if (noteBody) {
+    parts.push(`Last note: ${snippet(noteBody, 80)}`);
+  } else if (!lastEmail) {
+    parts.push("No notes or logged emails");
+  }
+
+  return parts.join(". ");
+}
+
+async function mapPool<T, R>(
+  items: T[],
+  size: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = [];
+  for (let i = 0; i < items.length; i += size) {
+    const chunk = items.slice(i, i + size);
+    out.push(...(await Promise.all(chunk.map(fn))));
+  }
+  return out;
+}
+
+async function polishFollowUpReasons(
+  rows: Array<{
+    id: string;
+    name: string;
+    stageLabel: string;
+    why: string;
+    activity: string;
+  }>,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (!process.env.OPENAI_API_KEY || rows.length === 0) {
+    return out;
+  }
+
+  try {
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const model = process.env.OPENAI_CHEAP_MODEL ?? "gpt-4.1-mini";
+    const completion = await openai.chat.completions.create({
+      model,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            'You write one-sentence GTM follow-up reasons. Be specific to the deal\'s notes/emails. No fluff, no "it looks like". Max 140 characters. Reply JSON: {"results":[{"id":"...","why":"..."}]}',
+        },
+        {
+          role: "user",
+          content: JSON.stringify(
+            rows.map((row) => ({
+              id: row.id,
+              deal: row.name,
+              stage: row.stageLabel,
+              facts: row.why,
+              activity: row.activity.slice(0, 1200),
+            })),
+          ),
+        },
+      ],
+    });
+    const raw = completion.choices[0]?.message?.content ?? "{}";
+    const parsed = JSON.parse(raw) as {
+      results?: Array<{ id?: string; why?: string }>;
+    };
+    for (const result of parsed.results ?? []) {
+      if (result.id && result.why?.trim()) {
+        out.set(result.id, result.why.trim());
+      }
+    }
+  } catch (error) {
+    console.warn("[digest] follow-up why polish failed:", error);
+  }
+  return out;
+}
+
+function stallThresholdDays(stageLabel: string): number {
+  const lateDays = envInt("STALL_DAYS_LATE_STAGE", 7);
+  const earlyDays = envInt("STALL_DAYS_EARLY_STAGE", 14);
+  return LATE_STAGE_LABELS.has(stageLabel.trim().toLowerCase())
+    ? lateDays
+    : earlyDays;
+}
+
+/**
+ * Open deals that need a follow-up: quiet past the stage threshold, or past
+ * close date. Skips intentionally paused stages (On Hold / Nurture / Inactive).
+ */
+export async function queryDealsNeedingFollowUp(
+  deals: OpenDeal[],
+): Promise<DealFollowUp[]> {
+  const now = Date.now();
+  const todayStart = startOfTodayMs();
+  const maxRows = Math.max(envInt("DIGEST_MAX_ROWS", 8) * 2, 12);
+
+  const active = deals.filter(
+    (deal) => !PAUSED_STAGE_LABELS.has(deal.stageLabel.trim().toLowerCase()),
+  );
+
+  const withQuiet = await mapPool(active, 5, async (deal) => {
+    const nativeMs = await latestNoteTimestampMs("deals", deal.id).catch(
+      () => null,
+    );
+    const quietFrom =
+      Math.max(deal.notesLastUpdated ?? 0, nativeMs ?? 0) ||
+      deal.createdAt ||
+      0;
+    const closeMs = deal.closeDate ? Date.parse(deal.closeDate) : NaN;
+    const pastClose = Number.isFinite(closeMs) && closeMs < todayStart;
+    return {
+      deal,
+      daysQuiet: daysSince(quietFrom || null, now),
+      pastClose,
+    };
+  });
+
+  const candidates = withQuiet
+    .filter(
+      (row) =>
+        row.pastClose ||
+        row.daysQuiet >= stallThresholdDays(row.deal.stageLabel),
+    )
+    .sort((a, b) => {
+      if (a.pastClose !== b.pastClose) {
+        return a.pastClose ? -1 : 1;
+      }
+      return b.daysQuiet - a.daysQuiet;
+    })
+    .slice(0, maxRows);
+
+  const enriched = await mapPool(candidates, 4, async (row) => {
+    const bundle = await getDealFollowUpBundle(row.deal.id).catch(
+      (): DealFollowUpBundle => ({
+        dealId: row.deal.id,
+        dealNotes: "",
+        company: null,
+        contacts: [],
+        notes: [],
+        emails: [],
+      }),
+    );
+    const contact =
+      bundle.contacts.find((c) => c.email) ?? bundle.contacts[0];
+    const activity = [
+      ...bundle.notes.map((n) => n.body),
+      ...bundle.emails.map(
+        (e) => `${e.subject} ${e.body}`.trim(),
+      ),
+      bundle.dealNotes,
+      bundle.company?.notes ?? "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    return {
+      ...row.deal,
+      daysQuiet: row.daysQuiet,
+      why: heuristicWhy(row.deal, row.daysQuiet, row.pastClose, bundle),
+      contactId: contact?.id ?? "",
+      contactName: contact?.name ?? "",
+      contactEmail: contact?.email ?? "",
+      canDraft: Boolean(contact?.email),
+      activity,
+    };
+  });
+
+  const polished = await polishFollowUpReasons(
+    enriched.map((row) => ({
+      id: row.id,
+      name: row.name,
+      stageLabel: row.stageLabel,
+      why: row.why,
+      activity: row.activity,
+    })),
+  );
+
+  return enriched.map((row) => {
+    const { activity: _activity, ...rest } = row;
+    return {
+      ...rest,
+      why: polished.get(row.id) || row.why,
+    };
+  });
 }
 
 export async function queryFollowUpContacts(): Promise<FollowUpContact[]> {

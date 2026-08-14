@@ -1,7 +1,7 @@
 import type { App } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
 import { hubspotRecordUrl } from "../digest/format.js";
-import { updateObjectProperties } from "../integrations/hubspot.js";
+import { touchLastActivity, updateObjectProperties } from "../integrations/hubspot.js";
 import {
   beginLeadStatusAction,
   completeLeadStatusAction,
@@ -86,6 +86,11 @@ export function registerLeadStatusActions(app: App): void {
       await updateObjectProperties("contacts", pending.contactId, {
         hs_lead_status: pending.statusValue,
       });
+      await touchLastActivity(
+        "contacts",
+        pending.contactId,
+        `Lead status → ${pending.statusLabel}`,
+      );
 
       completeLeadStatusAction(pendingId);
 

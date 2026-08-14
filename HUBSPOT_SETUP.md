@@ -13,6 +13,7 @@ Flare requires this setup to exist in HubSpot before launch (PRD sections 7.1 an
    - `crm.schemas.deals.read` (pipelines)
    - `crm.objects.owners.read` (optional — may not appear on Service Keys)
    - `crm.objects.tasks.read` (for `/digest` overdue tasks)
+   - `crm.objects.notes.write` (native notes — this is what updates **Last Activity Date**)
 4. Copy the service key into `HUBSPOT_ACCESS_TOKEN` in `.env`.
 
 `HUBSPOT_ACCESS_TOKEN` holds the service key — use it as a Bearer token in API requests, same as a legacy private-app token.
