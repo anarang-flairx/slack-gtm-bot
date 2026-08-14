@@ -490,7 +490,7 @@ export function buildReminderPreviewBlocks(
   recordName: string,
   recordType: NoteRecordMatch["type"],
   dueLabel: string,
-  days: number,
+  delayLabel: string,
   note: string,
   pendingId: string,
 ): KnownBlock[] {
@@ -503,7 +503,7 @@ export function buildReminderPreviewBlocks(
       type: "section",
       fields: [
         { type: "mrkdwn", text: `*Record:*\n${recordName} (${recordType})` },
-        { type: "mrkdwn", text: `*When:*\nin ${days} day(s) — ${dueLabel}` },
+        { type: "mrkdwn", text: `*When:*\nin ${delayLabel} — ${dueLabel}` },
       ],
     },
     ...(note

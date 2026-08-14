@@ -393,7 +393,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "schedule_follow_up",
       description:
-        "Set a follow-up reminder for a contact, company, or deal in N days. Posts an approval card; on approve it creates a HubSpot task due then AND schedules a Slack nudge. Use for 'remind me to follow up with X in N days'.",
+        "Set a follow-up reminder for a contact, company, or deal. Supports minutes, hours, or days (e.g. 'in 2 minutes', 'in 3 hours', 'in 2 days'). Posts an approval card; on approve it creates a HubSpot task due then AND schedules a Slack nudge. Prefer minutes for short delays.",
       parameters: {
         type: "object",
         properties: {
@@ -401,16 +401,24 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
             type: "string",
             description: "Contact, company, or deal name",
           },
+          minutes: {
+            type: "number",
+            description: "Minutes from now (use for short delays like 2 minutes)",
+          },
+          hours: {
+            type: "number",
+            description: "Hours from now",
+          },
           days: {
             type: "number",
-            description: "Days from now until the reminder (e.g. 2)",
+            description: "Days from now (e.g. 2)",
           },
           note: {
             type: "string",
             description: "Optional context for the reminder",
           },
         },
-        required: ["name", "days"],
+        required: ["name"],
       },
     },
   },
@@ -926,12 +934,65 @@ async function runDraftCustomEmail(
   return CARD_READY;
 }
 
+function resolveReminderDelay(args: Record<string, unknown>): {
+  dueMs: number;
+  delayLabel: string;
+  days: number;
+} {
+  const minutes = Number(args.minutes);
+  const hours = Number(args.hours);
+  const days = Number(args.days);
+
+  if (Number.isFinite(minutes) && minutes > 0) {
+    const m = Math.max(1, Math.round(minutes));
+    return {
+      dueMs: Date.now() + m * 60_000,
+      delayLabel: m === 1 ? "1 minute" : `${m} minutes`,
+      days: m / (24 * 60),
+    };
+  }
+  if (Number.isFinite(hours) && hours > 0) {
+    const h = Math.max(1, Math.round(hours));
+    return {
+      dueMs: Date.now() + h * 3_600_000,
+      delayLabel: h === 1 ? "1 hour" : `${h} hours`,
+      days: h / 24,
+    };
+  }
+  if (Number.isFinite(days) && days > 0) {
+    // Support fractional days from the model, but never round short delays to 0.
+    const ms = Math.max(60_000, Math.round(days * 86_400_000));
+    const whole = Math.round(days);
+    const delayLabel =
+      whole >= 1 && Math.abs(days - whole) < 0.05
+        ? whole === 1
+          ? "1 day"
+          : `${whole} days`
+        : `${days} day(s)`;
+    return {
+      dueMs: Date.now() + ms,
+      delayLabel,
+      days,
+    };
+  }
+
+  // Default: 1 day if the model forgot a delay.
+  return {
+    dueMs: Date.now() + 86_400_000,
+    delayLabel: "1 day",
+    days: 1,
+  };
+}
+
 async function runScheduleFollowUp(
   ctx: ToolContext,
-  name: string,
-  days: number,
-  note: string,
+  args: Record<string, unknown>,
 ): Promise<string> {
+  const name = String(args.name ?? "").trim();
+  if (!name) {
+    return "Missing name.";
+  }
+
   const result = await findNoteRecords(name);
   if (Array.isArray(result)) {
     return pickPrompt(
@@ -941,20 +1002,23 @@ async function runScheduleFollowUp(
     );
   }
 
-  const safeDays = Number.isFinite(days) && days > 0 ? Math.round(days) : 1;
-  const dueMs = Date.now() + safeDays * 86_400_000;
-  const dueLabel = new Date(dueMs).toLocaleDateString("en-US", {
+  const { dueMs, delayLabel, days } = resolveReminderDelay(args);
+  const dueLabel = new Date(dueMs).toLocaleString("en-US", {
     timeZone: "America/Los_Angeles",
     month: "short",
     day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
   });
+  const note = args.note ? String(args.note).trim() : "";
 
   const pending = savePendingReminder({
     recordType: result.type,
     recordId: result.id,
     recordName: result.name,
     note,
-    days: safeDays,
+    delayLabel,
+    days,
     dueMs,
     createdBy: ctx.userId,
     channelId: ctx.channel,
@@ -968,7 +1032,7 @@ async function runScheduleFollowUp(
       result.name,
       result.type,
       dueLabel,
-      safeDays,
+      delayLabel,
       note,
       pending.id,
     ),
@@ -1205,12 +1269,7 @@ export async function executeTool(
       return runMoveDealStage(ctx, args);
 
     case "schedule_follow_up":
-      return runScheduleFollowUp(
-        ctx,
-        String(args.name ?? ""),
-        typeof args.days === "number" ? args.days : Number(args.days ?? 0),
-        args.note ? String(args.note) : "",
-      );
+      return runScheduleFollowUp(ctx, args);
 
     case "cleanup_marketing_records":
       return runCleanupMarketing(ctx);

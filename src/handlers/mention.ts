@@ -36,7 +36,7 @@ You can:
 - Add a new contact (+ optional company), or a full prospect with a deal in Prospecting when explicitly requested.
 - Create a deal on an existing company (named "[Company] - FlairX") and associate all of that company's contacts.
 - Move a deal to a different pipeline stage.
-- Set a follow-up reminder in N days (creates a HubSpot task + a scheduled Slack nudge).
+- Set a follow-up reminder in minutes, hours, or days (creates a HubSpot task + a scheduled Slack nudge).
 - Draft templated or custom emails into Gmail Drafts, and find sent emails that have not been replied to.
 - Summarize an email thread into notes on the matching contact and its company.
 - Clean up inbound marketing contacts/companies created in the last 24 hours after reviewing logged emails (cleanup_marketing_records — one approval card per record; also runs daily at 8am).
@@ -95,7 +95,7 @@ const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 • Move a deal stage — _"move the Acme deal to Negotiation"_
 
 *Reminders*
-• Follow-up reminder — _"remind me to follow up with Acme in 2 days"_ (creates a HubSpot task + a scheduled Slack nudge)
+• Follow-up reminder — _"remind me to follow up with Acme in 2 days"_ or _"in 5 minutes"_ (HubSpot task + Slack nudge)
 
 *Cleanup*
 • Marketing junk — daily at 8am (last 24h emails): summary + Approve/Discard per contact/company. Or type _cleanup_
@@ -368,14 +368,18 @@ async function runAgentTurn(
     const model = isTrivialReply(userMessage) ? CHEAP_MODEL : MODEL;
     let reply = "";
     let historyReply = "";
+    const openaiTimeoutMs = Number(process.env.OPENAI_TIMEOUT_MS ?? 90_000) || 90_000;
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-      const completion = await openai!.chat.completions.create({
-        model,
-        messages,
-        tools: toolDefinitions,
-        tool_choice: "auto",
-      });
+      const completion = await openai!.chat.completions.create(
+        {
+          model,
+          messages,
+          tools: toolDefinitions,
+          tool_choice: "auto",
+        },
+        { signal: AbortSignal.timeout(openaiTimeoutMs) },
+      );
 
       const choice = completion.choices[0]?.message;
       if (!choice) {
@@ -466,8 +470,15 @@ async function runAgentTurn(
     await finish(reply);
   } catch (error) {
     console.error("[agent] turn failed:", error);
+    const timedOut =
+      error instanceof Error &&
+      (error.name === "TimeoutError" || /aborted|timeout/i.test(error.message));
     try {
-      await finish("Error — try again.");
+      await finish(
+        timedOut
+          ? "Timed out — try again (or use a shorter request)."
+          : "Error — try again.",
+      );
     } catch (postError) {
       console.error("[agent] failed to post error reply:", postError);
     }
