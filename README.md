@@ -145,7 +145,7 @@ Sign in as the sending account, then copy `GOOGLE_REFRESH_TOKEN` and `GMAIL_SEND
 
 ### HubSpot setup
 
-Complete the one-time HubSpot checklist: [HUBSPOT_SETUP.md](HUBSPOT_SETUP.md)
+Complete the one-time HubSpot checklist: [PRD.md § 11](PRD.md#11-hubspot-setup-checklist-one-time)
 
 Deal pipeline stages (must match exactly):
 
@@ -168,14 +168,14 @@ slack-gtm-bot/
 │   ├── handlers/         # mention loop + Approve/Discard action handlers
 │   ├── integrations/     # hubspot.ts, gmail.ts
 │   ├── lib/              # previews (Block Kit), stores, note/draft helpers
+│   ├── jobs/             # email→notes logger, daily cleanup scheduler
 │   └── digest/           # daily digest queries + blocks
-├── PRD.md                # Full product requirements
-├── HUBSPOT_SETUP.md      # HubSpot one-time setup checklist
+├── PRD.md                # Product requirements + as-built reference + HubSpot setup
 ├── .env.example
 └── package.json
 ```
 
-See [PRD.md](PRD.md) for full requirements, architecture, data model, and success metrics.
+See [PRD.md](PRD.md) for requirements, architecture, and data model. [Section 10](PRD.md#10-as-built-functionality-current-implementation) is the as-built reference for everything the bot does today; [Section 11](PRD.md#11-hubspot-setup-checklist-one-time) is the HubSpot setup checklist.
 
 ## Slack channels
 

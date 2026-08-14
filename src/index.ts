@@ -11,7 +11,6 @@ import { registerLeadStatusActions } from "./handlers/leadStatusActions.js";
 import { registerProspectActions } from "./handlers/prospectActions.js";
 import { registerReminderActions } from "./handlers/reminderActions.js";
 import { registerStageMoveActions } from "./handlers/stageMoveActions.js";
-import { runEmailNoteSync } from "./jobs/emailNoteLogger.js";
 import { startMarketingCleanupScheduler } from "./jobs/marketingCleanup.js";
 
 const echoMode = process.env.DEV_ECHO_MODE === "true";
@@ -55,35 +54,8 @@ registerLeadStatusActions(app);
 registerCleanupActions(app);
 registerDigestActions(app);
 
-function startEmailNoteLogger(): void {
-  if (echoMode || !openai) {
-    return;
-  }
-  if (process.env.EMAIL_LOG_ENABLED !== "true") {
-    return;
-  }
-  if (!process.env.GOOGLE_REFRESH_TOKEN) {
-    console.warn(
-      "[email-log] EMAIL_LOG_ENABLED=true but GOOGLE_REFRESH_TOKEN is missing; skipping. Run: npm run gmail-auth",
-    );
-    return;
-  }
-
-  const minutes = Number(process.env.EMAIL_LOG_POLL_MINUTES ?? 5) || 5;
-  const tick = () =>
-    runEmailNoteSync(openai, app.client).catch((error) =>
-      console.error("[email-log] sync failed:", error),
-    );
-
-  // First run establishes a baseline; subsequent runs log new sent mail.
-  setTimeout(tick, 10_000);
-  setInterval(tick, minutes * 60_000);
-  console.log(`[email-log] Auto-logging sent emails to notes every ${minutes}m.`);
-}
-
 (async () => {
   await app.start();
-  startEmailNoteLogger();
   startMarketingCleanupScheduler(app.client);
   console.log(
     echoMode
