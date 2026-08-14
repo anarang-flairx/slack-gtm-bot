@@ -96,9 +96,11 @@ const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 
 *Reminders*
 • Follow-up reminder — _"remind me to follow up with Acme in 2 days"_ or _"in 5 minutes"_ (HubSpot task + Slack nudge)
+• Missing email — if I create a contact, company, or deal with no email address, I set a reminder to go get one (24h by default)
 
 *Cleanup*
 • Marketing junk — daily at 8am (last 24h emails): summary + Approve/Discard per contact/company. Or type _cleanup_
+• Unnamed companies — daily at 8am: one Approve/Discard card per blank-name company (archives it and its contacts together). Nothing is ever archived without your click.
 
 *Email (drafts only — I never send)*
 • Templated draft — _"draft an intro email to Jane Doe"_ or _"event follow-up to Jane Doe"_

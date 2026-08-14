@@ -2,10 +2,14 @@
 
 | | |
 |---|---|
-| **Document status** | Draft v1.0 |
+| **Document status** | v1.1 — partially shipped |
 | **Author** | GTM Team (Aayush Narang) |
-| **Last updated** | July 2, 2026 |
+| **Last updated** | August 14, 2026 |
 | **Audience** | Sections 1–5: exec / GTM team. Sections 6–9: engineering. |
+
+> **Sections 1–9 are the original product vision.** Parts of it shipped, parts changed shape during the build, and some features were never built (Apollo enrichment, slash commands, WhatsApp/LinkedIn commitment capture).
+>
+> **For what the bot actually does today, read [Section 10](#10-as-built-functionality-current-implementation).** Where 1–9 and 10 disagree, Section 10 is the truth. [Section 11](#11-hubspot-setup-checklist-one-time) is the one-time HubSpot setup.
 
 ---
 
@@ -226,8 +230,8 @@ Flare translates the question into HubSpot CRM Search API queries and answers wi
 
 ## 4. Non-Goals
 
-- **Flare never sends email autonomously.** It creates Gmail drafts only; a human always presses send. (Apollo sequences send, but those are configured and owned inside Apollo.)
-- **Flare never auto-advances deal stages.** Stage changes are human decisions made in HubSpot; the bot reads stages, it does not write them.
+- **Flare never sends email autonomously.** It creates Gmail drafts only; a human always presses send. (Apollo sequences send, but those are configured and owned inside Apollo.) — *Still true as built.*
+- **Flare never auto-advances deal stages.** ~~Stage changes are human decisions made in HubSpot; the bot reads stages, it does not write them.~~ — *Changed in build.* The bot **can** move a deal's stage via `move_deal_stage`, but only from an explicit request and only after the requester approves the card. It never advances a stage on its own initiative, which is what this non-goal was protecting. See 10.4.
 - **Flare does not replace HubSpot as the system of record.** It stores no CRM data of its own beyond nudge-scheduling state and Slack↔HubSpot ID mappings.
 - **No direct WhatsApp/LinkedIn API integration in v1** (see 3.3).
 - **No calendar booking.** Flare reminds about meetings; it does not schedule them (a Calendly/Google Calendar integration is a possible future addition).
@@ -323,7 +327,7 @@ flowchart LR
 - **APIs used**: CRM objects (contacts, companies, deals), associations, tasks/notes (engagements), CRM Search, pipelines API (to read the 7 stages: Prospecting → Initial Contact → Demonstration → Proposal Sent → Negotiation → Closed Won / Closed Lost).
 - **Rate limits (Starter, private app)**: 100 requests / 10 seconds, 250,000 / day — orders of magnitude above expected usage (a heavy conference day is a few hundred calls).
 - **Key constraint**: workflow-triggered Slack actions in HubSpot require Professional tier. This is precisely why Flare is a **custom Slack app talking to the HubSpot API directly** rather than relying on HubSpot's native Slack integration, which on Starter only supports basic notifications and slash-command search.
-- **Prerequisite setup (one-time, manual)**: create the custom properties listed in Section 8 and the 7-stage pipeline before launch. See the step-by-step [HUBSPOT_SETUP.md](HUBSPOT_SETUP.md) checklist.
+- **Prerequisite setup (one-time, manual)**: create the custom properties listed in Section 8 and the pipeline before launch. See the step-by-step checklist in [Section 11](#11-hubspot-setup-checklist-one-time).
 
 ### 7.2 Apollo — Basic Plan
 
@@ -340,7 +344,7 @@ flowchart LR
 ### 7.3 Gmail
 
 - **Auth**: Google Cloud OAuth app; one-time consent by the CEO.
-- **Scope**: `https://www.googleapis.com/auth/gmail.compose` **only** — create/update drafts; no inbox read access. (The scope allows sending, but the bot's code path only ever calls draft creation — see 6.4.)
+- **Scope**: ~~`gmail.compose` **only** — no inbox read access.~~ — *Changed in build.* The shipped bot uses `gmail.compose` **plus `gmail.readonly`**. Read access was needed for "who hasn't replied?" and email-thread summaries (10.6). The never-sends guarantee is unaffected and still enforced in code: only `drafts.create` is ever called, never `messages.send`.
 - **API**: `users.drafts.create` with a MIME message (to, subject, body).
 - Google verification note: an internal-use OAuth app for a Workspace domain can remain in "internal" mode, avoiding the public app-verification process.
 
@@ -438,6 +442,268 @@ Highest manual-labor savings; useful the very next conference.
 | OCR accuracy across badge formats (lanyards, glare, partial shots) | Confirmation-card human review is mandatory in v1; measure edit rate; prompt-tune per conference |
 | Apollo Basic API surface may gate specific endpoints | Fallback to OCR-only creation (7.2); verify endpoints in a spike during Phase 1 week 1 |
 | Apollo credit budget across the year | ~1–2 credits/lead ≈ thousands of leads/year of headroom; dashboard-monitor monthly |
-| HubSpot custom properties/pipeline must exist before launch | One-time setup checklist owned by GTM, done in Phase 1 — see [HUBSPOT_SETUP.md](HUBSPOT_SETUP.md) |
+| HubSpot custom properties/pipeline must exist before launch | One-time setup checklist owned by GTM, done in Phase 1 — see [Section 11](#11-hubspot-setup-checklist-one-time) |
 | CEO adoption of the forwarding habit | Make the flow one action (screenshot → Slack DM to Flare); track usage in week 1 of Phase 2 and simplify if unused |
 | LLM misreads a commitment date | Dates always shown on the confirmation card with `[Edit date]`; never silently scheduled |
+
+---
+
+## 10. As-built functionality (current implementation)
+
+Everything in this section is shipped and running. Where it contradicts Sections 1–9, this section wins.
+
+### 10.1 Interaction model
+
+**`@mention` is the only interface — there are no slash commands.** The `/leads …` commands in 3.2 were never built, and the earlier slash commands (`/intro-draft`, `/event-follow-up`, `/update-notes`, `/digest`, `/current-status`, `/add-prospect`) were removed. Delete them in the Slack app settings if you're upgrading, or they'll show `dispatch_failed`.
+
+- Mention the bot in plain English; an OpenAI tool-calling loop picks the action.
+- **Thread follow-ups need no second mention.** Once the bot has replied in a thread, plain messages there continue the conversation. This requires the `message.channels` / `message.groups` / `message.im` / `message.mpim` subscriptions.
+- Conversation history is kept per `channel:thread`, capped at 10 messages, in memory.
+- Model: `gpt-4.1` (`OPENAI_MODEL`). Short replies like "yes" or "the first one" route to `gpt-4.1-mini` (`OPENAI_CHEAP_MODEL`) — but bare numbers do not, since those are disambiguation picks that need tools.
+- Up to 8 tool iterations per turn; 90s OpenAI timeout (`OPENAI_TIMEOUT_MS`).
+- `help` and `cleanup` are deterministic fast paths that skip the model entirely.
+- When several records match, the bot posts a numbered list and you reply with the number.
+
+### 10.2 The approval model
+
+**Every write to HubSpot or Gmail posts an Approve/Discard card first.** The bot never completes a write itself, and never claims a record was created — only that a preview is ready.
+
+- Pending approvals live in memory with a **30-minute TTL**, are **owner-only** (only the requester can approve), and hold an **in-flight lock** so a double-click can't double-write.
+- Daily-job cards are the one exception: they carry a **12-hour TTL** and **anyone can approve** them, since nobody personally requested them.
+- A restart drops all pending approvals.
+
+### 10.3 Reading and answering
+
+| Ask | Tool |
+|---|---|
+| "what are the sales pipeline stages?" | `get_pipeline_stages` |
+| "what lead statuses do we have?" | `get_lead_statuses` |
+| "what lifecycle stages do companies have?" | `get_company_lifecycle_stages` |
+| "show me all customers" | `list_companies_by_lifecycle_stage` |
+| "look up Acme Corp" | `search_records` |
+| "what's the status of Acme Corp?" | `get_company_status` — posts a card with deals, contacts, notes, last activity |
+
+The status card and digest read **native HubSpot note engagements** as well as the bot's own custom note properties, so notes the CEO writes from Codex via the HubSpot MCP connection show up too.
+
+### 10.4 Writing to HubSpot
+
+| Action | Tool | Notes |
+|---|---|---|
+| Add a dated note | `update_notes` | Contact, company, or deal; also refreshes the last-activity date |
+| Change lead status | `update_lead_status` | Contact-only action |
+| Add a contact | `add_contact` | Contact + optional company, no deal — the default for "add X to HubSpot" |
+| Add a full prospect | `add_prospect` | Contact + company + deal in Prospecting; only for a genuinely new person |
+| Create a deal on a company | `create_company_deal` | Deal is always named `[Company] - FlairX`; every company contact is auto-associated |
+| Move a deal's stage | `move_deal_stage` | Existing deals only; stages are validated against **that deal's own pipeline** |
+| Set a follow-up reminder | `schedule_follow_up` | Minutes, hours, or days → HubSpot task + scheduled Slack nudge |
+
+**Deal creation is a deterministic wizard, not a model decision.** `create_company_deal` takes a company name only, then walks pipeline → stage → (Partnerships only) relationship type, then posts the card. The picks are handled in code, outside the model, so it can't invent stages or ids.
+
+**Duplicate protection.** Before creating, the tools check HubSpot for an existing contact (by email or name), company (exact name), or deal (company already has one). A hit reports the existing record with links instead of posting a create card. A second deal requires an explicit `force=true`.
+
+**Sales vs Partnerships** are handled differently throughout: Partnership deals carry a relationship type; sales deals don't, and the bot doesn't ask for a company lifecycle stage when creating one.
+
+### 10.5 Lead capture from photos — shipped without Apollo
+
+Section 3.1.1 is built; the full 3.1 vision (Apollo enrichment) is not.
+
+- Attach badge, business-card, or WhatsApp/LinkedIn screenshot photos to a mention, with optional context ("met at SaaStr, wants a demo").
+- Images are downloaded from Slack and run through vision OCR.
+- **One approval card per person detected** — several people in one photo produce several cards.
+- Defaults to `add_contact`; phrases like "as a prospect" or "with a deal" switch it to `add_prospect`.
+- JPEG/PNG/WebP only. HEIC is rejected with a message telling the user to re-export.
+- **No Apollo enrichment.** Fields are limited to what's printed plus what the user adds; company size, industry, ATS, and verified email are not auto-filled.
+
+### 10.6 Email
+
+Gmail access is **compose + read-only**. The bot never sends.
+
+| Action | Tool |
+|---|---|
+| Templated draft (intro / event follow-up) | `draft_email` |
+| Custom context-aware draft | `draft_custom_email` |
+| Find sent mail with no reply | `list_unanswered_emails` |
+| Read a thread | `get_email_thread` |
+| Summarize a thread into notes | `summarize_email_to_notes` — writes to the contact **and** its company |
+
+> **Every write in the bot is approval-gated.** An automatic sent-mail→notes logger was built and then **removed unshipped** (it was never enabled and never ran): it wrote LLM summaries of outbound mail into contact, company, and deal notes with no review step and no undo. Summarizing a thread into notes is still available on demand via `summarize_email_to_notes`, behind a card like everything else.
+
+### 10.7 Daily digest
+
+`post_digest`, or "post the digest". Posts to `DIGEST_CHANNEL`.
+
+- Pipeline snapshot: open deals, raw and weighted totals.
+- **Deals needing a follow-up**, decided by reading each deal's email chains and notes — not by a quiet-day threshold alone. Each row states *why* it needs attention and carries a **Draft follow-up** button.
+- Overdue HubSpot tasks, when present.
+- Each section is fetched independently, so one HubSpot failure degrades that section instead of killing the whole post.
+
+### 10.8 Cleanup
+
+Runs daily at `CLEANUP_HOUR` (default 8am `CLEANUP_TZ`), posting to `CLEANUP_CHANNEL` or `DIGEST_CHANNEL`. Two passes, **both approval-gated** — no record is ever archived without a human click.
+
+**Pass 1 — unnamed companies.** Finds companies created in the lookback window with a blank name and no deals, and posts one card per company covering that company *and* every contact on it. Approving archives the group and adds their emails/domain to Never Log.
+
+**Pass 2 — marketing junk.** Scans contacts and companies created in the last `CLEANUP_LOOKBACK_HOURS` (default 24), skipping internal emails and anything with a deal, then classifies in two tiers:
+
+1. **Heuristics** — `noreply`/`newsletter`/`marketing` addresses, auto-creation from HubSpot Conversations with no real activity, or ≥2 marketing keyword hits.
+2. **Model** — everything else with logged activity goes to `gpt-4.1-mini` in batches, prompted to flag only newsletters, automated senders, and cold spam.
+
+Records with no logged activity are skipped entirely, and a classification error fails toward *keeping* the record. Flagged contacts that belong to a company you already had are dropped as likely false positives. Survivors get **one card each**, showing the **logged email subject lines** — usually the fastest tell — plus the reason, a summary, and an activity snippet.
+
+Run Pass 2 on demand by typing `cleanup`. Archives are HubSpot archives (recycle bin, restorable ~90 days), not permanent deletes.
+
+### 10.9 Missing-email reminders
+
+When a record is created with no way to email anyone, the bot schedules a HubSpot task plus a Slack nudge (default 24h, `MISSING_EMAIL_REMINDER_HOURS`) to go find an address:
+
+- **Contact** — created with no email.
+- **Deal** — no associated contact has an email.
+- **Company** — newly created *and* has no domain. Reused companies are left alone.
+
+Set `MISSING_EMAIL_REMINDER=false` to disable. The reminder is fire-and-forget — a failure is logged, never surfaced as a creation failure.
+
+### 10.10 What was not built
+
+| PRD feature | Status |
+|---|---|
+| Apollo enrichment (3.1 steps 3, 7.2) | **Not built.** No Apollo integration at all — no enrichment, no sequence hand-off. |
+| WhatsApp/LinkedIn commitment capture (3.3) | **Partial.** Screenshots are OCR'd into *contacts*; commitment/date parsing into tasks + nudges was not built. |
+| `/leads` slash commands (3.2) | **Not built.** Replaced by `@mention`. |
+| Snooze / escalation / 3-miss `OVERDUE` marker (3.2) | **Not built.** |
+| Recurring daily/weekly `#gtm-pipeline` reports (3.5) | **Not built.** The daily digest covers part of this. |
+| Editable confirmation cards (`[Edit]` button) (3.1) | **Not built.** Cards are Approve/Discard; corrections are made by asking again. |
+| Prompt for loss reason / competitor on Closed Lost (Section 8) | **Not built.** |
+| Postgres/SQLite persistence (6.1) | **Changed.** See 10.11. |
+
+### 10.11 Runtime and storage, as built
+
+- **Node.js + TypeScript**, run directly through `tsx` — there is no build step.
+- **Slack Bolt in Socket Mode**; no public webhook.
+- Four runtime dependencies: `@slack/bolt`, `openai`, `googleapis`, `dotenv`.
+- **No database.** The Postgres/SQLite plan in 6.1 was not built. Pending approvals and conversation history are **in-memory** and lost on restart. Only four things persist, as JSON files:
+
+| File | Holds |
+|---|---|
+| `data/cleanup-schedule-state.json` | Last date the daily cleanup ran |
+| `data/digest-state.json` | Digest state |
+| `data/never-log.json` | Emails/domains recorded when a cleanup card is approved (see 10.8) |
+
+- **The scheduler is a 60-second poll, not cron.** It fires when the local hour is at/after `CLEANUP_HOUR` and it hasn't run yet that calendar day, so a bot that was down at 8am still runs when it comes back. The run date is written *before* the scan, so a mid-run crash costs a day rather than double-posting cards.
+- **No test suite.** `npx tsc --noEmit` is the only automated check.
+
+---
+
+## 11. HubSpot setup checklist (one-time)
+
+Do this once, manually, in the HubSpot UI before launch. ~30 minutes.
+
+### 11.1 Create a service key
+
+Settings → Integrations → **Service Keys** → **Create service key**, named `Flare GTM Bot`, with these scopes:
+
+- `crm.objects.contacts.read` / `.write`
+- `crm.objects.companies.read` / `.write`
+- `crm.objects.deals.read` / `.write`
+- `crm.schemas.deals.read` (pipelines)
+- `crm.objects.owners.read` (optional — may not appear on Service Keys)
+- `crm.objects.tasks.read` (digest overdue tasks) and task write (reminders)
+- `crm.objects.notes.write` (native notes — this is what updates **Last Activity Date**)
+
+Copy it into `HUBSPOT_ACCESS_TOKEN`. It's used as a Bearer token, same as a legacy private-app token. For record links in the digest and cards, also set:
+
+```bash
+HUBSPOT_PORTAL_ID=your-portal-id
+HUBSPOT_APP_HOST=app-na2.hubspot.com
+```
+
+Find the portal ID in any HubSpot URL (`/contacts/{portalId}/...`).
+
+### 11.2 Configure the sales pipeline
+
+Settings → Objects → Deals → Pipelines. The pipeline Flare uses (default `default`; override with `HUBSPOT_PIPELINE_ID`) needs exactly these stages, in order — **labels must match exactly**, since stages are looked up by label:
+
+1. Prospecting
+2. Initial Contact
+3. Demo Scheduled
+4. Demo Completed
+5. Proposal Sent
+6. Negotiation
+7. Closed Won
+8. Closed Lost
+
+### 11.3 Create custom properties
+
+Settings → Data Management → Properties. Internal names must match — the bot writes these exact names. All are overridable via env (see `.env.example`).
+
+**Contact**
+
+| Label | Internal name | Type |
+|---|---|---|
+| Role in hiring process | `role_in_hiring_process` | Text, or dropdown: Decision maker / Influencer / User / Unknown |
+| Industry focus | `industry_focus` | Single-line text |
+| Hiring urgency | `hiring_urgency` | Dropdown: high / medium / low |
+| Outreach Notes | `outreach_notes` | Multi-line text |
+| Last Contact Date | `last_contact_date` | Date |
+
+**Method of Contact already exists — do not create it.** Confirm its internal name (often `method_of_contact`) and set `HUBSPOT_METHOD_OF_CONTACT_PROPERTY`.
+
+**Company**
+
+| Label | Internal name | Type |
+|---|---|---|
+| Current ATS / hiring tools | `current_ats_hiring_tools` | Single-line text |
+| Industry vertical | `industry_vertical` | Single-line text |
+| Growth stage | `growth_stage` | Single-line text |
+| Contract type | `contract_type` | Dropdown |
+| Company Notes | `company_notes` | Multi-line text |
+| Last Activity Date | `notes_last_updated` | Date |
+| Relationship type | `relationship_type` | Dropdown: Referral, Partner, Investor, Advisor (Partnerships only) |
+
+**Deal**
+
+| Label | Internal name | Type |
+|---|---|---|
+| Lead source | `lead_source` | Single-line text (conference name) |
+| Loss reason | `loss_reason` | Dropdown or text |
+| Competitor evaluated | `competitor_evaluated` | Single-line text |
+| Deal Notes | `deal_notes` | Multi-line text |
+| Last Activity Date | `notes_last_updated` | Date |
+
+### 11.4 Find the pipeline IDs
+
+Needed when you have more than one deal pipeline.
+
+**Ask the bot:** `@FlairX GTM Bot what are the sales pipeline stages?` — the reply includes `(pipeline_id: …)` under each pipeline.
+
+**Or the API:**
+
+```bash
+node -e "fetch('https://api.hubapi.com/crm/v3/pipelines/deals', {headers:{Authorization:'Bearer '+process.env.HUBSPOT_ACCESS_TOKEN}}).then(r=>r.json()).then(d=>console.log(d.results.map(p=>({id:p.id,label:p.label,stages:p.stages.map(s=>s.label)}))))" --env-file=.env
+```
+
+Then set:
+
+```bash
+HUBSPOT_PIPELINE_ID=<sales-pipeline-id>
+HUBSPOT_PARTNERSHIP_PIPELINE_ID=<partnerships-pipeline-id>
+```
+
+If the bot shows the wrong stages for Partnerships, the wrong pipeline id is selected.
+
+### 11.5 Cleanup and channel setup
+
+Invite the bot to the digest/cleanup channel and set its ID. Cleanup needs the contacts and companies **write** scopes above.
+
+```bash
+# Never archive contacts on these domains (defaults to the GMAIL_SENDER_EMAIL domain, or flairx.ai)
+INTERNAL_EMAIL_DOMAINS=flairx.ai
+
+DIGEST_CHANNEL=C0123456789
+#CLEANUP_CHANNEL=C0123456789
+#CLEANUP_ENABLED=false
+#CLEANUP_HOUR=8
+#CLEANUP_TZ=America/Los_Angeles
+#CLEANUP_LOOKBACK_HOURS=24
+```
+
+See `.env.example` for the full list, including the note-property overrides and `MISSING_EMAIL_REMINDER*`.

@@ -1,9 +1,12 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { App } from "@slack/bolt";
-import { cleanupUnnamedCompanies } from "../integrations/hubspot.js";
-import { SCHEDULED_CLEANUP_USER } from "../lib/cleanupStore.js";
-import { addToNeverLog } from "../lib/neverLogStore.js";
+import { scanUnnamedCompanies } from "../integrations/hubspot.js";
+import {
+  SCHEDULED_CLEANUP_USER,
+  savePendingCleanup,
+} from "../lib/cleanupStore.js";
+import { buildUnnamedCompanyCleanupBlocks } from "../lib/previews.js";
 import { postRecentMarketingCleanup } from "../lib/runMarketingCleanup.js";
 
 const STATE_PATH =
@@ -77,104 +80,118 @@ async function saveState(state: ScheduleState): Promise<void> {
   await writeFile(STATE_PATH, JSON.stringify(state, null, 2));
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
- * Auto-archive blank-name companies (and their contacts) from the lookback
- * window, then add emails/domains to Never Log so email auto-logging skips them.
+ * Find blank-name companies (and their contacts) from the lookback window and
+ * post one Approve/Discard card each. Nothing is archived until someone clicks
+ * Approve; the archive and the Never Log update both happen in the handler.
  */
 export async function runScheduledUnnamedCompanyCleanup(
   client: App["client"],
-): Promise<{
-  archivedCompanies: number;
-  archivedContacts: number;
-  neverLogAdded: number;
-}> {
+): Promise<{ posted: number; candidates: number }> {
   const channel = cleanupChannel();
+  if (!channel) {
+    throw new Error(
+      "Missing CLEANUP_CHANNEL or DIGEST_CHANNEL — cannot post unnamed-company cleanup",
+    );
+  }
+
   const createdAfterMs = Date.now() - lookbackMs();
   const lookbackHours = Math.round(lookbackMs() / 3_600_000);
 
-  const cleaned = await cleanupUnnamedCompanies({
+  const scan = await scanUnnamedCompanies({
     createdAfterMs,
     maxCompanies: 40,
   });
 
-  const neverLog = await addToNeverLog({
-    emails: cleaned.neverLogEmails,
-    domains: cleaned.neverLogDomains,
-  });
-
-  if (cleaned.archivedCompanies === 0 && cleaned.archivedContacts === 0) {
-    console.log(
-      `[cleanup] Unnamed-company scan: nothing to archive (last ${lookbackHours}h).`,
+  if (scan.errors.length > 0) {
+    console.warn(
+      `[cleanup] Unnamed-company scan hit ${scan.errors.length} error(s):`,
+      scan.errors.slice(0, 5).join("; "),
     );
-    return {
-      archivedCompanies: 0,
-      archivedContacts: 0,
-      neverLogAdded: 0,
-    };
   }
 
-  const neverLogNote =
-    neverLog.emails.length + neverLog.domains.length > 0
-      ? `\nNever Log += ${neverLog.emails.length} email(s), ${neverLog.domains.length} domain(s).`
-      : "";
-  const errorNote =
-    cleaned.errors.length > 0
-      ? `\n_${cleaned.errors.length} error(s) — check logs._`
-      : "";
+  if (scan.candidates.length === 0) {
+    console.log(
+      `[cleanup] Unnamed-company scan: nothing to review (last ${lookbackHours}h).`,
+    );
+    return { posted: 0, candidates: 0 };
+  }
 
-  const lines = cleaned.items
-    .slice(0, 15)
-    .map((item) => {
-      const emails =
-        item.emails.length > 0 ? item.emails.join(", ") : "(no email)";
-      const domain = item.domain ? ` · ${item.domain}` : "";
-      return `• blank-name company${domain} → archived ${item.contactIds.length} contact(s): ${emails}`;
-    })
-    .join("\n");
+  const totalContacts = scan.candidates.reduce(
+    (sum, c) => sum + c.contacts.length,
+    0,
+  );
 
-  if (channel) {
+  await client.chat.postMessage({
+    channel,
+    text: `Unnamed company cleanup: ${scan.candidates.length} company(ies) to review`,
+    blocks: [
+      {
+        type: "header",
+        text: { type: "plain_text", text: "Unnamed company cleanup" },
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `Found *${scan.candidates.length}* company(ies) with no name and *${totalContacts}* associated contact(s) created in the last *${lookbackHours} hours* (any with deals were skipped).\nApprove or discard each card below — nothing is archived until you do.`,
+        },
+      },
+    ],
+  });
+
+  let posted = 0;
+  for (const candidate of scan.candidates) {
+    const pending = savePendingCleanup({
+      kind: "unnamed-company",
+      contacts: candidate.contacts.map((c) => ({
+        id: c.id,
+        name: c.name?.trim() || c.email || "Unnamed contact",
+        email: c.email,
+        reason: "contact on a blank-name company",
+      })),
+      companies: [
+        {
+          id: candidate.companyId,
+          name: "(no name)",
+          domain: candidate.domain,
+          reason: "blank company name · no deals",
+          emailSubjects: candidate.emailSubjects,
+        },
+      ],
+      truncated: false,
+      createdBy: SCHEDULED_CLEANUP_USER,
+      channelId: channel,
+      neverLogEmails: candidate.neverLogEmails,
+      neverLogDomains: candidate.neverLogDomains,
+    });
+
     await client.chat.postMessage({
       channel,
-      text: `Auto-archived ${cleaned.archivedCompanies} unnamed compan(ies) and ${cleaned.archivedContacts} contact(s) (last ${lookbackHours}h).`,
-      blocks: [
+      text: `Cleanup unnamed company${candidate.domain ? ` · ${candidate.domain}` : ""}`,
+      blocks: buildUnnamedCompanyCleanupBlocks(
         {
-          type: "header",
-          text: {
-            type: "plain_text",
-            text: "Unnamed company cleanup (auto)",
-          },
+          id: candidate.companyId,
+          domain: candidate.domain,
+          emailSubjects: candidate.emailSubjects,
         },
-        {
-          type: "section",
-          text: {
-            type: "mrkdwn",
-            text:
-              `Archived *${cleaned.archivedCompanies}* company(ies) with no name and *${cleaned.archivedContacts}* associated contact(s) from the last *${lookbackHours} hours* (skipped any with deals).` +
-              neverLogNote +
-              errorNote,
-          },
-        },
-        ...(lines
-          ? [
-              {
-                type: "section" as const,
-                text: { type: "mrkdwn" as const, text: lines },
-              },
-            ]
-          : []),
-      ],
+        candidate.contacts,
+        pending.id,
+      ),
     });
+    posted += 1;
+    await sleep(150);
   }
 
   console.log(
-    `[cleanup] Unnamed companies: archived ${cleaned.archivedCompanies} companies, ${cleaned.archivedContacts} contacts; never-log +${neverLog.emails.length} emails / +${neverLog.domains.length} domains.`,
+    `[cleanup] Unnamed companies: posted ${posted} approval card(s) covering ${totalContacts} contact(s) → #${channel}`,
   );
 
-  return {
-    archivedCompanies: cleaned.archivedCompanies,
-    archivedContacts: cleaned.archivedContacts,
-    neverLogAdded: neverLog.emails.length + neverLog.domains.length,
-  };
+  return { posted, candidates: scan.candidates.length };
 }
 
 /**

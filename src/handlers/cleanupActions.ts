@@ -7,6 +7,7 @@ import {
   releaseCleanupAction,
   takeCleanup,
 } from "../lib/cleanupStore.js";
+import { addToNeverLog } from "../lib/neverLogStore.js";
 import { postThread } from "../lib/slackPost.js";
 
 function actionContext(body: {
@@ -94,16 +95,38 @@ export function registerCleanupActions(app: App): void {
       });
       completeCleanupAction(pendingId);
 
+      // Only suppress future logging for senders we actually archived.
+      let neverLogNote = "";
+      if (
+        archived.archivedCompanies > 0 &&
+        (pending.neverLogEmails?.length || pending.neverLogDomains?.length)
+      ) {
+        try {
+          const neverLog = await addToNeverLog({
+            emails: pending.neverLogEmails ?? [],
+            domains: pending.neverLogDomains ?? [],
+          });
+          const added = neverLog.emails.length + neverLog.domains.length;
+          if (added > 0) {
+            neverLogNote = ` Never Log += ${neverLog.emails.length} email(s), ${neverLog.domains.length} domain(s).`;
+          }
+        } catch (error) {
+          console.error("[cleanup] never-log update failed:", error);
+        }
+      }
+
       const errorNote =
         archived.errors.length > 0
           ? ` · ${archived.errors.length} error(s)`
           : "";
       const successText =
-        pending.contacts.length === 1 && pending.companies.length === 0
-          ? `Archived contact *${pending.contacts[0].name}*.${errorNote}`
-          : pending.companies.length === 1 && pending.contacts.length === 0
-            ? `Archived company *${pending.companies[0].name}*.${errorNote}`
-            : `Archived *${archived.archivedContacts}* contact(s) and *${archived.archivedCompanies}* company(ies).${errorNote}`;
+        pending.kind === "unnamed-company"
+          ? `Archived unnamed company and *${archived.archivedContacts}* contact(s).${errorNote}${neverLogNote}`
+          : pending.contacts.length === 1 && pending.companies.length === 0
+            ? `Archived contact *${pending.contacts[0].name}*.${errorNote}`
+            : pending.companies.length === 1 && pending.contacts.length === 0
+              ? `Archived company *${pending.companies[0].name}*.${errorNote}`
+              : `Archived *${archived.archivedContacts}* contact(s) and *${archived.archivedCompanies}* company(ies).${errorNote}`;
       await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
@@ -163,11 +186,13 @@ export function registerCleanupActions(app: App): void {
     }
 
     const discardText =
-      result.pending.contacts.length === 1 && result.pending.companies.length === 0
-        ? `Kept contact *${result.pending.contacts[0].name}* — nothing archived.`
-        : result.pending.companies.length === 1 && result.pending.contacts.length === 0
-          ? `Kept company *${result.pending.companies[0].name}* — nothing archived.`
-          : "Marketing cleanup discarded — nothing archived.";
+      result.pending.kind === "unnamed-company"
+        ? `Kept unnamed company and ${result.pending.contacts.length} contact(s) — nothing archived.`
+        : result.pending.contacts.length === 1 && result.pending.companies.length === 0
+          ? `Kept contact *${result.pending.contacts[0].name}* — nothing archived.`
+          : result.pending.companies.length === 1 && result.pending.contacts.length === 0
+            ? `Kept company *${result.pending.companies[0].name}* — nothing archived.`
+            : "Marketing cleanup discarded — nothing archived.";
     await replaceMessage(client, channelId, messageTs, discardText);
 
     if (channelId && !messageTs) {

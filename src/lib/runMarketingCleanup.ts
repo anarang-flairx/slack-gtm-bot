@@ -3,7 +3,11 @@ import {
   findExistingCompanyForContact,
   listRecentRecordsWithActivity,
 } from "../integrations/hubspot.js";
-import { activitySnippet, classifyRecentMarketing } from "./classifyMarketing.js";
+import {
+  activitySnippet,
+  classifyRecentMarketing,
+  emailSubjects,
+} from "./classifyMarketing.js";
 import { savePendingCleanup } from "./cleanupStore.js";
 import {
   buildCleanupItemPreviewBlocks,
@@ -69,6 +73,7 @@ export async function postRecentMarketingCleanup(
       }
     }
     const snippet = activitySnippet(record);
+    const subjects = emailSubjects(record);
     if (record.objectType === "contacts") {
       contacts.push({
         id: record.id,
@@ -77,6 +82,7 @@ export async function postRecentMarketingCleanup(
         reason: verdict.reason,
         summary: verdict.summary,
         activitySnippet: snippet,
+        emailSubjects: subjects,
       });
     } else {
       companies.push({
@@ -86,6 +92,7 @@ export async function postRecentMarketingCleanup(
         reason: verdict.reason,
         summary: verdict.summary,
         activitySnippet: snippet,
+        emailSubjects: subjects,
       });
     }
   }
@@ -113,6 +120,7 @@ export async function postRecentMarketingCleanup(
 
   for (const contact of contacts) {
     const pending = savePendingCleanup({
+      kind: "marketing",
       contacts: [contact],
       companies: [],
       truncated: false,
@@ -131,6 +139,7 @@ export async function postRecentMarketingCleanup(
 
   for (const company of companies) {
     const pending = savePendingCleanup({
+      kind: "marketing",
       contacts: [],
       companies: [company],
       truncated: false,

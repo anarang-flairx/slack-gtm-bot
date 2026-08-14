@@ -56,7 +56,7 @@ async function saveState(state: NeverLogState): Promise<void> {
   );
 }
 
-/** Add emails/domains so the email auto-logger never writes notes for them. */
+/** Record emails/domains archived as marketing junk, so cleanup can skip them. */
 export async function addToNeverLog(input: {
   emails?: string[];
   domains?: string[];

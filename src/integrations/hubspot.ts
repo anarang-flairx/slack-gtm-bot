@@ -1878,6 +1878,8 @@ export type CreateProspectResult = {
   dealName: string;
   companyName: string | null;
   stageLabel: string;
+  /** False when an existing company was reused rather than created. */
+  companyCreated: boolean;
 };
 
 export type CreateContactResult = {
@@ -1885,6 +1887,8 @@ export type CreateContactResult = {
   companyId: string | null;
   contactName: string;
   companyName: string | null;
+  /** False when an existing company was reused rather than created. */
+  companyCreated: boolean;
 };
 
 /** Canonical deal name for FlairX pipeline deals. */
@@ -1935,6 +1939,7 @@ export async function createContact(
   const contact = await createCrmObject("contacts", contactProperties);
 
   let companyId: string | null = null;
+  let companyCreated = false;
   if (input.companyName) {
     const existing = await findCompaniesByName(input.companyName);
     const exact = existing.find(
@@ -1947,6 +1952,7 @@ export async function createContact(
         name: input.companyName,
       });
       companyId = company.id;
+      companyCreated = true;
     }
     await associateDefault("contacts", contact.id, "companies", companyId);
   }
@@ -1969,6 +1975,7 @@ export async function createContact(
     companyId,
     contactName,
     companyName: input.companyName ?? null,
+    companyCreated,
   };
 }
 
@@ -2003,7 +2010,7 @@ export async function createProspect(
     }
   }
 
-  const { contactId, companyId, contactName, companyName } =
+  const { contactId, companyId, contactName, companyName, companyCreated } =
     await createContact(input);
 
   const dealName = companyName
@@ -2045,6 +2052,7 @@ export async function createProspect(
     dealName,
     companyName,
     stageLabel: prospecting.label,
+    companyCreated,
   };
 }
 
@@ -2450,6 +2458,10 @@ export type CrmActivitySnippet = {
   kind: "email" | "note" | "source";
   title: string;
   body: string;
+  /** Raw email subject line (email snippets only) — shown on cleanup cards. */
+  subject?: string;
+  /** Raw sender (email snippets only). */
+  from?: string;
 };
 
 export type RecentCrmRecord = {
@@ -2585,6 +2597,8 @@ function snippetsFromEmails(emails: EmailEngagement[]): CrmActivitySnippet[] {
       .filter(Boolean)
       .join(" · ") || "Logged email",
     body: email.body.slice(0, 1200),
+    subject: email.subject?.trim() || "",
+    from: email.from?.trim() || "",
   }));
 }
 
@@ -3018,18 +3032,19 @@ export async function archiveMarketingJunk(input: {
   return { archivedContacts, archivedCompanies, errors };
 }
 
-export type UnnamedCompanyCleanupResult = {
-  archivedCompanies: number;
-  archivedContacts: number;
+export type UnnamedCompanyCandidate = {
+  companyId: string;
+  domain: string;
+  contacts: Array<{ id: string; name: string; email: string }>;
+  /** Subject lines from the logged emails, for the approval card. */
+  emailSubjects: string[];
   neverLogEmails: string[];
   neverLogDomains: string[];
+};
+
+export type UnnamedCompanyScanResult = {
+  candidates: UnnamedCompanyCandidate[];
   errors: string[];
-  items: Array<{
-    companyId: string;
-    domain: string;
-    contactIds: string[];
-    emails: string[];
-  }>;
 };
 
 function isBlankCompanyName(name: string | null | undefined): boolean {
@@ -3037,13 +3052,16 @@ function isBlankCompanyName(name: string | null | undefined): boolean {
 }
 
 /**
- * Find companies with no name (optionally created after `createdAfterMs`),
- * archive them and their associated contacts (skip if any deals), and return
- * emails/domains for Never Log.
+ * Find companies with no name (optionally created after `createdAfterMs`) that
+ * have no deals, along with their associated contacts and the emails/domains
+ * that would go to Never Log.
+ *
+ * Read-only on purpose: nothing is archived here. Callers post an approval card
+ * and archive on Approve, so no record is ever deleted without a human click.
  */
-export async function cleanupUnnamedCompanies(
+export async function scanUnnamedCompanies(
   options: { createdAfterMs?: number; maxCompanies?: number } = {},
-): Promise<UnnamedCompanyCleanupResult> {
+): Promise<UnnamedCompanyScanResult> {
   const maxCompanies = options.maxCompanies ?? 40;
   const createdAfterMs = options.createdAfterMs;
   const createdFilter =
@@ -3106,17 +3124,13 @@ export async function cleanupUnnamedCompanies(
     );
   }
 
-  const result: UnnamedCompanyCleanupResult = {
-    archivedCompanies: 0,
-    archivedContacts: 0,
-    neverLogEmails: [],
-    neverLogDomains: [],
+  const result: UnnamedCompanyScanResult = {
+    candidates: [],
     errors: [],
-    items: [],
   };
 
   for (const company of raw) {
-    if (result.items.length >= maxCompanies) {
+    if (result.candidates.length >= maxCompanies) {
       break;
     }
     if (!isBlankCompanyName(company.properties.name)) {
@@ -3139,39 +3153,46 @@ export async function cleanupUnnamedCompanies(
         .map((c) => c.email.trim().toLowerCase())
         .filter(Boolean);
       const domain = status.domain.trim().toLowerCase();
-      const contactIds = status.contacts.map((c) => c.id);
 
-      for (const contactId of contactIds) {
-        try {
-          await archiveCrmObject("contacts", contactId);
-          result.archivedContacts += 1;
-        } catch (error) {
-          result.errors.push(
-            `contact ${contactId}: ${error instanceof Error ? error.message : "failed"}`,
-          );
+      // Subjects for the card: company-level emails first, then the first two
+      // contacts (auto-created companies usually log mail on the contact).
+      const engagements = [
+        ...(await getRecentEmails("companies", company.id, 3).catch(() => [])),
+      ];
+      for (const contact of status.contacts.slice(0, 2)) {
+        engagements.push(
+          ...(await getRecentEmails("contacts", contact.id, 3).catch(() => [])),
+        );
+      }
+
+      const seenSubjects = new Set<string>();
+      const emailSubjects: string[] = [];
+      for (const engagement of engagements) {
+        const subject = engagement.subject?.replace(/\s+/g, " ").trim();
+        if (!subject || seenSubjects.has(subject.toLowerCase())) {
+          continue;
+        }
+        seenSubjects.add(subject.toLowerCase());
+        emailSubjects.push(
+          subject.length > 140 ? `${subject.slice(0, 137)}…` : subject,
+        );
+        if (emailSubjects.length >= 3) {
+          break;
         }
       }
 
-      try {
-        await archiveCrmObject("companies", company.id);
-        result.archivedCompanies += 1;
-      } catch (error) {
-        result.errors.push(
-          `company ${company.id}: ${error instanceof Error ? error.message : "failed"}`,
-        );
-        continue;
-      }
-
-      result.items.push({
+      result.candidates.push({
         companyId: company.id,
         domain,
-        contactIds,
-        emails,
+        contacts: status.contacts.map((c) => ({
+          id: c.id,
+          name: c.name,
+          email: c.email,
+        })),
+        emailSubjects,
+        neverLogEmails: [...new Set(emails)],
+        neverLogDomains: domain ? [domain] : [],
       });
-      result.neverLogEmails.push(...emails);
-      if (domain) {
-        result.neverLogDomains.push(domain);
-      }
     } catch (error) {
       result.errors.push(
         `company ${company.id}: ${error instanceof Error ? error.message : "failed"}`,
@@ -3179,8 +3200,6 @@ export async function cleanupUnnamedCompanies(
     }
   }
 
-  result.neverLogEmails = [...new Set(result.neverLogEmails)];
-  result.neverLogDomains = [...new Set(result.neverLogDomains)];
   return result;
 }
 
