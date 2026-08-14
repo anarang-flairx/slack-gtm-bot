@@ -6,6 +6,9 @@ export type PendingReminder = {
   recordId: string;
   recordName: string;
   note: string;
+  /** Human delay, e.g. "2 minutes" or "3 days". */
+  delayLabel: string;
+  /** Kept for older callers; fractional days are OK. */
   days: number;
   dueMs: number;
   createdBy: string;

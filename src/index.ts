@@ -1,6 +1,8 @@
 import "dotenv/config";
 import { App } from "@slack/bolt";
 import OpenAI from "openai";
+import { registerCompanyDealActions } from "./handlers/companyDealActions.js";
+import { registerCleanupActions } from "./handlers/cleanupActions.js";
 import { registerDigestActions } from "./handlers/digestActions.js";
 import { registerEmailActions } from "./handlers/emailActions.js";
 import { registerMentionHandler } from "./handlers/mention.js";
@@ -10,6 +12,7 @@ import { registerProspectActions } from "./handlers/prospectActions.js";
 import { registerReminderActions } from "./handlers/reminderActions.js";
 import { registerStageMoveActions } from "./handlers/stageMoveActions.js";
 import { runEmailNoteSync } from "./jobs/emailNoteLogger.js";
+import { startMarketingCleanupScheduler } from "./jobs/marketingCleanup.js";
 
 const echoMode = process.env.DEV_ECHO_MODE === "true";
 
@@ -45,9 +48,11 @@ registerMentionHandler(app, echoMode, openai);
 registerEmailActions(app);
 registerNoteActions(app);
 registerProspectActions(app);
+registerCompanyDealActions(app);
 registerStageMoveActions(app);
 registerReminderActions(app);
 registerLeadStatusActions(app);
+registerCleanupActions(app);
 registerDigestActions(app);
 
 function startEmailNoteLogger(): void {
@@ -79,6 +84,7 @@ function startEmailNoteLogger(): void {
 (async () => {
   await app.start();
   startEmailNoteLogger();
+  startMarketingCleanupScheduler(app.client);
   console.log(
     echoMode
       ? "FlairX GTM Bot running (DEV_ECHO_MODE). Mention the bot in Slack."

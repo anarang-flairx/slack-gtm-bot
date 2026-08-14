@@ -7,6 +7,8 @@ export type PendingProspect = {
   companyName?: string;
   displayName: string;
   fields: ProspectFields;
+  /** When false, approve creates contact (+ company) only — no deal. */
+  createDeal: boolean;
   createdBy: string;
   channelId: string;
   threadTs?: string;

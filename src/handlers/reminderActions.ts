@@ -4,6 +4,7 @@ import { hubspotRecordUrl } from "../digest/format.js";
 import {
   associateTaskToRecord,
   createTask,
+  touchLastActivity,
 } from "../integrations/hubspot.js";
 import {
   beginReminderAction,
@@ -109,6 +110,17 @@ export function registerReminderActions(app: App): void {
         task.id,
         pending.recordType,
         pending.recordId,
+      );
+      const objectType =
+        pending.recordType === "contact"
+          ? "contacts"
+          : pending.recordType === "company"
+            ? "companies"
+            : "deals";
+      await touchLastActivity(
+        objectType,
+        pending.recordId,
+        `Follow-up task: ${subject}`,
       );
 
       // Schedule a Slack nudge; Slack requires post_at in the future.

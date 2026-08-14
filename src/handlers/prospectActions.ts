@@ -1,7 +1,7 @@
 import type { App } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
 import { hubspotRecordUrl } from "../digest/format.js";
-import { createProspect } from "../integrations/hubspot.js";
+import { createContact, createProspect } from "../integrations/hubspot.js";
 import {
   beginProspectAction,
   completeProspectAction,
@@ -89,21 +89,41 @@ export function registerProspectActions(app: App): void {
     const pending = result.pending;
 
     try {
-      const created = await createProspect({
+      const input = {
         firstName: pending.firstName,
         lastName: pending.lastName,
         ...(pending.companyName ? { companyName: pending.companyName } : {}),
         ...pending.fields,
-      });
+      };
+
+      if (pending.createDeal) {
+        const created = await createProspect(input);
+        completeProspectAction(pendingId);
+
+        const contactUrl = hubspotRecordUrl("contact", created.contactId);
+        const dealUrl = hubspotRecordUrl("deal", created.dealId);
+        const companyPart = created.companyId
+          ? ` · company <${hubspotRecordUrl("company", created.companyId)}|${created.companyName}>`
+          : "";
+
+        const successText = `Prospect created: contact <${contactUrl}|${created.contactName}> · deal <${dealUrl}|${created.dealName}> (${created.stageLabel})${companyPart}`;
+        await replaceMessage(client, channelId, messageTs, successText);
+
+        if (channelId && !messageTs) {
+          await postThread(client, channelId, threadTs, successText);
+        }
+        return;
+      }
+
+      const created = await createContact(input);
       completeProspectAction(pendingId);
 
       const contactUrl = hubspotRecordUrl("contact", created.contactId);
-      const dealUrl = hubspotRecordUrl("deal", created.dealId);
       const companyPart = created.companyId
         ? ` · company <${hubspotRecordUrl("company", created.companyId)}|${created.companyName}>`
         : "";
 
-      const successText = `Prospect created: contact <${contactUrl}|${created.contactName}> · deal <${dealUrl}|${created.dealName}> (${created.stageLabel})${companyPart}`;
+      const successText = `Contact added: <${contactUrl}|${created.contactName}>${companyPart}`;
       await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {

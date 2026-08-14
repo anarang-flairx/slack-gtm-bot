@@ -1,8 +1,14 @@
 import {
   appendDatedNote,
+  activityDateProperty,
   companyActivityDateProperty,
   companyNotesProperty,
+  contactActivityDateProperty,
   contactNotesProperty,
+  dealNotesProperty,
+  isHubSpotReadOnlyActivityProperty,
+  todayDatePropertyValue,
+  WRITABLE_LAST_ACTIVITY_FALLBACK,
 } from "../lib/noteProperties.js";
 
 const HUBSPOT_BASE = "https://api.hubapi.com";
@@ -44,7 +50,19 @@ async function hubspotFetch<T>(path: string, init?: RequestInit): Promise<T> {
       throw lastError;
     }
 
-    return response.json() as Promise<T>;
+    if (
+      response.status === 204 ||
+      response.headers.get("content-length") === "0"
+    ) {
+      return undefined as T;
+    }
+
+    const text = await response.text();
+    if (!text.trim()) {
+      return undefined as T;
+    }
+
+    return JSON.parse(text) as T;
   }
 
   throw lastError ?? new Error("HubSpot request failed after retries");
@@ -74,6 +92,7 @@ export type PipelineStage = {
 
 export type PipelineMeta = {
   id: string;
+  label: string;
   stages: PipelineStage[];
   stageById: Map<string, PipelineStage>;
   stageByLabel: Map<string, PipelineStage>;
@@ -82,6 +101,7 @@ export type PipelineMeta = {
 type HubSpotPipelinesResponse = {
   results: Array<{
     id: string;
+    label: string;
     stages: Array<{
       id: string;
       label: string;
@@ -105,27 +125,28 @@ export type HubSpotContactContext = {
   leadSource: string;
 };
 
-let pipelineCache: PipelineMeta | null = null;
-let leadStatusCache: Map<string, string> | null = null;
+/** HubSpot metadata refreshes every 30s so new pipelines/stages show up without restart. */
+const META_CACHE_TTL_MS = 30_000;
 
-export async function getPipelineMeta(): Promise<PipelineMeta> {
-  if (pipelineCache) {
-    return pipelineCache;
-  }
+type TimedCache<T> = { value: T; fetchedAt: number };
 
-  const data = await hubspotFetch<HubSpotPipelinesResponse>(
-    "/crm/v3/pipelines/deals",
-  );
+let pipelineMetaById: TimedCache<Map<string, PipelineMeta>> | null = null;
+let pipelinesListCache: TimedCache<
+  Array<{ id: string; label: string; stageCount: number }>
+> | null = null;
+let leadStatusCache: TimedCache<Map<string, string>> | null = null;
+let lifecycleStageCache: Map<string, string> | null = null;
+let lifecycleStageOptionsCache: TimedCache<
+  Array<{ label: string; value: string }>
+> | null = null;
 
-  const pipelineId = process.env.HUBSPOT_PIPELINE_ID;
-  const pipeline = pipelineId
-    ? data.results.find((p) => p.id === pipelineId)
-    : data.results[0];
+function cacheFresh<T>(entry: TimedCache<T> | null): entry is TimedCache<T> {
+  return !!entry && Date.now() - entry.fetchedAt < META_CACHE_TTL_MS;
+}
 
-  if (!pipeline) {
-    throw new Error("No HubSpot deal pipeline found");
-  }
-
+function toPipelineMeta(
+  pipeline: HubSpotPipelinesResponse["results"][number],
+): PipelineMeta {
   const stages: PipelineStage[] = pipeline.stages
     .map((stage) => ({
       id: stage.id,
@@ -135,40 +156,418 @@ export async function getPipelineMeta(): Promise<PipelineMeta> {
     }))
     .sort((a, b) => a.displayOrder - b.displayOrder);
 
-  pipelineCache = {
+  return {
     id: pipeline.id,
+    label: pipeline.label?.trim() || pipeline.id,
     stages,
     stageById: new Map(stages.map((s) => [s.id, s])),
     stageByLabel: new Map(stages.map((s) => [s.label.toLowerCase(), s])),
   };
+}
 
-  return pipelineCache;
+async function fetchDealPipelines(): Promise<
+  HubSpotPipelinesResponse["results"]
+> {
+  const data = await hubspotFetch<HubSpotPipelinesResponse>(
+    "/crm/v3/pipelines/deals",
+  );
+  return data.results ?? [];
+}
+
+/** List all HubSpot deal pipelines (short TTL cache). */
+export async function listDealPipelines(): Promise<
+  Array<{ id: string; label: string; stageCount: number }>
+> {
+  if (cacheFresh(pipelinesListCache)) {
+    return pipelinesListCache.value;
+  }
+
+  const results = await fetchDealPipelines();
+  const list = results.map((p) => ({
+    id: p.id,
+    label: p.label?.trim() || p.id,
+    stageCount: p.stages?.length ?? 0,
+  }));
+  pipelinesListCache = { value: list, fetchedAt: Date.now() };
+  return list;
+}
+
+async function loadCompanyLifecycleStages(): Promise<
+  Array<{ label: string; value: string }>
+> {
+  if (cacheFresh(lifecycleStageOptionsCache)) {
+    return lifecycleStageOptionsCache.value;
+  }
+
+  const data = await hubspotFetch<{
+    options?: Array<{ label: string; value: string }>;
+  }>("/crm/v3/properties/companies/lifecyclestage");
+
+  const options = (data.options ?? []).map((option) => ({
+    label: option.label,
+    value: option.value,
+  }));
+  lifecycleStageOptionsCache = { value: options, fetchedAt: Date.now() };
+  lifecycleStageCache = new Map(
+    options.map((option) => [option.label.toLowerCase(), option.value]),
+  );
+
+  return options;
+}
+
+/**
+ * Resolve deal pipeline metadata.
+ * Prefers `pipelineId`, then `HUBSPOT_PIPELINE_ID`, then the first pipeline.
+ * Cached per pipeline id so Sales metadata cannot leak into Partnerships lookups.
+ */
+export async function getPipelineMeta(
+  pipelineId?: string,
+): Promise<PipelineMeta> {
+  const wantId =
+    pipelineId?.trim() || process.env.HUBSPOT_PIPELINE_ID?.trim() || "";
+
+  if (cacheFresh(pipelineMetaById)) {
+    if (wantId) {
+      const cached = pipelineMetaById.value.get(wantId);
+      if (cached) {
+        return cached;
+      }
+    } else {
+      const first = pipelineMetaById.value.values().next().value;
+      if (first) {
+        return first;
+      }
+    }
+  }
+
+  const results = await fetchDealPipelines();
+  const map = new Map<string, PipelineMeta>();
+  for (const pipeline of results) {
+    const meta = toPipelineMeta(pipeline);
+    map.set(meta.id, meta);
+  }
+  pipelineMetaById = { value: map, fetchedAt: Date.now() };
+  pipelinesListCache = {
+    value: results.map((p) => ({
+      id: p.id,
+      label: p.label?.trim() || p.id,
+      stageCount: p.stages?.length ?? 0,
+    })),
+    fetchedAt: Date.now(),
+  };
+
+  if (wantId) {
+    const meta = map.get(wantId);
+    if (meta) {
+      return meta;
+    }
+    const available = results
+      .map((p) => `${p.label?.trim() || p.id} (${p.id})`)
+      .join(", ");
+    throw new Error(
+      `No HubSpot deal pipeline with id "${wantId}". Available: ${available || "none"}`,
+    );
+  }
+
+  const first = results[0];
+  if (!first) {
+    throw new Error("No HubSpot deal pipeline found");
+  }
+  return toPipelineMeta(first);
 }
 
 async function getStageLabels(): Promise<Map<string, string>> {
-  const pipeline = await getPipelineMeta();
-  return new Map(
-    pipeline.stages.map((stage) => [stage.id, stage.label]),
-  );
+  // Merge labels across all pipelines so deals in any pipeline resolve.
+  const results = await fetchDealPipelines();
+  const labels = new Map<string, string>();
+  for (const pipeline of results) {
+    for (const stage of pipeline.stages ?? []) {
+      labels.set(stage.id, stage.label);
+    }
+  }
+  return labels;
+}
+
+export async function getDealStageLabels(): Promise<Map<string, string>> {
+  return getStageLabels();
 }
 
 export async function getLeadStatusMap(): Promise<Map<string, string>> {
-  if (leadStatusCache) {
-    return leadStatusCache;
+  if (cacheFresh(leadStatusCache)) {
+    return leadStatusCache.value;
   }
 
   const data = await hubspotFetch<{
     options?: Array<{ label: string; value: string }>;
   }>("/crm/v3/properties/contacts/hs_lead_status");
 
-  leadStatusCache = new Map(
+  const map = new Map(
     (data.options ?? []).map((option) => [
       option.label.toLowerCase(),
       option.value,
     ]),
   );
+  leadStatusCache = { value: map, fetchedAt: Date.now() };
+  return map;
+}
 
-  return leadStatusCache;
+/** Map lifecycle stage label (lowercase) → HubSpot internal value for companies. */
+export async function getCompanyLifecycleStageMap(): Promise<
+  Map<string, string>
+> {
+  await loadCompanyLifecycleStages();
+  return lifecycleStageCache!;
+}
+
+/** Ordered HubSpot company lifecycle stage options (display label + value). */
+export async function getCompanyLifecycleStageOptions(): Promise<
+  Array<{ label: string; value: string }>
+> {
+  return loadCompanyLifecycleStages();
+}
+
+/** Internal name of the company relationship-type property (Partnership pipeline). */
+export function relationshipTypeProperty(): string {
+  return process.env.HUBSPOT_RELATIONSHIP_TYPE_PROPERTY ?? "relationship_type";
+}
+
+const PARTNERSHIP_STAGE_MARKERS = [
+  "active relationship",
+  "referral received",
+  "inactive relationship",
+];
+
+/** Compact alphanumerics so zero-width / punctuation in HubSpot labels still match. */
+function compactLabel(label: string): string {
+  return label.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function labelLooksLikePartnership(pipelineLabel: string): boolean {
+  const compact = compactLabel(pipelineLabel);
+  if (compact.includes("partnership")) {
+    return true;
+  }
+  const tokens = pipelineLabel
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  return tokens.some((token) => token === "partner" || token === "partners");
+}
+
+export function looksLikePartnershipStages(
+  stages: Array<{ label: string }>,
+): boolean {
+  const labels = stageLabelSet(stages);
+  return PARTNERSHIP_STAGE_MARKERS.some((marker) => labels.has(marker));
+}
+
+/** True when the deal belongs to the Partnership pipeline (env id, label, or stages). */
+export function isPartnershipPipeline(
+  pipelineId: string,
+  pipelineLabel: string,
+  stages?: Array<{ label: string }>,
+): boolean {
+  const configuredId = process.env.HUBSPOT_PARTNERSHIP_PIPELINE_ID?.trim();
+  if (configuredId && pipelineId && pipelineId === configuredId) {
+    return true;
+  }
+  if (labelLooksLikePartnership(pipelineLabel ?? "")) {
+    return true;
+  }
+  return Boolean(stages && looksLikePartnershipStages(stages));
+}
+
+/** Stock HubSpot Sales Pipeline stage names (not FlairX). */
+const STOCK_HUBSPOT_STAGE_MARKERS = [
+  "appointment scheduled",
+  "qualified to buy",
+  "presentation scheduled",
+  "decision maker bought-in",
+  "contract sent",
+];
+
+/** FlairX-style Sales stage markers. */
+const FLAIRX_SALES_STAGE_MARKERS = [
+  "initial contact",
+  "demo scheduled",
+  "demo completed",
+  "proposal sent",
+  "negotiation",
+];
+
+function stageLabelSet(stages: Array<{ label: string }>): Set<string> {
+  return new Set(stages.map((s) => s.label.trim().toLowerCase()));
+}
+
+export function looksLikeStockHubSpotSalesStages(
+  stages: Array<{ label: string }>,
+): boolean {
+  const labels = stageLabelSet(stages);
+  return (
+    STOCK_HUBSPOT_STAGE_MARKERS.filter((m) => labels.has(m)).length >= 2
+  );
+}
+
+export function looksLikeFlairXSalesStages(
+  stages: Array<{ label: string }>,
+): boolean {
+  const labels = stageLabelSet(stages);
+  return FLAIRX_SALES_STAGE_MARKERS.filter((m) => labels.has(m)).length >= 2;
+}
+
+/**
+ * Pipelines to offer when creating a deal: configured Sales + Partnerships
+ * when env ids are set; otherwise all HubSpot deal pipelines.
+ */
+export async function listDealCreatePipelines(): Promise<
+  Array<{ id: string; label: string; stageCount: number }>
+> {
+  const all = await listDealPipelines();
+  const salesId = process.env.HUBSPOT_PIPELINE_ID?.trim() || "";
+  const partnerId = process.env.HUBSPOT_PARTNERSHIP_PIPELINE_ID?.trim() || "";
+  if (!salesId && !partnerId) {
+    return all;
+  }
+
+  const preferred: Array<{ id: string; label: string; stageCount: number }> =
+    [];
+  const seen = new Set<string>();
+  for (const id of [salesId, partnerId]) {
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    const match = all.find((p) => p.id === id);
+    if (match) {
+      preferred.push(match);
+      seen.add(id);
+    }
+  }
+  return preferred.length > 0 ? preferred : all;
+}
+
+/**
+ * If `pipelineId` is the stock HubSpot Sales pipeline, prefer another pipeline
+ * that has FlairX-style stages (Initial Contact / Demo Scheduled / …).
+ */
+export async function preferFlairXSalesPipelineId(
+  pipelineId: string,
+): Promise<string> {
+  const meta = await getPipelineMeta(pipelineId);
+  if (isPartnershipPipeline(meta.id, meta.label, meta.stages)) {
+    return pipelineId;
+  }
+  if (looksLikeFlairXSalesStages(meta.stages)) {
+    return pipelineId;
+  }
+
+  const all = await fetchDealPipelines();
+  const partnerId = process.env.HUBSPOT_PARTNERSHIP_PIPELINE_ID?.trim() || "";
+  for (const candidate of all) {
+    if (candidate.id === pipelineId) {
+      continue;
+    }
+    if (partnerId && candidate.id === partnerId) {
+      continue;
+    }
+    if (
+      isPartnershipPipeline(
+        candidate.id,
+        candidate.label?.trim() || "",
+        candidate.stages,
+      )
+    ) {
+      continue;
+    }
+    const candidateMeta = toPipelineMeta(candidate);
+    if (looksLikeFlairXSalesStages(candidateMeta.stages)) {
+      console.warn(
+        `[pipeline] "${pipelineId}" (${meta.label}) is not the FlairX Sales pipeline; using "${candidateMeta.label}" (${candidateMeta.id}) instead.`,
+      );
+      return candidateMeta.id;
+    }
+  }
+  return pipelineId;
+}
+
+let relationshipTypeOptionsCache: TimedCache<
+  Array<{ label: string; value: string }>
+> | null = null;
+
+/** Options for the company relationship-type property (Partnership pipeline). */
+export async function getRelationshipTypeOptions(): Promise<
+  Array<{ label: string; value: string }>
+> {
+  if (cacheFresh(relationshipTypeOptionsCache)) {
+    return relationshipTypeOptionsCache.value;
+  }
+
+  const prop = relationshipTypeProperty();
+  const data = await hubspotFetch<{
+    options?: Array<{ label: string; value: string }>;
+  }>(`/crm/v3/properties/companies/${encodeURIComponent(prop)}`);
+
+  const options = (data.options ?? []).map((option) => ({
+    label: option.label,
+    value: option.value,
+  }));
+  relationshipTypeOptionsCache = { value: options, fetchedAt: Date.now() };
+  return options;
+}
+
+export type CompanyLifecycleMatch = {
+  id: string;
+  name: string;
+  domain: string;
+  lifecycleStage: string;
+};
+
+/** List HubSpot companies whose lifecycle stage matches the given label. */
+export async function listCompaniesByLifecycleStage(
+  stageLabel: string,
+  maxResults = 50,
+): Promise<CompanyLifecycleMatch[]> {
+  const label = stageLabel.trim();
+  if (!label) {
+    return [];
+  }
+
+  const stageMap = await getCompanyLifecycleStageMap();
+  const stageValue =
+    stageMap.get(label.toLowerCase()) ??
+    [...stageMap.entries()].find(([key]) =>
+      key.includes(label.toLowerCase()),
+    )?.[1];
+
+  if (!stageValue) {
+    const valid = [...stageMap.keys()].join(", ");
+    throw new Error(
+      `"${stageLabel}" is not a valid company lifecycle stage. Valid options: ${valid}.`,
+    );
+  }
+
+  const results = await searchObjects("companies", {
+    filterGroups: [
+      {
+        filters: [
+          {
+            propertyName: "lifecyclestage",
+            operator: "EQ",
+            value: stageValue,
+          },
+        ],
+      },
+    ],
+    properties: ["name", "domain", "lifecyclestage"],
+    sorts: [{ propertyName: "name", direction: "ASCENDING" }],
+  });
+
+  return results.slice(0, maxResults).map((company) => ({
+    id: company.id,
+    name: company.properties.name?.trim() || "Untitled company",
+    domain: company.properties.domain?.trim() ?? "",
+    lifecycleStage:
+      company.properties.lifecyclestage?.trim() || stageLabel,
+  }));
 }
 
 export async function searchObjects(
@@ -538,6 +937,133 @@ export async function latestNoteTimestampMs(
   return notes[0]?.timestampMs ?? null;
 }
 
+export type DealFollowUpContact = {
+  id: string;
+  name: string;
+  email: string;
+};
+
+export type DealFollowUpBundle = {
+  dealId: string;
+  dealNotes: string;
+  company: { id: string; name: string; notes: string } | null;
+  contacts: DealFollowUpContact[];
+  notes: NoteEngagement[];
+  emails: EmailEngagement[];
+};
+
+/**
+ * Notes, logged emails, company, and contacts for a deal — used by the digest
+ * follow-up table and personalized draft generation.
+ */
+export async function getDealFollowUpBundle(
+  dealId: string,
+): Promise<DealFollowUpBundle> {
+  const notesProp = dealNotesProperty();
+  const companyNotesProp = companyNotesProperty();
+
+  const [deal, contactAssoc, companyAssoc, notes, emails] = await Promise.all([
+    hubspotFetch<{ properties: Record<string, string | null> }>(
+      `/crm/v3/objects/deals/${dealId}?properties=${encodeURIComponent(notesProp)}`,
+    ),
+    hubspotFetch<HubSpotAssociationResponse>(
+      `/crm/v4/objects/deals/${dealId}/associations/contacts`,
+    ).catch(() => ({ results: [] }) as HubSpotAssociationResponse),
+    hubspotFetch<HubSpotAssociationResponse>(
+      `/crm/v4/objects/deals/${dealId}/associations/companies`,
+    ).catch(() => ({ results: [] }) as HubSpotAssociationResponse),
+    getRecentNotes("deals", dealId, 8).catch(() => []),
+    getRecentEmails("deals", dealId, 8).catch(() => []),
+  ]);
+
+  const contactIds = contactAssoc.results.map((r) => r.toObjectId).slice(0, 8);
+  const companyId = companyAssoc.results[0]?.toObjectId ?? "";
+
+  const contacts: DealFollowUpContact[] = [];
+  if (contactIds.length > 0) {
+    const data = await hubspotFetch<{
+      results: Array<{ id: string; properties: Record<string, string | null> }>;
+    }>("/crm/v3/objects/contacts/batch/read", {
+      method: "POST",
+      body: JSON.stringify({
+        properties: ["firstname", "lastname", "email"],
+        inputs: contactIds.map((id) => ({ id })),
+      }),
+    });
+    for (const contact of data.results) {
+      const first = contact.properties.firstname?.trim() ?? "";
+      const last = contact.properties.lastname?.trim() ?? "";
+      contacts.push({
+        id: contact.id,
+        name: `${first} ${last}`.trim() || "Unknown contact",
+        email: contact.properties.email?.trim() ?? "",
+      });
+    }
+  }
+
+  let company: DealFollowUpBundle["company"] = null;
+  if (companyId) {
+    const companyRecord = await hubspotFetch<{
+      id: string;
+      properties: Record<string, string | null>;
+    }>(
+      `/crm/v3/objects/companies/${companyId}?properties=name,${encodeURIComponent(companyNotesProp)}`,
+    );
+    company = {
+      id: companyRecord.id,
+      name: companyRecord.properties.name?.trim() || "Untitled company",
+      notes: companyRecord.properties[companyNotesProp]?.trim() ?? "",
+    };
+  }
+
+  let mergedEmails = emails;
+  if (mergedEmails.length === 0) {
+    const extra: EmailEngagement[] = [];
+    if (companyId) {
+      extra.push(
+        ...(await getRecentEmails("companies", companyId, 5).catch(() => [])),
+      );
+    }
+    const withEmail = contacts.find((c) => c.email);
+    if (withEmail && extra.length === 0) {
+      extra.push(
+        ...(await getRecentEmails("contacts", withEmail.id, 5).catch(() => [])),
+      );
+    }
+    mergedEmails = extra.sort(
+      (a, b) => (b.timestampMs ?? 0) - (a.timestampMs ?? 0),
+    );
+  }
+
+  let mergedNotes = notes;
+  if (mergedNotes.length === 0 && companyId) {
+    mergedNotes = await getRecentNotes("companies", companyId, 3).catch(
+      () => [],
+    );
+  }
+
+  return {
+    dealId,
+    dealNotes: deal.properties[notesProp]?.trim() ?? "",
+    company,
+    contacts,
+    notes: mergedNotes,
+    emails: mergedEmails,
+  };
+}
+
+function parseHubSpotTimestampMs(raw: string | null | undefined): number | null {
+  if (!raw?.trim()) {
+    return null;
+  }
+  const asNum = Number(raw);
+  if (Number.isFinite(asNum) && asNum > 0) {
+    return asNum;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
 /** Return the company associated with a contact, if any. */
 export async function getAssociatedCompany(
   contactId: string,
@@ -559,6 +1085,43 @@ export async function getAssociatedCompany(
     id: companyId,
     name: company.properties.name?.trim() || "Untitled company",
   };
+}
+
+/**
+ * If this contact is on a company we already have — created before
+ * `createdAfterMs`, or already has deals — return that company. Used to keep
+ * marketing cleanup from proposing people at existing accounts.
+ */
+export async function findExistingCompanyForContact(
+  contactId: string,
+  createdAfterMs: number,
+): Promise<{ id: string; name: string } | null> {
+  const associations = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/contacts/${contactId}/associations/companies`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+
+  for (const row of associations.results) {
+    const companyId = row.toObjectId;
+    const company = await hubspotFetch<{
+      properties: Record<string, string | null>;
+    }>(
+      `/crm/v3/objects/companies/${companyId}?properties=name,createdate`,
+    ).catch(() => null);
+    if (!company) {
+      continue;
+    }
+
+    const name = company.properties.name?.trim() || "Untitled company";
+    const createdateMs = parseHubSpotTimestampMs(company.properties.createdate);
+    if (createdateMs != null && createdateMs < createdAfterMs) {
+      return { id: companyId, name };
+    }
+    if (await companyHasDeals(companyId)) {
+      return { id: companyId, name };
+    }
+  }
+
+  return null;
 }
 
 async function searchNoteMatchesByName(
@@ -722,33 +1285,185 @@ export async function findCompaniesByName(
     return [];
   }
 
-  const search = await hubspotFetch<HubSpotSearchResponse>(
-    "/crm/v3/objects/companies/search",
-    {
-      method: "POST",
-      body: JSON.stringify({
-        filterGroups: [
+  // CONTAINS_TOKEN rejects tokens shorter than 3 chars and treats punctuation
+  // as separators — "Programmers.ai" becomes ["Programmers", "ai"] and can 400.
+  const tokenQuery = query
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 3)
+    .join(" ");
+
+  const looksLikeDomain =
+    /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(query) ||
+    query.toLowerCase().includes(".ai") ||
+    query.toLowerCase().includes(".com") ||
+    query.toLowerCase().includes(".io");
+
+  const domainCandidate = looksLikeDomain
+    ? query.toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "")
+    : null;
+
+  const filterGroups: Array<{
+    filters: Array<{ propertyName: string; operator: string; value: string }>;
+  }> = [];
+
+  if (tokenQuery) {
+    filterGroups.push({
+      filters: [
+        {
+          propertyName: "name",
+          operator: "CONTAINS_TOKEN",
+          value: tokenQuery,
+        },
+      ],
+    });
+  }
+
+  // Exact name match (case-insensitive via EQ on the raw string when possible).
+  filterGroups.push({
+    filters: [
+      {
+        propertyName: "name",
+        operator: "EQ",
+        value: query,
+      },
+    ],
+  });
+
+  if (domainCandidate) {
+    filterGroups.push({
+      filters: [
+        {
+          propertyName: "domain",
+          operator: "EQ",
+          value: domainCandidate,
+        },
+      ],
+    });
+    // Also try without a leading www.
+    const bare = domainCandidate.replace(/^www\./, "");
+    if (bare !== domainCandidate) {
+      filterGroups.push({
+        filters: [
           {
-            filters: [
-              {
-                propertyName: "name",
-                operator: "CONTAINS_TOKEN",
-                value: query,
-              },
-            ],
+            propertyName: "domain",
+            operator: "EQ",
+            value: bare,
           },
         ],
-        properties: ["name", "domain"],
-        limit: 5,
-      }),
-    },
-  );
+      });
+    }
+  }
 
-  return search.results.map((company) => ({
+  // First meaningful token alone (e.g. "Programmers" from "Programmers.ai").
+  const firstToken = tokenQuery.split(/\s+/)[0];
+  if (firstToken && firstToken.toLowerCase() !== tokenQuery.toLowerCase()) {
+    filterGroups.push({
+      filters: [
+        {
+          propertyName: "name",
+          operator: "CONTAINS_TOKEN",
+          value: firstToken,
+        },
+      ],
+    });
+  }
+
+  if (filterGroups.length === 0) {
+    return [];
+  }
+
+  let results: HubSpotSearchResult[] = [];
+  try {
+    const search = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/companies/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: filterGroups.slice(0, 5), // HubSpot max 5 groups
+          properties: ["name", "domain"],
+          limit: 10,
+        }),
+      },
+    );
+    results = search.results;
+  } catch (error) {
+    // Fall back to a safer single-token search if the combined query fails.
+    if (!firstToken) {
+      throw error;
+    }
+    const search = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/companies/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: [
+            {
+              filters: [
+                {
+                  propertyName: "name",
+                  operator: "CONTAINS_TOKEN",
+                  value: firstToken,
+                },
+              ],
+            },
+            ...(domainCandidate
+              ? [
+                  {
+                    filters: [
+                      {
+                        propertyName: "domain",
+                        operator: "EQ",
+                        value: domainCandidate,
+                      },
+                    ],
+                  },
+                ]
+              : []),
+          ],
+          properties: ["name", "domain"],
+          limit: 10,
+        }),
+      },
+    );
+    results = search.results;
+  }
+
+  const mapped = results.map((company) => ({
     id: company.id,
     name: company.properties.name?.trim() || "Untitled company",
     domain: company.properties.domain?.trim() ?? "",
   }));
+
+  // Prefer exact name / domain matches, then prefix matches.
+  const needle = query.toLowerCase();
+  const domainNeedle = domainCandidate?.toLowerCase();
+  mapped.sort((a, b) => {
+    const score = (c: { name: string; domain: string }) => {
+      const name = c.name.toLowerCase();
+      const domain = c.domain.toLowerCase();
+      if (name === needle) return 0;
+      if (domainNeedle && domain === domainNeedle) return 1;
+      if (name.startsWith(needle) || name.includes(needle)) return 2;
+      if (domainNeedle && domain.includes(domainNeedle.split(".")[0] ?? "")) {
+        return 3;
+      }
+      return 4;
+    };
+    return score(a) - score(b);
+  });
+
+  // Dedupe by id and cap.
+  const seen = new Set<string>();
+  const unique: typeof mapped = [];
+  for (const c of mapped) {
+    if (seen.has(c.id)) continue;
+    seen.add(c.id);
+    unique.push(c);
+    if (unique.length >= 5) break;
+  }
+  return unique;
 }
 
 export async function findContactByEmail(
@@ -1005,15 +1720,96 @@ export async function createCrmObject(
 }
 
 export async function associateDefault(
-  fromType: "contacts" | "companies" | "deals",
+  fromType: "contacts" | "companies" | "deals" | "notes" | "tasks",
   fromId: string,
-  toType: "contacts" | "companies" | "deals",
+  toType: "contacts" | "companies" | "deals" | "notes" | "tasks",
   toId: string,
 ): Promise<void> {
   await hubspotFetch(
     `/crm/v4/objects/${fromType}/${fromId}/associations/default/${toType}/${toId}`,
     { method: "PUT" },
   );
+}
+
+async function stampActivityDateProperty(
+  objectType: "contacts" | "companies" | "deals",
+  id: string,
+): Promise<void> {
+  const today = todayDatePropertyValue();
+  const primary = activityDateProperty(objectType);
+  const props = isHubSpotReadOnlyActivityProperty(primary)
+    ? [WRITABLE_LAST_ACTIVITY_FALLBACK]
+    : [primary, WRITABLE_LAST_ACTIVITY_FALLBACK].filter(
+        (name, index, all) => all.indexOf(name) === index,
+      );
+
+  for (const prop of props) {
+    if (isHubSpotReadOnlyActivityProperty(prop)) {
+      continue;
+    }
+    try {
+      await updateObjectProperties(objectType, id, { [prop]: today });
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (/READ_ONLY_VALUE|read only property/i.test(message)) {
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+/**
+ * Stamp HubSpot Last Activity Date for a record.
+ * Native notes update the built-in `notes_last_updated` field; a writable
+ * date property is also PATCHed so digest urgency still works if notes.write
+ * is missing.
+ */
+export async function touchLastActivity(
+  objectType: "contacts" | "companies" | "deals",
+  id: string,
+  summary: string,
+): Promise<void> {
+  const body = summary.trim();
+  if (body) {
+    try {
+      const note = await hubspotFetch<{ id: string }>("/crm/v3/objects/notes", {
+        method: "POST",
+        body: JSON.stringify({
+          properties: {
+            hs_timestamp: String(Date.now()),
+            hs_note_body: body.slice(0, 65000),
+          },
+        }),
+      });
+      await associateDefault("notes", note.id, objectType, id);
+    } catch (error) {
+      console.warn(
+        `[hubspot] native note failed for ${objectType}/${id}:`,
+        error,
+      );
+    }
+  }
+
+  try {
+    await stampActivityDateProperty(objectType, id);
+  } catch (error) {
+    console.warn(
+      `[hubspot] Last Activity Date stamp failed for ${objectType}/${id}:`,
+      error,
+    );
+  }
+}
+
+export async function listAssociatedDealIds(
+  objectType: "contacts" | "companies",
+  id: string,
+): Promise<string[]> {
+  const data = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/${objectType}/${id}/associations/deals`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+  return data.results.map((row) => row.toObjectId);
 }
 
 const RECORD_OBJECT_TYPE: Record<
@@ -1084,21 +1880,39 @@ export type CreateProspectResult = {
   stageLabel: string;
 };
 
-export async function createProspect(
-  input: CreateProspectInput,
-): Promise<CreateProspectResult> {
-  const pipeline = await getPipelineMeta();
-  const prospecting =
-    pipeline.stageByLabel.get("prospecting") ?? pipeline.stages[0];
+export type CreateContactResult = {
+  contactId: string;
+  companyId: string | null;
+  contactName: string;
+  companyName: string | null;
+};
 
-  if (!prospecting) {
-    throw new Error("No Prospecting stage found in HubSpot deal pipeline");
+/** Canonical deal name for FlairX pipeline deals. */
+export function formatCompanyDealName(companyName: string): string {
+  const name = companyName.trim();
+  return name ? `${name} - FlairX` : "FlairX";
+}
+
+/** Create a HubSpot contact and optionally a linked company record. No deal. */
+export async function createContact(
+  input: CreateProspectInput,
+): Promise<CreateContactResult> {
+  const contactName = `${input.firstName} ${input.lastName}`.trim();
+
+  if (input.email?.trim()) {
+    const existing = await findContactByEmail(input.email);
+    if (existing) {
+      throw new Error(
+        `Contact already exists: ${existing.name} <${input.email.trim()}>. Not creating a duplicate.`,
+      );
+    }
   }
 
-  const contactName = `${input.firstName} ${input.lastName}`.trim();
-  const dealName = input.companyName
-    ? `${input.companyName} — ${contactName}`
-    : contactName;
+  let notes = input.notes?.trim() ?? "";
+  if (input.source?.trim()) {
+    const sourceLine = `Source: ${input.source.trim()}`;
+    notes = notes ? `${notes}\n${sourceLine}` : sourceLine;
+  }
 
   const contactProperties: Record<string, string> = {
     firstname: input.firstName,
@@ -1111,8 +1925,11 @@ export async function createProspect(
     ...(input.linkedin ? { hs_linkedin_url: input.linkedin } : {}),
   };
 
-  if (input.notes) {
-    contactProperties[contactNotesProperty()] = appendDatedNote("", input.notes);
+  if (notes) {
+    contactProperties[contactNotesProperty()] = appendDatedNote("", notes);
+  }
+  if (!isHubSpotReadOnlyActivityProperty(contactActivityDateProperty())) {
+    contactProperties[contactActivityDateProperty()] = todayDatePropertyValue();
   }
 
   const contact = await createCrmObject("contacts", contactProperties);
@@ -1131,7 +1948,67 @@ export async function createProspect(
       });
       companyId = company.id;
     }
+    await associateDefault("contacts", contact.id, "companies", companyId);
   }
+
+  await touchLastActivity(
+    "contacts",
+    contact.id,
+    notes || `Contact created: ${contactName}`,
+  );
+  if (companyId) {
+    await touchLastActivity(
+      "companies",
+      companyId,
+      notes || `Contact added: ${contactName}`,
+    );
+  }
+
+  return {
+    contactId: contact.id,
+    companyId,
+    contactName,
+    companyName: input.companyName ?? null,
+  };
+}
+
+export async function createProspect(
+  input: CreateProspectInput,
+): Promise<CreateProspectResult> {
+  const pipeline = await getPipelineMeta();
+  const prospecting =
+    pipeline.stageByLabel.get("prospecting") ?? pipeline.stages[0];
+
+  if (!prospecting) {
+    throw new Error("No Prospecting stage found in HubSpot deal pipeline");
+  }
+
+  // Resolve company first so we can refuse a duplicate FlairX deal before
+  // creating the contact.
+  if (input.companyName) {
+    const existing = await findCompaniesByName(input.companyName);
+    const exact = existing.find(
+      (c) => c.name.toLowerCase() === input.companyName!.toLowerCase(),
+    );
+    if (exact) {
+      const status = await getCompanyStatus(exact.id);
+      if (status.deals.length > 0) {
+        const existingDeals = status.deals
+          .map((d) => `"${d.name}" (${d.stage})`)
+          .join(", ");
+        throw new Error(
+          `${exact.name} already has deal(s): ${existingDeals}. Not creating a duplicate deal. Add the contact with add_contact instead, or use the existing deal.`,
+        );
+      }
+    }
+  }
+
+  const { contactId, companyId, contactName, companyName } =
+    await createContact(input);
+
+  const dealName = companyName
+    ? formatCompanyDealName(companyName)
+    : formatCompanyDealName(contactName);
 
   const dealProperties: Record<string, string> = {
     dealname: dealName,
@@ -1142,20 +2019,192 @@ export async function createProspect(
 
   const deal = await createCrmObject("deals", dealProperties);
 
-  await associateDefault("contacts", contact.id, "deals", deal.id);
+  await associateDefault("contacts", contactId, "deals", deal.id);
   if (companyId) {
-    await associateDefault("contacts", contact.id, "companies", companyId);
     await associateDefault("companies", companyId, "deals", deal.id);
   }
 
+  await touchLastActivity(
+    "deals",
+    deal.id,
+    `Deal created in ${prospecting.label}`,
+  );
+  if (companyId) {
+    await touchLastActivity(
+      "companies",
+      companyId,
+      `Deal created: ${dealName}`,
+    );
+  }
+
   return {
-    contactId: contact.id,
+    contactId,
     dealId: deal.id,
     companyId,
     contactName,
     dealName,
-    companyName: input.companyName ?? null,
+    companyName,
     stageLabel: prospecting.label,
+  };
+}
+
+export type CreateCompanyDealInput = {
+  companyId: string;
+  companyName: string;
+  contactIds: string[];
+  /** Pipeline stage label; required for create. */
+  stageLabel: string;
+  /** HubSpot deal pipeline id (optional; falls back to env / default). */
+  pipelineId?: string;
+  /** Company lifecycle stage label to set on the company (sales pipelines). */
+  lifecycleStageLabel?: string;
+  /** Relationship type label to set on the company (Partnership pipeline). */
+  relationshipTypeLabel?: string;
+  /** When true, create even if the company already has deals. */
+  force?: boolean;
+};
+
+export type CreateCompanyDealResult = {
+  dealId: string;
+  dealName: string;
+  companyId: string;
+  companyName: string;
+  stageLabel: string;
+  pipelineLabel: string;
+  lifecycleStageLabel: string | null;
+  relationshipTypeLabel: string | null;
+  associatedContactIds: string[];
+};
+
+/**
+ * Create a deal on an existing company, named "[Company] - FlairX", and
+ * associate the company plus every provided contact.
+ * Optionally updates lifecycle stage (sales) or relationship type (Partnership).
+ * Refuses if the company already has deals unless `force` is set.
+ */
+export async function createDealForCompany(
+  input: CreateCompanyDealInput,
+): Promise<CreateCompanyDealResult> {
+  const pipeline = await getPipelineMeta(input.pipelineId);
+  const stageLabel = input.stageLabel.trim();
+  const stage = pipeline.stageByLabel.get(stageLabel.toLowerCase());
+
+  if (!stage) {
+    throw new Error(
+      `Unknown deal pipeline stage "${input.stageLabel}" in pipeline "${pipeline.label}"`,
+    );
+  }
+
+  let lifecycleValue: string | null = null;
+  let lifecycleLabel: string | null = null;
+  if (input.lifecycleStageLabel?.trim()) {
+    const options = await getCompanyLifecycleStageOptions();
+    const match = options.find(
+      (o) =>
+        o.label.toLowerCase() === input.lifecycleStageLabel!.trim().toLowerCase(),
+    );
+    if (!match) {
+      throw new Error(
+        `Unknown company lifecycle stage "${input.lifecycleStageLabel}"`,
+      );
+    }
+    lifecycleValue = match.value;
+    lifecycleLabel = match.label;
+  }
+
+  let relationshipValue: string | null = null;
+  let relationshipLabel: string | null = null;
+  if (input.relationshipTypeLabel?.trim()) {
+    const wanted = input.relationshipTypeLabel.trim();
+    let options: Array<{ label: string; value: string }> = [];
+    try {
+      options = await getRelationshipTypeOptions();
+    } catch (error) {
+      console.warn("[hubspot] relationship_type options failed:", error);
+    }
+    const match = options.find(
+      (o) =>
+        o.label.toLowerCase() === wanted.toLowerCase() ||
+        o.value.toLowerCase() === wanted.toLowerCase(),
+    );
+    if (match) {
+      relationshipValue = match.value;
+      relationshipLabel = match.label;
+    } else if (options.length === 0) {
+      relationshipValue = wanted;
+      relationshipLabel = wanted;
+    } else {
+      throw new Error(`Unknown relationship type "${wanted}"`);
+    }
+  }
+
+  const dealName = formatCompanyDealName(input.companyName);
+
+  if (!input.force) {
+    const status = await getCompanyStatus(input.companyId);
+    if (status.deals.length > 0) {
+      const existing = status.deals
+        .map((d) => `"${d.name}" (${d.stage})`)
+        .join(", ");
+      throw new Error(
+        `${input.companyName} already has deal(s): ${existing}. Not creating a duplicate.`,
+      );
+    }
+  }
+
+  const deal = await createCrmObject("deals", {
+    dealname: dealName,
+    dealstage: stage.id,
+    pipeline: pipeline.id,
+  });
+
+  await associateDefault("companies", input.companyId, "deals", deal.id);
+
+  for (const contactId of input.contactIds) {
+    await associateDefault("contacts", contactId, "deals", deal.id);
+  }
+
+  const companyUpdates: Record<string, string> = {};
+  if (lifecycleValue) {
+    companyUpdates.lifecyclestage = lifecycleValue;
+  }
+  if (relationshipValue) {
+    companyUpdates[relationshipTypeProperty()] = relationshipValue;
+  }
+  if (Object.keys(companyUpdates).length > 0) {
+    await updateObjectProperties("companies", input.companyId, companyUpdates);
+  }
+
+  await touchLastActivity(
+    "deals",
+    deal.id,
+    `Deal created in ${pipeline.label} / ${stage.label}`,
+  );
+  await touchLastActivity(
+    "companies",
+    input.companyId,
+    relationshipLabel
+      ? `Deal created (${stage.label}); relationship type ${relationshipLabel}`
+      : `Deal created in ${stage.label}`,
+  );
+  for (const contactId of input.contactIds) {
+    await touchLastActivity(
+      "contacts",
+      contactId,
+      `Associated to deal ${dealName}`,
+    );
+  }
+
+  return {
+    dealId: deal.id,
+    dealName,
+    companyId: input.companyId,
+    companyName: input.companyName,
+    stageLabel: stage.label,
+    pipelineLabel: pipeline.label,
+    lifecycleStageLabel: lifecycleLabel,
+    relationshipTypeLabel: relationshipLabel,
+    associatedContactIds: [...input.contactIds],
   };
 }
 
@@ -1164,59 +2213,89 @@ export type DealForStageMove = {
   name: string;
   currentStageId: string;
   currentStageLabel: string;
+  pipelineId: string;
+  pipelineLabel: string;
 };
 
+async function dealsFromIds(
+  dealIds: string[],
+): Promise<DealForStageMove[]> {
+  if (dealIds.length === 0) {
+    return [];
+  }
+
+  const stageLabels = await getStageLabels().catch(() => new Map());
+  const pipelines = await fetchDealPipelines();
+  const pipelineLabelById = new Map(
+    pipelines.map((p) => [p.id, p.label?.trim() || p.id]),
+  );
+
+  const deals: DealForStageMove[] = [];
+  for (let i = 0; i < dealIds.length; i += 100) {
+    const chunk = dealIds.slice(i, i + 100);
+    const data = await hubspotFetch<{
+      results: Array<{ id: string; properties: Record<string, string | null> }>;
+    }>("/crm/v3/objects/deals/batch/read", {
+      method: "POST",
+      body: JSON.stringify({
+        properties: ["dealname", "dealstage", "pipeline", "hs_is_closed"],
+        inputs: chunk.map((id) => ({ id })),
+      }),
+    });
+
+    for (const deal of data.results) {
+      const stageId = deal.properties.dealstage ?? "";
+      const pipelineId = deal.properties.pipeline?.trim() ?? "";
+      deals.push({
+        id: deal.id,
+        name: deal.properties.dealname?.trim() || "Untitled deal",
+        currentStageId: stageId,
+        currentStageLabel: stageLabels.get(stageId) || stageId || "—",
+        pipelineId,
+        pipelineLabel: pipelineLabelById.get(pipelineId) || pipelineId || "—",
+      });
+    }
+  }
+
+  return deals;
+}
+
 /**
- * Resolve candidate deals for a stage move, by company name and/or deal name.
- * Returns ambiguous company matches so the caller can ask for clarification.
+ * Resolve candidate deals for a stage move by company, deal, or contact name.
+ * Each deal includes its HubSpot pipeline so stage labels are validated against
+ * that pipeline (Sales vs Partnerships), not the default Sales pipeline.
  */
 export async function resolveDealsForStageMove(opts: {
   companyName?: string;
   dealName?: string;
+  contactName?: string;
 }): Promise<{
   ambiguousCompanies?: Array<{ id: string; name: string; domain: string }>;
   deals: DealForStageMove[];
 }> {
-  const stageLabels = await getStageLabels().catch(() => new Map());
-  const toDeal = (
-    id: string,
-    name: string,
-    stageId: string,
-  ): DealForStageMove => ({
-    id,
-    name,
-    currentStageId: stageId,
-    currentStageLabel: stageLabels.get(stageId) || stageId || "—",
-  });
-
   if (opts.companyName) {
     const companies = await findCompaniesByName(opts.companyName);
     if (companies.length === 0) {
-      return { deals: [] };
-    }
-    if (companies.length > 1) {
+      // Fall through: "Yogi Chugh" may be a contact, not a company.
+    } else if (companies.length > 1) {
       return { ambiguousCompanies: companies, deals: [] };
-    }
-
-    const status = await getCompanyStatus(companies[0].id);
-    let deals = status.deals.map((deal) =>
-      toDeal(
-        deal.id,
-        deal.name,
-        // getCompanyStatus already resolved stage to a label; re-resolve id
-        [...stageLabels.entries()].find(([, label]) => label === deal.stage)?.[0] ??
-          deal.stage,
-      ),
-    );
-
-    if (opts.dealName) {
-      const needle = opts.dealName.toLowerCase();
-      deals = deals.filter((deal) =>
-        deal.name.toLowerCase().includes(needle),
+    } else {
+      const associations = await hubspotFetch<HubSpotAssociationResponse>(
+        `/crm/v4/objects/companies/${companies[0].id}/associations/deals`,
+      ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+      let deals = await dealsFromIds(
+        associations.results.map((r) => r.toObjectId),
       );
+      if (opts.dealName) {
+        const needle = opts.dealName.toLowerCase();
+        deals = deals.filter((deal) =>
+          deal.name.toLowerCase().includes(needle),
+        );
+      }
+      if (deals.length > 0) {
+        return { deals };
+      }
     }
-
-    return { deals };
   }
 
   if (opts.dealName) {
@@ -1236,24 +2315,872 @@ export async function resolveDealsForStageMove(opts: {
               ],
             },
           ],
-          properties: ["dealname", "dealstage"],
+          properties: ["dealname", "dealstage", "pipeline"],
           limit: 10,
         }),
       },
     );
 
-    return {
-      deals: search.results.map((deal) =>
-        toDeal(
-          deal.id,
-          deal.properties.dealname?.trim() || "Untitled deal",
-          deal.properties.dealstage ?? "",
-        ),
-      ),
-    };
+    const deals = await dealsFromIds(search.results.map((d) => d.id));
+    if (deals.length > 0) {
+      return { deals };
+    }
+  }
+
+  const personName =
+    opts.contactName?.trim() ||
+    opts.companyName?.trim() ||
+    opts.dealName?.trim() ||
+    "";
+  if (personName) {
+    const contacts = await findContactsByName(personName);
+    const exact = contacts.filter(
+      (c) => c.name.toLowerCase() === personName.toLowerCase(),
+    );
+    const candidates = exact.length > 0 ? exact : contacts.slice(0, 5);
+    const dealIds = new Set<string>();
+    for (const contact of candidates) {
+      for (const id of await listAssociatedDealIds("contacts", contact.id)) {
+        dealIds.add(id);
+      }
+    }
+    const deals = await dealsFromIds([...dealIds]);
+    if (deals.length > 0) {
+      return { deals };
+    }
   }
 
   return { deals: [] };
 }
 
 export { parseContactName };
+
+export type MarketingJunkContact = {
+  id: string;
+  name: string;
+  email: string;
+  companyId: string | null;
+  companyName: string;
+  sourceLabel: string;
+  reason: string;
+};
+
+export type MarketingJunkCompany = {
+  id: string;
+  name: string;
+  domain: string;
+  reason: string;
+};
+
+export type MarketingJunkScan = {
+  contacts: MarketingJunkContact[];
+  companies: MarketingJunkCompany[];
+  truncated: boolean;
+};
+
+const MARKETING_EMAIL_LOCAL_PARTS = [
+  "noreply",
+  "no-reply",
+  "donotreply",
+  "do-not-reply",
+  "newsletter",
+  "marketing",
+  "updates",
+  "notifications",
+  "mailer-daemon",
+];
+
+function internalEmailDomains(): string[] {
+  const raw =
+    process.env.INTERNAL_EMAIL_DOMAINS?.trim() ||
+    process.env.GMAIL_SENDER_EMAIL?.split("@")[1] ||
+    "flairx.ai";
+  return raw
+    .split(",")
+    .map((d) => d.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isInternalEmail(email: string): boolean {
+  const domain = email.split("@")[1]?.toLowerCase();
+  if (!domain) {
+    return false;
+  }
+  return internalEmailDomains().some(
+    (d) => domain === d || domain.endsWith(`.${d}`),
+  );
+}
+
+function isMarketingLocalPart(email: string): boolean {
+  const local = email.split("@")[0]?.toLowerCase() ?? "";
+  return MARKETING_EMAIL_LOCAL_PARTS.some(
+    (p) =>
+      local === p || local.startsWith(`${p}+`) || local.startsWith(`${p}.`),
+  );
+}
+
+function looksLikeConversationsSource(
+  source: string,
+  sourceLabel: string,
+  detail: string,
+): boolean {
+  const blob = `${source} ${sourceLabel} ${detail}`.toLowerCase();
+  return (
+    blob.includes("conversation") ||
+    source.toUpperCase() === "CONVERSATIONS" ||
+    source.toUpperCase() === "EMAIL_INTEGRATION"
+  );
+}
+
+async function contactHasDeals(contactId: string): Promise<boolean> {
+  const associations = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/contacts/${contactId}/associations/deals`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+  return associations.results.length > 0;
+}
+
+async function companyHasDeals(companyId: string): Promise<boolean> {
+  const associations = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/companies/${companyId}/associations/deals`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+  return associations.results.length > 0;
+}
+
+export type CrmActivitySnippet = {
+  kind: "email" | "note" | "source";
+  title: string;
+  body: string;
+};
+
+export type RecentCrmRecord = {
+  objectType: "contacts" | "companies";
+  id: string;
+  name: string;
+  email: string;
+  domain: string;
+  companyName: string;
+  sourceLabel: string;
+  snippets: CrmActivitySnippet[];
+};
+
+export type EmailEngagement = {
+  id: string;
+  subject: string;
+  from: string;
+  to: string;
+  body: string;
+  direction: string;
+  timestampMs: number | null;
+};
+
+async function searchRecentObjects(
+  objectType: "contacts" | "companies",
+  properties: string[],
+  createdAfterMs: number,
+  maxResults: number,
+): Promise<HubSpotSearchResult[]> {
+  const results: HubSpotSearchResult[] = [];
+  let after: string | undefined;
+
+  while (results.length < maxResults) {
+    const page = await hubspotFetch<HubSpotSearchResponse>(
+      `/crm/v3/objects/${objectType}/search`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: [
+            {
+              filters: [
+                {
+                  propertyName: "createdate",
+                  operator: "GTE",
+                  value: String(createdAfterMs),
+                },
+              ],
+            },
+          ],
+          properties,
+          sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+          limit: Math.min(100, maxResults - results.length),
+          ...(after ? { after } : {}),
+        }),
+      },
+    );
+    results.push(...page.results);
+    after = page.paging?.next?.after;
+    if (!after || page.results.length === 0) {
+      break;
+    }
+  }
+
+  return results;
+}
+
+export async function getRecentEmails(
+  objectType: "contacts" | "companies" | "deals",
+  id: string,
+  limit = 5,
+): Promise<EmailEngagement[]> {
+  const associations = await hubspotFetch<HubSpotAssociationResponse>(
+    `/crm/v4/objects/${objectType}/${id}/associations/emails`,
+  ).catch(() => ({ results: [] }) as HubSpotAssociationResponse);
+
+  const emailIds = associations.results.map((r) => r.toObjectId);
+  if (emailIds.length === 0) {
+    return [];
+  }
+
+  const emails: EmailEngagement[] = [];
+  for (let i = 0; i < emailIds.length; i += 100) {
+    const chunk = emailIds.slice(i, i + 100);
+    const data = await hubspotFetch<{
+      results: Array<{ id: string; properties: Record<string, string | null> }>;
+    }>("/crm/v3/objects/emails/batch/read", {
+      method: "POST",
+      body: JSON.stringify({
+        properties: [
+          "hs_email_subject",
+          "hs_email_text",
+          "hs_email_html",
+          "hs_email_direction",
+          "hs_email_from_email",
+          "hs_email_to_email",
+          "hs_timestamp",
+        ],
+        inputs: chunk.map((emailId) => ({ id: emailId })),
+      }),
+    });
+
+    for (const email of data.results) {
+      const rawTimestamp = email.properties.hs_timestamp;
+      const timestampMs = rawTimestamp
+        ? Number.isFinite(Number(rawTimestamp))
+          ? Number(rawTimestamp)
+          : Date.parse(rawTimestamp) || null
+        : null;
+      const body =
+        stripHtml(email.properties.hs_email_text) ||
+        stripHtml(email.properties.hs_email_html);
+      emails.push({
+        id: email.id,
+        subject: email.properties.hs_email_subject?.trim() ?? "",
+        from: email.properties.hs_email_from_email?.trim() ?? "",
+        to: email.properties.hs_email_to_email?.trim() ?? "",
+        body,
+        direction: email.properties.hs_email_direction?.trim() ?? "",
+        timestampMs,
+      });
+    }
+  }
+
+  return emails
+    .sort((a, b) => (b.timestampMs ?? 0) - (a.timestampMs ?? 0))
+    .slice(0, limit);
+}
+
+function snippetsFromEmails(emails: EmailEngagement[]): CrmActivitySnippet[] {
+  return emails.map((email) => ({
+    kind: "email" as const,
+    title: [email.subject, email.from ? `from ${email.from}` : ""]
+      .filter(Boolean)
+      .join(" · ") || "Logged email",
+    body: email.body.slice(0, 1200),
+  }));
+}
+
+function snippetsFromNotes(
+  notes: Array<{ body: string }>,
+): CrmActivitySnippet[] {
+  return notes
+    .filter((note) => note.body.trim())
+    .map((note) => ({
+      kind: "note" as const,
+      title: "HubSpot note",
+      body: note.body.slice(0, 1200),
+    }));
+}
+
+/**
+ * Contacts and companies created after `createdAfterMs`, with logged emails /
+ * notes attached. Skips internal emails, records with deals, and blank-name
+ * companies (those are handled by the unnamed-company job). Contacts on
+ * existing companies are dropped later, before Slack, by marketing cleanup.
+ */
+export async function listRecentRecordsWithActivity(
+  createdAfterMs: number,
+  maxRecords = 40,
+): Promise<{ records: RecentCrmRecord[]; truncated: boolean }> {
+  const scanCap = Math.max(maxRecords * 2, 60);
+  const [rawContacts, rawCompanies] = await Promise.all([
+    searchRecentObjects(
+      "contacts",
+      [
+        "firstname",
+        "lastname",
+        "email",
+        "company",
+        "hs_object_source",
+        "hs_object_source_label",
+        "hs_object_source_detail_1",
+        "createdate",
+      ],
+      createdAfterMs,
+      scanCap,
+    ),
+    searchRecentObjects(
+      "companies",
+      ["name", "domain", "createdate"],
+      createdAfterMs,
+      scanCap,
+    ),
+  ]);
+
+  const records: RecentCrmRecord[] = [];
+
+  for (const contact of rawContacts) {
+    if (records.length >= maxRecords) {
+      break;
+    }
+    const email = contact.properties.email?.trim() ?? "";
+    if (email && isInternalEmail(email)) {
+      continue;
+    }
+    if (await contactHasDeals(contact.id)) {
+      continue;
+    }
+
+    const first = contact.properties.firstname?.trim() ?? "";
+    const last = contact.properties.lastname?.trim() ?? "";
+    const name = `${first} ${last}`.trim() || email || "Unknown contact";
+    const source = contact.properties.hs_object_source?.trim() ?? "";
+    const sourceLabel =
+      contact.properties.hs_object_source_label?.trim() ?? "";
+    const detail =
+      contact.properties.hs_object_source_detail_1?.trim() ?? "";
+
+    const [emails, notes, company] = await Promise.all([
+      getRecentEmails("contacts", contact.id, 5).catch(() => []),
+      getRecentNotes("contacts", contact.id, 3).catch(() => []),
+      getAssociatedCompany(contact.id).catch(() => null),
+    ]);
+
+    const snippets: CrmActivitySnippet[] = [
+      ...snippetsFromEmails(emails),
+      ...snippetsFromNotes(notes),
+    ];
+    if (source || sourceLabel) {
+      snippets.push({
+        kind: "source",
+        title: "HubSpot source",
+        body: [sourceLabel || source, detail].filter(Boolean).join(" · "),
+      });
+    }
+
+    records.push({
+      objectType: "contacts",
+      id: contact.id,
+      name,
+      email,
+      domain: email.split("@")[1]?.toLowerCase() ?? "",
+      companyName: company?.name || contact.properties.company?.trim() || "",
+      sourceLabel: sourceLabel || source || "—",
+      snippets,
+    });
+  }
+
+  for (const company of rawCompanies) {
+    if (records.filter((r) => r.objectType === "companies").length >= maxRecords) {
+      break;
+    }
+    const name = company.properties.name?.trim() ?? "";
+    if (!name) {
+      continue;
+    }
+    if (await companyHasDeals(company.id)) {
+      continue;
+    }
+
+    const [emails, notes] = await Promise.all([
+      getRecentEmails("companies", company.id, 5).catch(() => []),
+      getRecentNotes("companies", company.id, 3).catch(() => []),
+    ]);
+
+    const snippets: CrmActivitySnippet[] = [
+      ...snippetsFromEmails(emails),
+      ...snippetsFromNotes(notes),
+    ];
+
+    records.push({
+      objectType: "companies",
+      id: company.id,
+      name,
+      email: "",
+      domain: company.properties.domain?.trim() ?? "",
+      companyName: name,
+      sourceLabel: "company",
+      snippets,
+    });
+  }
+
+  return {
+    records,
+    truncated:
+      rawContacts.length >= scanCap || rawCompanies.length >= scanCap,
+  };
+}
+
+export type ScanMarketingJunkOptions = {
+  /** Only include contacts created at/after this unix ms timestamp. */
+  createdAfterMs?: number;
+};
+
+type HubSpotSearchFilter = {
+  propertyName: string;
+  operator: string;
+  value: string;
+};
+
+function marketingSourceFilterGroups(
+  createdAfterMs?: number,
+): Array<{ filters: HubSpotSearchFilter[] }> {
+  const createdFilter: HubSpotSearchFilter | null =
+    createdAfterMs != null
+      ? {
+          propertyName: "createdate",
+          operator: "GTE",
+          value: String(createdAfterMs),
+        }
+      : null;
+
+  const withCreated = (
+    filters: HubSpotSearchFilter[],
+  ): HubSpotSearchFilter[] =>
+    createdFilter ? [...filters, createdFilter] : filters;
+
+  return [
+    {
+      filters: withCreated([
+        {
+          propertyName: "hs_object_source",
+          operator: "EQ",
+          value: "CONVERSATIONS",
+        },
+      ]),
+    },
+    {
+      filters: withCreated([
+        {
+          propertyName: "hs_object_source",
+          operator: "EQ",
+          value: "EMAIL_INTEGRATION",
+        },
+      ]),
+    },
+    {
+      filters: withCreated([
+        {
+          propertyName: "hs_object_source_label",
+          operator: "CONTAINS_TOKEN",
+          value: "Conversations",
+        },
+      ]),
+    },
+  ];
+}
+
+const MARKETING_SCAN_PROPERTIES = [
+  "firstname",
+  "lastname",
+  "email",
+  "company",
+  "hs_lead_status",
+  "hs_object_source",
+  "hs_object_source_label",
+  "hs_object_source_detail_1",
+  "createdate",
+];
+
+async function searchContactsForMarketingScan(
+  maxResults: number,
+  createdAfterMs?: number,
+): Promise<HubSpotSearchResult[]> {
+  const filterGroups = marketingSourceFilterGroups(createdAfterMs);
+  const results: HubSpotSearchResult[] = [];
+  let after: string | undefined;
+
+  while (results.length < maxResults) {
+    const page = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/contacts/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups,
+          properties: MARKETING_SCAN_PROPERTIES,
+          limit: Math.min(100, maxResults - results.length),
+          sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+          ...(after ? { after } : {}),
+        }),
+      },
+    );
+    results.push(...page.results);
+    after = page.paging?.next?.after;
+    if (!after || page.results.length === 0) {
+      break;
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Find auto-created inbound marketing / cold-outreach contacts (Conversations /
+ * email integration, no deals) and companies that only have those contacts.
+ */
+export async function scanMarketingJunk(
+  maxContacts = 40,
+  options: ScanMarketingJunkOptions = {},
+): Promise<MarketingJunkScan> {
+  const scanCap = Math.max(maxContacts * 3, 60);
+  const createdAfterMs = options.createdAfterMs;
+  let raw: HubSpotSearchResult[] = [];
+  try {
+    raw = await searchContactsForMarketingScan(scanCap, createdAfterMs);
+  } catch (error) {
+    console.warn("[cleanup] primary contact search failed:", error);
+    const page = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/contacts/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: marketingSourceFilterGroups(createdAfterMs).slice(0, 2),
+          properties: MARKETING_SCAN_PROPERTIES,
+          sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+          limit: scanCap,
+        }),
+      },
+    );
+    raw = page.results;
+  }
+
+  const contacts: MarketingJunkContact[] = [];
+  const junkContactIds = new Set<string>();
+  const companyIdsFromJunk = new Set<string>();
+
+  for (const contact of raw) {
+    if (contacts.length >= maxContacts) {
+      break;
+    }
+
+    if (createdAfterMs != null) {
+      const createdRaw = contact.properties.createdate?.trim() ?? "";
+      const createdMs = Number(createdRaw);
+      if (Number.isFinite(createdMs) && createdMs < createdAfterMs) {
+        continue;
+      }
+    }
+
+    const email = contact.properties.email?.trim() ?? "";
+    if (email && isInternalEmail(email)) {
+      continue;
+    }
+
+    const source = contact.properties.hs_object_source?.trim() ?? "";
+    const sourceLabel =
+      contact.properties.hs_object_source_label?.trim() ?? "";
+    const detail =
+      contact.properties.hs_object_source_detail_1?.trim() ?? "";
+
+    const marketingLocal = email ? isMarketingLocalPart(email) : false;
+    const conversations = looksLikeConversationsSource(
+      source,
+      sourceLabel,
+      detail,
+    );
+    if (!conversations && !marketingLocal) {
+      continue;
+    }
+
+    if (await contactHasDeals(contact.id)) {
+      continue;
+    }
+
+    const first = contact.properties.firstname?.trim() ?? "";
+    const last = contact.properties.lastname?.trim() ?? "";
+    const name = `${first} ${last}`.trim() || email || "Unknown contact";
+
+    let companyId: string | null = null;
+    let companyName = contact.properties.company?.trim() ?? "";
+    try {
+      const company = await getAssociatedCompany(contact.id);
+      if (company) {
+        companyId = company.id;
+        companyName = company.name || companyName;
+        companyIdsFromJunk.add(company.id);
+      }
+    } catch {
+      // ignore association failures
+    }
+
+    const reason = conversations
+      ? `auto-created (${sourceLabel || source || "Conversations"}) · 0 deals`
+      : `marketing-style email · 0 deals`;
+
+    contacts.push({
+      id: contact.id,
+      name,
+      email,
+      companyId,
+      companyName,
+      sourceLabel: sourceLabel || source || "—",
+      reason,
+    });
+    junkContactIds.add(contact.id);
+  }
+
+  const companies: MarketingJunkCompany[] = [];
+  for (const companyId of companyIdsFromJunk) {
+    if (companies.length >= maxContacts) {
+      break;
+    }
+    try {
+      const status = await getCompanyStatus(companyId);
+      if (status.deals.length > 0) {
+        continue;
+      }
+      const otherContacts = status.contacts.filter(
+        (c) => !junkContactIds.has(c.id),
+      );
+      if (otherContacts.length > 0) {
+        continue;
+      }
+      companies.push({
+        id: companyId,
+        name: status.name,
+        domain: status.domain,
+        reason: "0 deals · only marketing/auto-created contacts",
+      });
+    } catch {
+      // skip company on lookup failure
+    }
+  }
+
+  return {
+    contacts,
+    companies,
+    truncated: raw.length >= scanCap || contacts.length >= maxContacts,
+  };
+}
+
+/** Soft-delete (archive) a HubSpot contact or company. Restorable ~90 days. */
+export async function archiveCrmObject(
+  objectType: "contacts" | "companies",
+  id: string,
+): Promise<void> {
+  await hubspotFetch(`/crm/v3/objects/${objectType}/${id}`, {
+    method: "DELETE",
+  });
+}
+
+export async function archiveMarketingJunk(input: {
+  contactIds: string[];
+  companyIds: string[];
+}): Promise<{
+  archivedContacts: number;
+  archivedCompanies: number;
+  errors: string[];
+}> {
+  const errors: string[] = [];
+  let archivedContacts = 0;
+  let archivedCompanies = 0;
+
+  for (const id of input.contactIds) {
+    try {
+      await archiveCrmObject("contacts", id);
+      archivedContacts += 1;
+    } catch (error) {
+      errors.push(
+        `contact ${id}: ${error instanceof Error ? error.message : "failed"}`,
+      );
+    }
+  }
+
+  for (const id of input.companyIds) {
+    try {
+      await archiveCrmObject("companies", id);
+      archivedCompanies += 1;
+    } catch (error) {
+      errors.push(
+        `company ${id}: ${error instanceof Error ? error.message : "failed"}`,
+      );
+    }
+  }
+
+  return { archivedContacts, archivedCompanies, errors };
+}
+
+export type UnnamedCompanyCleanupResult = {
+  archivedCompanies: number;
+  archivedContacts: number;
+  neverLogEmails: string[];
+  neverLogDomains: string[];
+  errors: string[];
+  items: Array<{
+    companyId: string;
+    domain: string;
+    contactIds: string[];
+    emails: string[];
+  }>;
+};
+
+function isBlankCompanyName(name: string | null | undefined): boolean {
+  return !name?.trim();
+}
+
+/**
+ * Find companies with no name (optionally created after `createdAfterMs`),
+ * archive them and their associated contacts (skip if any deals), and return
+ * emails/domains for Never Log.
+ */
+export async function cleanupUnnamedCompanies(
+  options: { createdAfterMs?: number; maxCompanies?: number } = {},
+): Promise<UnnamedCompanyCleanupResult> {
+  const maxCompanies = options.maxCompanies ?? 40;
+  const createdAfterMs = options.createdAfterMs;
+  const createdFilter =
+    createdAfterMs != null
+      ? {
+          propertyName: "createdate",
+          operator: "GTE",
+          value: String(createdAfterMs),
+        }
+      : null;
+
+  const filterGroups = [
+    {
+      filters: [
+        { propertyName: "name", operator: "NOT_HAS_PROPERTY" },
+        ...(createdFilter ? [createdFilter] : []),
+      ],
+    },
+    {
+      filters: [
+        { propertyName: "name", operator: "EQ", value: "" },
+        ...(createdFilter ? [createdFilter] : []),
+      ],
+    },
+  ];
+
+  let raw: HubSpotSearchResult[] = [];
+  try {
+    const page = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/companies/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups,
+          properties: ["name", "domain", "createdate"],
+          sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+          limit: Math.min(100, maxCompanies * 2),
+        }),
+      },
+    );
+    raw = page.results;
+  } catch (error) {
+    console.warn("[cleanup] unnamed company search failed:", error);
+    // Fallback: recent companies, filter blank names client-side.
+    const filters = createdFilter ? [createdFilter] : [];
+    const page = await hubspotFetch<HubSpotSearchResponse>(
+      "/crm/v3/objects/companies/search",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: filters.length > 0 ? [{ filters }] : undefined,
+          properties: ["name", "domain", "createdate"],
+          sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+          limit: 100,
+        }),
+      },
+    );
+    raw = page.results.filter((c) =>
+      isBlankCompanyName(c.properties.name),
+    );
+  }
+
+  const result: UnnamedCompanyCleanupResult = {
+    archivedCompanies: 0,
+    archivedContacts: 0,
+    neverLogEmails: [],
+    neverLogDomains: [],
+    errors: [],
+    items: [],
+  };
+
+  for (const company of raw) {
+    if (result.items.length >= maxCompanies) {
+      break;
+    }
+    if (!isBlankCompanyName(company.properties.name)) {
+      continue;
+    }
+    if (createdAfterMs != null) {
+      const createdMs = Number(company.properties.createdate ?? "");
+      if (Number.isFinite(createdMs) && createdMs < createdAfterMs) {
+        continue;
+      }
+    }
+
+    try {
+      const status = await getCompanyStatus(company.id);
+      if (status.deals.length > 0) {
+        continue;
+      }
+
+      const emails = status.contacts
+        .map((c) => c.email.trim().toLowerCase())
+        .filter(Boolean);
+      const domain = status.domain.trim().toLowerCase();
+      const contactIds = status.contacts.map((c) => c.id);
+
+      for (const contactId of contactIds) {
+        try {
+          await archiveCrmObject("contacts", contactId);
+          result.archivedContacts += 1;
+        } catch (error) {
+          result.errors.push(
+            `contact ${contactId}: ${error instanceof Error ? error.message : "failed"}`,
+          );
+        }
+      }
+
+      try {
+        await archiveCrmObject("companies", company.id);
+        result.archivedCompanies += 1;
+      } catch (error) {
+        result.errors.push(
+          `company ${company.id}: ${error instanceof Error ? error.message : "failed"}`,
+        );
+        continue;
+      }
+
+      result.items.push({
+        companyId: company.id,
+        domain,
+        contactIds,
+        emails,
+      });
+      result.neverLogEmails.push(...emails);
+      if (domain) {
+        result.neverLogDomains.push(domain);
+      }
+    } catch (error) {
+      result.errors.push(
+        `company ${company.id}: ${error instanceof Error ? error.message : "failed"}`,
+      );
+    }
+  }
+
+  result.neverLogEmails = [...new Set(result.neverLogEmails)];
+  result.neverLogDomains = [...new Set(result.neverLogDomains)];
+  return result;
+}
+

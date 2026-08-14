@@ -1,13 +1,13 @@
 import type { App } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
 import { hubspotRecordUrl } from "../digest/format.js";
-import { touchLastActivity, updateObjectProperties } from "../integrations/hubspot.js";
+import { createDealForCompany } from "../integrations/hubspot.js";
 import {
-  beginLeadStatusAction,
-  completeLeadStatusAction,
-  releaseLeadStatusAction,
-  takeLeadStatus,
-} from "../lib/leadStatusStore.js";
+  beginCompanyDealAction,
+  completeCompanyDealAction,
+  releaseCompanyDealAction,
+  takeCompanyDeal,
+} from "../lib/companyDealStore.js";
 import { postThread } from "../lib/slackPost.js";
 
 function actionContext(body: {
@@ -36,6 +36,7 @@ async function replaceMessage(
   if (!channelId || !messageTs) {
     return;
   }
+
   await client.chat.update({
     channel: channelId,
     ts: messageTs,
@@ -44,8 +45,8 @@ async function replaceMessage(
   });
 }
 
-export function registerLeadStatusActions(app: App): void {
-  app.action("approve_lead_status", async ({ ack, body, action, client }) => {
+export function registerCompanyDealActions(app: App): void {
+  app.action("approve_create_company_deal", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -54,7 +55,7 @@ export function registerLeadStatusActions(app: App): void {
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
     const pendingId = action.value;
-    const result = beginLeadStatusAction(pendingId, userId);
+    const result = beginCompanyDealAction(pendingId, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -62,7 +63,7 @@ export function registerLeadStatusActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This lead status update expired. Mention me again to redo it.",
+          "This company deal preview expired. Mention me again to create the deal.",
         );
       }
       return;
@@ -74,7 +75,7 @@ export function registerLeadStatusActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who requested this update can approve or discard it.",
+          "Only the person who requested this deal can approve or discard it.",
         );
       }
       return;
@@ -83,37 +84,44 @@ export function registerLeadStatusActions(app: App): void {
     const pending = result.pending;
 
     try {
-      await updateObjectProperties("contacts", pending.contactId, {
-        hs_lead_status: pending.statusValue,
+      const created = await createDealForCompany({
+        companyId: pending.companyId,
+        companyName: pending.companyName,
+        contactIds: pending.contacts.map((c) => c.id),
+        pipelineId: pending.pipelineId,
+        stageLabel: pending.stageLabel,
+        ...(pending.companyFieldKind === "relationship" && pending.companyFieldLabel
+          ? { relationshipTypeLabel: pending.companyFieldLabel }
+          : {}),
+        force: pending.force === true,
       });
-      await touchLastActivity(
-        "contacts",
-        pending.contactId,
-        `Lead status → ${pending.statusLabel}`,
-      );
+      completeCompanyDealAction(pendingId);
 
-      completeLeadStatusAction(pendingId);
-
-      const url = hubspotRecordUrl("contact", pending.contactId);
-      const successText = `Updated lead status for <${url}|${pending.contactName}> to *${pending.statusLabel}*.`;
+      const dealUrl = hubspotRecordUrl("deal", created.dealId);
+      const companyUrl = hubspotRecordUrl("company", created.companyId);
+      const contactCount = created.associatedContactIds.length;
+      const fieldPart =
+        pending.companyFieldKind === "relationship" &&
+        created.relationshipTypeLabel
+          ? ` · relationship *${created.relationshipTypeLabel}*`
+          : "";
+      const successText = `Deal created: <${dealUrl}|${created.dealName}> (${created.pipelineLabel} / ${created.stageLabel}) · company <${companyUrl}|${created.companyName}>${fieldPart} · ${contactCount} contact${contactCount === 1 ? "" : "s"} associated`;
       await replaceMessage(client, channelId, messageTs, successText);
 
       if (channelId && !messageTs) {
         await postThread(client, channelId, threadTs, successText);
       }
     } catch (error) {
-      releaseLeadStatusAction(pendingId);
+      releaseCompanyDealAction(pendingId);
       const message =
-        error instanceof Error
-          ? error.message
-          : "Failed to update lead status";
+        error instanceof Error ? error.message : "Failed to create company deal";
       if (channelId) {
         await postThread(client, channelId, threadTs, message);
       }
     }
   });
 
-  app.action("discard_lead_status", async ({ ack, body, action, client }) => {
+  app.action("discard_create_company_deal", async ({ ack, body, action, client }) => {
     await ack();
 
     if (action.type !== "button" || !action.value) {
@@ -121,7 +129,7 @@ export function registerLeadStatusActions(app: App): void {
     }
 
     const { channelId, messageTs, threadTs, userId } = actionContext(body);
-    const result = takeLeadStatus(action.value, userId);
+    const result = takeCompanyDeal(action.value, userId);
 
     if (result.status === "not_found") {
       if (channelId) {
@@ -129,7 +137,7 @@ export function registerLeadStatusActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "This lead status update already expired or was discarded.",
+          "This company deal preview already expired or was discarded.",
         );
       }
       return;
@@ -141,13 +149,13 @@ export function registerLeadStatusActions(app: App): void {
           client,
           channelId,
           threadTs,
-          "Only the person who requested this update can approve or discard it.",
+          "Only the person who requested this deal can approve or discard it.",
         );
       }
       return;
     }
 
-    const discardText = `Lead status update for *${result.pending.contactName}* discarded.`;
+    const discardText = `Deal for *${result.pending.companyName}* discarded.`;
     await replaceMessage(client, channelId, messageTs, discardText);
 
     if (channelId && !messageTs) {

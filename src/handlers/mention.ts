@@ -1,8 +1,15 @@
 import type { App } from "@slack/bolt";
 import type OpenAI from "openai";
-import { executeTool, toolDefinitions, type ToolContext } from "../agent/tools.js";
+import { executeTool, runCleanupMarketing, toolDefinitions, type ToolContext } from "../agent/tools.js";
+import {
+  continueDealCreate,
+  isDealCreateCancel,
+  isDealCreatePick,
+} from "../lib/dealCreateFlow.js";
+import { getDealCreateSession } from "../lib/dealCreateStore.js";
 import {
   fetchSlackImageAsDataUrl,
+  filterImageFiles,
   imageFilesFrom,
   type SlackFile,
 } from "../lib/slackFiles.js";
@@ -21,50 +28,77 @@ const TRIVIAL_REPLY_MAX_WORDS = 6;
 const SYSTEM_PROMPT = `You are FlairX GTM Bot, a go-to-market assistant that lives in Slack for FlairX (an AI interview platform). The team mentions you in plain English and you take GTM actions in HubSpot and Gmail.
 
 You can:
-- Answer questions about the sales pipeline stages and contact lead statuses.
+- Answer questions about the sales pipeline stages, contact lead statuses, and company lifecycle stages.
+- List companies in a lifecycle stage (e.g. all Customers).
 - Look up records and post a company status card (deals, contacts, notes, last activity).
 - Add a dated note to a contact, company, or deal (this also refreshes the last-activity date).
 - Change a contact's lead status (e.g. to Connected).
-- Add a new prospect (contact + optional company + a deal in Prospecting).
+- Add a new contact (+ optional company), or a full prospect with a deal in Prospecting when explicitly requested.
+- Create a deal on an existing company (named "[Company] - FlairX") and associate all of that company's contacts.
 - Move a deal to a different pipeline stage.
-- Set a follow-up reminder in N days (creates a HubSpot task + a scheduled Slack nudge).
+- Set a follow-up reminder in minutes, hours, or days (creates a HubSpot task + a scheduled Slack nudge).
 - Draft templated or custom emails into Gmail Drafts, and find sent emails that have not been replied to.
 - Summarize an email thread into notes on the matching contact and its company.
+- Clean up inbound marketing contacts/companies created in the last 24 hours after reviewing logged emails (cleanup_marketing_records — one approval card per record; also runs daily at 8am).
+- Post the daily digest: scan open deals, read email chains/notes, and list only deals that need a follow-up (with why). Each row can draft a personalized email.
 
 Rules:
+- VOICE (strict — overrides everything else for user-visible text):
+  • Default reply: 1–2 short sentences. Never write paragraphs.
+  • Forbidden: "It looks like", "Would you like", "Please confirm", "Let me know if", "I will now proceed", "Before I can", re-asking something already answered, asking for company lifecycle when creating a deal.
+  • After any approval card: say only "Review the card above — Approve or Discard." (or ≤8 words). Do not describe card fields.
+  • Numbered disambiguation: one-line prompt, then EACH option on its own line (never "1. A 2. B 3. C" on one line). No preamble or recap. If a tool already posted the list to Slack, do not restate it.
+  • NEVER echo tool internals to the user: no "[pick posted]", "<<<PICK_USER>>>", "[pick] …", "ids (model only)", or HubSpot ids. Those are for you only.
+  • Errors/blockers: one sentence — what failed + what to do next. No apologies or repetition.
+  • Tool results are internal; translate them into minimal user text. Never paste tool instructions verbatim.
 - A single request can require multiple actions — call each relevant tool. For example, "update notes for Acme — demoed today, and remind me to follow up in 2 days" should call both update_notes and schedule_follow_up, producing two approval cards.
-- Every action that writes to HubSpot or Gmail posts an approval card with Approve/Discard buttons. You never complete a write yourself; after calling a write tool, tell the user you posted a preview for them to approve. Do not claim a record was created, moved, or drafted — only that a preview is ready.
+- Every action that writes to HubSpot or Gmail posts an approval card with Approve/Discard buttons. You never complete a write yourself; after calling a write tool, tell the user a preview is ready (briefly). Do not claim a record was created, moved, or drafted — only that a preview is ready.
 - The bot never sends email; drafts are saved to Gmail Drafts for a human to send.
 - The approval card IS the confirmation step. Never ask the user to verbally confirm an action before you post its card (do not say "just to confirm" or "shall I proceed?"). As soon as you know what to do, call the tool so the card appears; the user confirms by clicking Approve.
 - Disambiguation happens at most once. When a tool reports multiple matches, present them to the user as a NUMBERED list exactly like "1. ...", "2. ...", and ask them to "reply with the number". Do not list the internal ids. When the user replies with a number (or otherwise names one), immediately call the tool again for that specific record — do NOT ask another clarifying or confirmation question. Never re-ask something the user already answered.
 - Changing a contact's lead status is a CONTACT action — use update_lead_status, not notes and not deals. Do not offer a deal as an option for a lead-status change.
-- The conversation may span several Slack messages in a thread. Use the prior turns as context: if you asked a clarifying question and the user answers ("yes", "the first one", an email, "1", etc.), act on it using the earlier context instead of starting over. Never reply with a generic greeting mid-conversation.
+- To add someone to HubSpot, default to add_contact (contact + optional company, no deal). Use add_prospect only when the user names a *new person* to add as a prospect (e.g. "add Jane Doe as a prospect"). Never use add_prospect to put an existing company into the pipeline.
+- CRITICAL routing for deals:
+  • "move Acme to deals", "add Acme to deals/pipeline", "create a deal for Acme", "new deal for Acme", or follow-ups like "new deal" / "create a new one" after talking about a company → call create_company_deal immediately. Do NOT call move_deal_stage. Do NOT call get_company_status first unless the user asked for status. Do NOT ask for deal name, contacts, first name, or email — deal name is always "[Company] - FlairX", all company contacts are auto-associated.
+  • create_company_deal flow (strict): call create_company_deal with company_name only. Do NOT pass pipeline/stage/relationship_type. Do NOT call get_pipeline_stages. Do NOT list stages or ids yourself. The tool asks pipeline, then stages, then (Partnerships only) relationship type, then posts the Approve/Discard card.
+    When they reply with a number/name, do nothing if the tool is already collecting the pick — the app handles it. If you must call a tool, call create_company_deal again with the same company_name only.
+  • move_deal_stage is ONLY for changing an *existing* deal's pipeline stage (e.g. "move the Acme deal to Negotiation" or "move Yogi Chugh to Engaged"). Resolve the deal first — stages come from THAT deal's pipeline (Sales vs Partnerships). Pass contact_name when the user names a person. It is NOT for creating deals or "moving a company to deals".
+- Never create duplicates. Before creating, tools check HubSpot: if a contact (email/name), company (exact name), or deal (company already has deals) already exists, tell the user about the existing record(s) with links — do not post a create card. Only create another deal when the user explicitly asks and you call create_company_deal with force=true. Existing companies are reused (not recreated) when adding contacts.
+- When the user asks to create deals for multiple companies in one message, call create_company_deal once per company and report each result. Ask for deal stage (and relationship type on Partnership) once, then reuse those choices for every company. If a tool returns "Error: …", quote that error to the user — do not invent causes like permissions.
+- The conversation may span several Slack messages in a thread. Follow-ups in the same thread (without another @mention) continue this conversation. Use the prior turns as context: if you asked a clarifying question and the user answers ("yes", "the first one", "new deal", "let's create a new one", "1", "1 3", etc.), immediately call the correct tool with the company from earlier context — do not ask for contact details. Never reply with a generic greeting mid-conversation.
 - When you post a card (e.g. company status), keep your text reply short since the card carries the detail.
 - To move a deal "forward" or to the "next" stage, first call get_pipeline_stages and get the current stage (via get_company_status or search_records), then pass the exact next stage label.
 - To draft a context-aware follow-up to an unanswered email, use list_unanswered_emails, then get_email_thread, then draft_custom_email with a body referencing that thread.
-- Stay within GTM scope. Be concise.`;
+- Stay within GTM scope.`;
 
 const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 
 *Ask / look up*
 • Pipeline stages — _"what are the sales pipeline stages?"_
 • Lead statuses — _"what lead statuses do we have?"_
+• Company lifecycle stages — _"what lifecycle stages do companies have?"_
+• List companies by stage — _"show me all customers"_ or _"which companies are in the Customer stage?"_
 • Find a record — _"look up Acme Corp"_
 • Company status — _"what's the status of Acme Corp?"_ (deals, contacts, notes, last activity)
-• Daily digest — _"post the digest"_ (pipeline snapshot, stalled deals, follow-ups due, overdue tasks)
+• Daily digest — _"post the digest"_ (scans open deals, reads email/activity, lists who needs a follow-up + Draft)
 
 *Capture leads from photos*
-• Send a badge or business-card photo (with an optional note like _"met at SaaStr, wants a demo"_) and I'll read the details and post an add-prospect card. Multiple people in one photo? I'll post one card each.
-• Send a screenshot of a WhatsApp/LinkedIn message and I'll pull out the sender as a new lead.
+• Send a badge or business-card photo (with an optional note like _"met at SaaStr, wants a demo"_) and I'll read the details and post an add-contact card. Say _"as a prospect"_ to also create a deal. Multiple people in one photo? I'll post one card each.
+• Send a screenshot of a WhatsApp/LinkedIn message and I'll pull out the sender as a new contact.
 
 *Update HubSpot*
+• Add a contact — _"add Jane Doe at Acme to HubSpot"_ (contact + optional company; no deal)
+• Add a full prospect — _"add Jane as a prospect with a deal"_ (contact + company + Prospecting deal)
+• Create a company deal — _"create a deal for Payoneer"_ → pipeline → deal stage (Sales) or deal stage + relationship type (Partnerships) → Approve
 • Add a note — _"add a note to Acme Corp — demoed today, wants pricing"_ (also refreshes last-activity date)
 • Change lead status — _"set Navin Chugh's lead status to Connected"_
-• Add a prospect — _"add Jane Doe, VP Talent at Acme, jane@acme.com to HubSpot"_ (contact + company + Prospecting deal)
 • Move a deal stage — _"move the Acme deal to Negotiation"_
 
 *Reminders*
-• Follow-up reminder — _"remind me to follow up with Acme in 2 days"_ (creates a HubSpot task + a scheduled Slack nudge)
+• Follow-up reminder — _"remind me to follow up with Acme in 2 days"_ or _"in 5 minutes"_ (HubSpot task + Slack nudge)
+
+*Cleanup*
+• Marketing junk — daily at 8am (last 24h emails): summary + Approve/Discard per contact/company. Or type _cleanup_
 
 *Email (drafts only — I never send)*
 • Templated draft — _"draft an intro email to Jane Doe"_ or _"event follow-up to Jane Doe"_
@@ -73,6 +107,7 @@ const HELP_TEXT = `*FlairX GTM Bot — here's what I can do* :robot_face:
 • Summarize a thread into notes — _"summarize Jane's last email into her notes"_
 
 *Tips*
+• After the first @mention, keep chatting in the thread — no need to tag me again.
 • You can combine actions: _"add a note to Acme — great demo, and remind me to follow up in 2 days"_.
 • If several records match, I'll show a numbered list — just reply with the number.
 • Type _help_ anytime to see this again.`;
@@ -86,6 +121,20 @@ function isHelpRequest(text: string): boolean {
     normalized === "menu" ||
     normalized === "what can you do" ||
     normalized === "what can you do for me"
+  );
+}
+
+function isCleanupRequest(text: string): boolean {
+  const normalized = text.trim().toLowerCase().replace(/[?!.]+$/, "");
+  return (
+    normalized === "cleanup" ||
+    normalized === "clean up" ||
+    normalized === "cleanup marketing" ||
+    normalized === "clean up marketing" ||
+    normalized === "cleanup marketing emails" ||
+    normalized === "clean up marketing emails" ||
+    normalized === "delete marketing contacts" ||
+    normalized === "delete spam contacts"
   );
 }
 
@@ -103,8 +152,49 @@ function parseArgs(raw: string): Record<string, unknown> {
 
 /** Short answers/confirmations that don't need the flagship model. */
 function isTrivialReply(text: string): boolean {
-  const words = text.trim().split(/\s+/).filter(Boolean);
+  const trimmed = text.trim();
+  // Numbered picks ("1", "2", "1 3") must use the full model + tools.
+  if (/^\d+(\s+\d+)?$/.test(trimmed)) {
+    return false;
+  }
+  const words = trimmed.split(/\s+/).filter(Boolean);
   return words.length > 0 && words.length <= TRIVIAL_REPLY_MAX_WORDS;
+}
+
+function extractPickUserText(toolResult: string): string | null {
+  const start = toolResult.indexOf("<<<PICK_USER>>>");
+  const end = toolResult.indexOf("<<<END_PICK_USER>>>");
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+  return toolResult
+    .slice(start + "<<<PICK_USER>>>".length, end)
+    .replace(/^\n/, "")
+    .replace(/\n$/, "")
+    .trim();
+}
+
+/** Never show pick machinery / id maps in Slack. */
+function sanitizeSlackReply(text: string): string {
+  const extracted = extractPickUserText(text);
+  if (extracted) {
+    return extracted;
+  }
+  return text
+    .replace(/^\[pick posted\]\s*/gm, "")
+    .replace(/<<<PICK_USER>>>\s*/g, "")
+    .replace(/\s*<<<END_PICK_USER>>>/g, "")
+    .replace(/^\[pick\][^\n]*\n?/gm, "")
+    .replace(/^ids \(model only\):[^\n]*\n?/gm, "")
+    .replace(/\n?\(ids:[^)]*\)/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function isPickToolResult(result: string): boolean {
+  return (
+    result.startsWith("[pick posted]") || result.includes("<<<PICK_USER>>>")
+  );
 }
 
 /**
@@ -126,8 +216,32 @@ async function runAgentTurn(
   const { channel, threadTs, userMessage, userId } = params;
   const conversationKey = `${channel}:${threadTs}`;
 
+  // Seed early so plain thread replies are accepted while this turn runs.
+  if (!conversations.has(conversationKey)) {
+    conversations.set(conversationKey, []);
+  }
+
   const post = (text: string) =>
     client.chat.postMessage({ channel, thread_ts: threadTs, text });
+
+  let workingTs: string | undefined;
+
+  const finish = async (text: string) => {
+    const slackText = sanitizeSlackReply(text);
+    if (workingTs) {
+      try {
+        await client.chat.update({
+          channel,
+          ts: workingTs,
+          text: slackText,
+        });
+        return;
+      } catch (error) {
+        console.error("[agent] failed to update working reply:", error);
+      }
+    }
+    await post(slackText);
+  };
 
   try {
     if (!userMessage) {
@@ -148,6 +262,93 @@ async function runAgentTurn(
       return;
     }
 
+    // Fast-path: "cleanup" scans marketing junk and posts an approval card.
+    if (isCleanupRequest(userMessage)) {
+      const working = await client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: "⏳ Scanning HubSpot for marketing junk…",
+      });
+      try {
+        const result = await runCleanupMarketing({
+          client,
+          channel,
+          threadTs,
+          userId,
+        });
+        const text =
+          result.startsWith("[card ready]")
+            ? "Review the card above — Approve or Discard."
+            : result;
+        await client.chat.update({ channel, ts: working.ts!, text });
+      } catch (error) {
+        console.error("[cleanup] failed:", error);
+        const message =
+          error instanceof Error ? error.message : "Cleanup scan failed.";
+        await client.chat.update({
+          channel,
+          ts: working.ts!,
+          text: message.length > 280 ? `${message.slice(0, 277)}…` : message,
+        });
+      }
+      return;
+    }
+
+    // Fast-path: continue an in-progress deal create without the model.
+    const dealSession = getDealCreateSession(channel, threadTs);
+    if (dealSession) {
+      const lowered = userMessage.trim().toLowerCase();
+      const looksLikePick =
+        isDealCreatePick(userMessage) ||
+        isDealCreateCancel(userMessage) ||
+        /^\d+$/.test(userMessage.trim()) ||
+        dealSession.stages.some((s) => s.label.toLowerCase() === lowered) ||
+        dealSession.pipelines.some((p) => p.label.toLowerCase() === lowered) ||
+        dealSession.relationshipOptions?.some(
+          (o) => o.label.toLowerCase() === lowered,
+        ) ||
+        Boolean(
+          dealSession.companyOptions?.some(
+            (c) => c.name.toLowerCase() === lowered,
+          ),
+        );
+      if (looksLikePick) {
+        const working = await client.chat.postMessage({
+          channel,
+          thread_ts: threadTs,
+          text: "⏳ Working on it…",
+        });
+        try {
+          const result = await continueDealCreate(
+            { client, channel, threadTs, userId },
+            dealSession,
+            userMessage,
+          );
+          const text = result.startsWith("[card ready]")
+            ? "Review the card above — Approve or Discard."
+            : extractPickUserText(result) ?? sanitizeSlackReply(result);
+          await client.chat.update({ channel, ts: working.ts!, text });
+        } catch (error) {
+          console.error("[deal-create] continue failed:", error);
+          const message =
+            error instanceof Error ? error.message : "Deal create failed.";
+          await client.chat.update({
+            channel,
+            ts: working.ts!,
+            text: message.length > 280 ? `${message.slice(0, 277)}…` : message,
+          });
+        }
+        return;
+      }
+    }
+
+    const working = await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: "⏳ Working on it…",
+    });
+    workingTs = working.ts;
+
     const history = conversations.get(conversationKey) ?? [];
     history.push({ role: "user", content: userMessage });
 
@@ -166,24 +367,32 @@ async function runAgentTurn(
     // full thread history still gives it the context it needs to act.
     const model = isTrivialReply(userMessage) ? CHEAP_MODEL : MODEL;
     let reply = "";
+    let historyReply = "";
+    const openaiTimeoutMs = Number(process.env.OPENAI_TIMEOUT_MS ?? 90_000) || 90_000;
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-      const completion = await openai!.chat.completions.create({
-        model,
-        messages,
-        tools: toolDefinitions,
-        tool_choice: "auto",
-      });
+      const completion = await openai!.chat.completions.create(
+        {
+          model,
+          messages,
+          tools: toolDefinitions,
+          tool_choice: "auto",
+        },
+        { signal: AbortSignal.timeout(openaiTimeoutMs) },
+      );
 
       const choice = completion.choices[0]?.message;
       if (!choice) {
-        reply = "Sorry, I had trouble thinking of a response.";
+        reply = "Something went wrong — try again.";
         break;
       }
 
       messages.push(choice);
 
       if (choice.tool_calls && choice.tool_calls.length > 0) {
+        let pickResult = "";
+        let cardReady = false;
+        let hardError = "";
         for (const call of choice.tool_calls) {
           if (call.type !== "function") {
             continue;
@@ -201,51 +410,96 @@ async function runAgentTurn(
                 ? `Error: ${error.message}`
                 : "Error running that action.";
           }
+          if (isPickToolResult(result)) {
+            pickResult = result;
+          }
+          if (result.startsWith("[card ready]")) {
+            cardReady = true;
+          }
+          if (result.startsWith("Error:")) {
+            hardError = result.replace(/^Error:\s*/, "");
+          }
           messages.push({
             role: "tool",
             tool_call_id: call.id,
             content: result,
           });
         }
+        // Don't let the model invent/restate after picks, cards, or hard errors.
+        if (hardError) {
+          reply =
+            hardError.length > 280 ? `${hardError.slice(0, 277)}…` : hardError;
+          break;
+        }
+        if (pickResult) {
+          // Slack gets the clean list once; history keeps ids so the next "2" works.
+          reply = extractPickUserText(pickResult) ?? "Reply with a number.";
+          historyReply = pickResult;
+          break;
+        }
+        if (cardReady) {
+          reply = "Review the card above — Approve or Discard.";
+          break;
+        }
         continue;
       }
 
       reply =
         typeof choice.content === "string" && choice.content.trim()
-          ? choice.content
+          ? sanitizeSlackReply(choice.content)
           : "Done.";
       break;
     }
 
     if (!reply) {
-      reply =
-        "I wasn't able to finish that in a reasonable number of steps. Could you narrow the request?";
+      reply = "Too many steps — narrow the request.";
     }
 
     // Persist only plain user/assistant turns so trimming can't orphan a
     // tool message (which would break the next OpenAI request).
-    history.push({ role: "assistant", content: reply });
+    // For picks, store the full pick payload (with ids) so the next number works.
+    history.push({
+      role: "assistant",
+      content: historyReply || reply,
+    });
     if (history.length > MAX_HISTORY_MESSAGES) {
       history.splice(0, history.length - MAX_HISTORY_MESSAGES);
     }
     conversations.set(conversationKey, history);
 
-    await post(reply);
+    await finish(reply);
   } catch (error) {
     console.error("[agent] turn failed:", error);
+    const timedOut =
+      error instanceof Error &&
+      (error.name === "TimeoutError" || /aborted|timeout/i.test(error.message));
     try {
-      await post("Sorry, I hit an error handling that. Please try again.");
+      await finish(
+        timedOut
+          ? "Timed out — try again (or use a shorter request)."
+          : "Error — try again.",
+      );
     } catch (postError) {
       console.error("[agent] failed to post error reply:", postError);
     }
   }
 }
 
+function wantsProspectDeal(context: string): boolean {
+  const lower = context.toLowerCase();
+  return (
+    /\bas a prospect\b/.test(lower) ||
+    /\bwith a deal\b/.test(lower) ||
+    /\badd (?:them|him|her|this) to (?:the )?pipeline\b/.test(lower) ||
+    /\bcreate (?:a )?deal\b/.test(lower)
+  );
+}
+
 /**
  * Handles a mention/message that includes image attachments: downloads each
  * image, runs vision OCR to extract lead(s) from badges/business cards or
- * WhatsApp/LinkedIn screenshots, and posts an add-prospect approval card per
- * person found. Approval creates the full contact + company + deal.
+ * WhatsApp/LinkedIn screenshots, and posts an add-contact approval card per
+ * person found (or add-prospect when the caption asks for a deal).
  */
 async function runImageCapture(
   client: App["client"],
@@ -259,18 +513,59 @@ async function runImageCapture(
   },
 ): Promise<void> {
   const { channel, threadTs, files, context, userId } = params;
+  const conversationKey = `${channel}:${threadTs}`;
+  if (!conversations.has(conversationKey)) {
+    conversations.set(conversationKey, []);
+  }
+
   const post = (text: string) =>
     client.chat.postMessage({ channel, thread_ts: threadTs, text });
 
   if (!openai) {
-    await post("Image scanning needs OpenAI, which isn't configured right now.");
+    await post("Image scanning needs OpenAI configured.");
     return;
   }
 
+  let workingTs: string | undefined;
   try {
+    const working = await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: "⏳ Working on it…",
+    });
+    workingTs = working.ts;
+
+    const finish = async (text: string) => {
+      if (workingTs) {
+        try {
+          await client.chat.update({ channel, ts: workingTs, text });
+          return;
+        } catch (error) {
+          console.error("[image-capture] failed to update working reply:", error);
+        }
+      }
+      await post(text);
+    };
+
+    const filtered = filterImageFiles({ files });
+    if (filtered.images.length === 0) {
+      if (filtered.skippedUnsupported > 0) {
+        await finish(
+          "Those images aren't supported (use JPEG/PNG/WebP — not HEIC). Re-export or screenshot and try again.",
+        );
+        return;
+      }
+      if (filtered.skippedTooLarge > 0) {
+        await finish("Those images are too large — try a smaller photo.");
+        return;
+      }
+      await finish("No image attachments found.");
+      return;
+    }
+
     const botToken = process.env.SLACK_BOT_TOKEN ?? "";
     const dataUrls: string[] = [];
-    for (const file of files) {
+    for (const file of filtered.images) {
       const url = await fetchSlackImageAsDataUrl(file, botToken);
       if (url) {
         dataUrls.push(url);
@@ -278,19 +573,38 @@ async function runImageCapture(
     }
 
     if (dataUrls.length === 0) {
-      await post("I couldn't download those images. Please try again.");
+      await finish("Couldn't download those images.");
       return;
     }
 
     const leads = await extractLeadsFromImages(openai, dataUrls, context);
     if (leads.length === 0) {
-      await post(
-        "I couldn't read any contact details from that. Try a clearer photo, or just type the details and I'll add them.",
+      await finish(
+        "Couldn't read contact details — try a clearer photo or type the info.",
       );
       return;
     }
 
+    const toolName = wantsProspectDeal(context) ? "add_prospect" : "add_contact";
     const ctx: ToolContext = { client, channel, threadTs, userId };
+    let cardsPosted = 0;
+    const messages: string[] = [];
+    const history = conversations.get(conversationKey) ?? [];
+    if (context) {
+      history.push({
+        role: "user",
+        content: context.startsWith("[image]")
+          ? context
+          : `[image] ${context}`,
+      });
+    } else {
+      history.push({
+        role: "user",
+        content: "[image] Extracted lead(s) from attached photo(s).",
+      });
+    }
+
+    let toolCallSeq = 0;
     for (const lead of leads) {
       const args: Record<string, unknown> = {
         first_name: lead.firstName,
@@ -304,23 +618,94 @@ async function runImageCapture(
         source: lead.source || context || undefined,
         notes: lead.notes,
       };
-      await executeTool("add_prospect", args, ctx);
+      let result: string;
+      try {
+        result = await executeTool(toolName, args, ctx);
+      } catch (error) {
+        result =
+          error instanceof Error
+            ? `Error: ${error.message}`
+            : "Error creating that contact.";
+      }
+
+      const toolCallId = `img_${toolCallSeq++}`;
+      history.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: toolCallId,
+            type: "function",
+            function: {
+              name: toolName,
+              arguments: JSON.stringify(args),
+            },
+          },
+        ],
+      } as OpenAI.Chat.Completions.ChatCompletionAssistantMessageParam);
+      history.push({
+        role: "tool",
+        tool_call_id: toolCallId,
+        content: result,
+      });
+
+      if (result.startsWith("[card ready]")) {
+        cardsPosted += 1;
+        continue;
+      }
+
+      const pickText = extractPickUserText(result);
+      if (pickText || isPickToolResult(result)) {
+        messages.push(pickText ?? sanitizeSlackReply(result));
+        continue;
+      }
+
+      messages.push(sanitizeSlackReply(result));
     }
 
-    // Mark the thread active so plain follow-ups continue the conversation.
-    const conversationKey = `${channel}:${threadTs}`;
-    if (!conversations.has(conversationKey)) {
-      conversations.set(conversationKey, []);
+    if (history.length > MAX_HISTORY_MESSAGES) {
+      history.splice(0, history.length - MAX_HISTORY_MESSAGES);
+    }
+    conversations.set(conversationKey, history);
+
+    if (cardsPosted > 0 && messages.length === 0) {
+      await finish(
+        cardsPosted === 1
+          ? "Review the card above — Approve or Discard."
+          : `Review the ${cardsPosted} cards above — Approve or Discard.`,
+      );
+      return;
     }
 
-    await post(
-      leads.length === 1
-        ? "Found 1 lead — review the card above and click Approve to add it to HubSpot."
-        : `Found ${leads.length} leads — review the cards above and Approve the ones you want in HubSpot.`,
-    );
+    if (cardsPosted > 0) {
+      messages.unshift(
+        cardsPosted === 1
+          ? "Review the card above — Approve or Discard."
+          : `Review the ${cardsPosted} cards above — Approve or Discard.`,
+      );
+    }
+
+    if (messages.length === 0) {
+      await finish("Couldn't create contacts from those images.");
+      return;
+    }
+
+    await finish(messages.join("\n\n"));
   } catch (error) {
     console.error("[image-capture] failed:", error);
-    await post("Sorry, I hit an error reading those images. Please try again.");
+    try {
+      if (workingTs) {
+        await client.chat.update({
+          channel,
+          ts: workingTs,
+          text: "Error reading images — try again.",
+        });
+      } else {
+        await post("Error reading images — try again.");
+      }
+    } catch {
+      await post("Error reading images — try again.");
+    }
   }
 }
 
@@ -341,6 +726,13 @@ export function registerMentionHandler(
     const threadTs = event.thread_ts ?? event.ts;
     const userMessage = stripBotMention(event.text);
     const userId = event.user ?? "";
+
+    // Mark the thread active immediately so follow-ups without @mention work
+    // even while this turn is still running.
+    const conversationKey = `${channel}:${threadTs}`;
+    if (!conversations.has(conversationKey)) {
+      conversations.set(conversationKey, []);
+    }
 
     // Photos of badges/business cards or WhatsApp/LinkedIn screenshots →
     // vision OCR + add-prospect cards.
@@ -396,7 +788,10 @@ export function registerMentionHandler(
     }
     // Only respond in threads the bot is actively part of.
     const conversationKey = `${msg.channel}:${msg.thread_ts}`;
-    if (!conversations.has(conversationKey)) {
+    const hasDealSession = Boolean(
+      getDealCreateSession(msg.channel, msg.thread_ts),
+    );
+    if (!conversations.has(conversationKey) && !hasDealSession) {
       return;
     }
 

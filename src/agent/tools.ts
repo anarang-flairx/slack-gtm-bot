@@ -2,15 +2,18 @@ import type { App } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
 import type OpenAI from "openai";
 import {
-  createProspect,
   findCompaniesByName,
+  findContactByEmail,
   findContactsByName,
   getAssociatedCompany,
+  getCompanyLifecycleStageOptions,
   getCompanyStatus,
   getLeadStatusMap,
   getObjectProperties,
   getPipelineMeta,
   findNoteRecords,
+  listCompaniesByLifecycleStage,
+  listDealPipelines,
   resolveDealsForStageMove,
   type NoteRecordMatch,
 } from "../integrations/hubspot.js";
@@ -19,8 +22,11 @@ import {
   listThreadsAwaitingReply,
 } from "../integrations/gmail.js";
 import { buildDailyDigest } from "../digest/buildDailyDigest.js";
+import { hubspotRecordUrl } from "../digest/format.js";
 import { createDraftByContactId } from "../lib/createDraft.js";
 import { saveDraft } from "../lib/draftStore.js";
+import { startDealCreate } from "../lib/dealCreateFlow.js";
+import { postRecentMarketingCleanup } from "../lib/runMarketingCleanup.js";
 import { savePendingLeadStatus } from "../lib/leadStatusStore.js";
 import { savePendingNoteUpdate } from "../lib/noteUpdateStore.js";
 import { savePendingProspect } from "../lib/prospectStore.js";
@@ -57,6 +63,57 @@ async function postCard(
     text,
     blocks,
   });
+}
+
+/** After posting an approval card — model should echo this to the user. */
+const CARD_READY =
+  "[card ready] User reply only: Review the card above — Approve or Discard.";
+
+/** Marker for a pick that should be shown as-is (not model-restated). */
+const PICK_POSTED = "[pick posted]";
+const PICK_USER_START = "<<<PICK_USER>>>";
+const PICK_USER_END = "<<<END_PICK_USER>>>";
+
+/** Resolve "1" / "2" style picks to a 0-based index item. */
+function resolveByNumber<T>(raw: string, items: T[]): T | undefined {
+  const n = Number(String(raw).trim());
+  if (!Number.isInteger(n) || n < 1 || n > items.length) {
+    return undefined;
+  }
+  return items[n - 1];
+}
+
+/**
+ * Numbered pick — model shows title + list to the user.
+ * `hint` and optional `idMap` are for the model only (never show ids to the user).
+ * Each option must stay on its own line when echoed.
+ */
+function pickPrompt(
+  title: string,
+  lines: string,
+  hint: string,
+  idMap?: string,
+): string {
+  const userText = `${title}\n${lines}\n\nReply with a number.`;
+  const mapLine = idMap ? `\nids (model only): ${idMap}` : "";
+  return (
+    `${PICK_POSTED}\n${PICK_USER_START}\n${userText}\n${PICK_USER_END}\n` +
+    `[pick] ${hint}${mapLine}`
+  );
+}
+
+/**
+ * Format a numbered pick for Slack. Does not post itself — the agent loop
+ * posts the user block once so history can keep the id map for the next turn.
+ */
+async function postPick(
+  _ctx: ToolContext,
+  title: string,
+  lines: string,
+  hint: string,
+  idMap?: string,
+): Promise<string> {
+  return pickPrompt(title, lines, hint, idMap);
 }
 
 export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
@@ -105,6 +162,33 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "get_company_lifecycle_stages",
+      description:
+        "List the HubSpot company lifecycle stage options (e.g. Lead, Opportunity, Customer). Use before listing companies by stage if the user’s wording is unclear.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_companies_by_lifecycle_stage",
+      description:
+        "List HubSpot companies in a given lifecycle stage (e.g. Customer, Lead, Opportunity). Use for 'show me all customers' or 'which companies are in the Customer stage'.",
+      parameters: {
+        type: "object",
+        properties: {
+          stage: {
+            type: "string",
+            description: "Lifecycle stage label, e.g. 'Customer'",
+          },
+        },
+        required: ["stage"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "search_records",
       description:
         "Search HubSpot for contacts, deals, and companies matching a name. Use to look up records or disambiguate before another action.",
@@ -122,7 +206,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "get_company_status",
       description:
-        "Post a status card for a company: its deals, contacts, notes (including native HubSpot notes), and last activity. Use for 'what's the status of X'.",
+        "Post a status card for a company: its deals, contacts, notes (including native HubSpot notes), and last activity. Use ONLY for 'what's the status of X' / status lookups. Do NOT use this for 'move X to deals' or creating a deal — use create_company_deal instead.",
       parameters: {
         type: "object",
         properties: {
@@ -137,7 +221,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "post_digest",
       description:
-        "Build and post the GTM daily digest (pipeline snapshot, stalled deals, follow-ups due, overdue tasks) to the configured digest channel.",
+        "Build and post the GTM daily digest: scan open HubSpot deals, read each deal's email chain and notes, decide which need a follow-up, and post those with a short why plus a Draft follow-up button.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -163,9 +247,36 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "add_contact",
+      description:
+        "Prepare a new HubSpot contact (+ optional company). No deal is created. Checks for an existing contact by email/name first and refuses duplicates. Reuses an exact-match company if one exists. Posts an approval card; records are only created after approval. Use for 'add <person> to HubSpot/contacts', badge scans, and screenshot leads unless the user explicitly asks for a deal or prospect.",
+      parameters: {
+        type: "object",
+        properties: {
+          first_name: { type: "string" },
+          last_name: { type: "string" },
+          company_name: { type: "string" },
+          email: { type: "string" },
+          phone: { type: "string" },
+          mobile: { type: "string" },
+          title: { type: "string" },
+          source: {
+            type: "string",
+            description: "Where you met them (stored in contact notes)",
+          },
+          notes: { type: "string" },
+          linkedin: { type: "string" },
+        },
+        required: ["first_name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "add_prospect",
       description:
-        "Prepare a new HubSpot contact (+ optional company) and a deal in the Prospecting stage. Posts an approval card; records are only created after approval. Use for 'add <person> to HubSpot'.",
+        "Prepare a new HubSpot contact (+ optional company) AND a deal in the Prospecting stage. Checks for existing contacts/companies/deals first and refuses duplicates. Use only when the user explicitly wants a deal/prospect in the pipeline for a *new person* — not for a simple 'add to contacts', and not for creating a deal on an existing company (use create_company_deal for that).",
       parameters: {
         type: "object",
         properties: {
@@ -187,14 +298,47 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "create_company_deal",
+      description:
+        "Create a NEW HubSpot deal on an *existing* company. Call with company_name only — do NOT pass pipeline, stage, or relationship_type, and do NOT call get_pipeline_stages. The bot asks pipeline, then that pipeline's stages, then (Partnerships only) relationship type, then posts an Approve/Discard card. Deal name is always '[Company] - FlairX'. Associates company + all contacts. Refuse duplicates unless force=true. Do NOT use move_deal_stage or add_prospect for these requests.",
+      parameters: {
+        type: "object",
+        properties: {
+          company_name: {
+            type: "string",
+            description: "Existing HubSpot company name",
+          },
+          company_id: {
+            type: "string",
+            description:
+              "HubSpot company id to disambiguate when the name matched multiple companies. Optional.",
+          },
+          force: {
+            type: "boolean",
+            description:
+              "Set true only when the user explicitly asks to create another deal even though the company already has one(s).",
+          },
+        },
+        required: ["company_name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "move_deal_stage",
       description:
-        "Prepare a move of a deal to a different pipeline stage. Identify the deal by company name and/or deal name. Posts an approval card; the stage only changes after approval.",
+        "Change the pipeline STAGE of an *existing* deal (e.g. Prospecting → Negotiation, or Engaged on Partnerships). NOT for creating deals. NOT for 'move company to deals' / 'add company to pipeline' — those require create_company_deal. Identify the deal by company name, deal name, and/or contact name. Stages are validated against THAT deal's pipeline (Sales vs Partnerships), not a fixed list. Posts an approval card.",
       parameters: {
         type: "object",
         properties: {
           company_name: { type: "string" },
           deal_name: { type: "string" },
+          contact_name: {
+            type: "string",
+            description:
+              "Contact associated with the deal (e.g. 'Yogi Chugh'). Use when the user names a person rather than a company.",
+          },
           target_stage: {
             type: "string",
             description: "Exact pipeline stage label to move the deal to",
@@ -249,7 +393,7 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "schedule_follow_up",
       description:
-        "Set a follow-up reminder for a contact, company, or deal in N days. Posts an approval card; on approve it creates a HubSpot task due then AND schedules a Slack nudge. Use for 'remind me to follow up with X in N days'.",
+        "Set a follow-up reminder for a contact, company, or deal. Supports minutes, hours, or days (e.g. 'in 2 minutes', 'in 3 hours', 'in 2 days'). Posts an approval card; on approve it creates a HubSpot task due then AND schedules a Slack nudge. Prefer minutes for short delays.",
       parameters: {
         type: "object",
         properties: {
@@ -257,17 +401,34 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
             type: "string",
             description: "Contact, company, or deal name",
           },
+          minutes: {
+            type: "number",
+            description: "Minutes from now (use for short delays like 2 minutes)",
+          },
+          hours: {
+            type: "number",
+            description: "Hours from now",
+          },
           days: {
             type: "number",
-            description: "Days from now until the reminder (e.g. 2)",
+            description: "Days from now (e.g. 2)",
           },
           note: {
             type: "string",
             description: "Optional context for the reminder",
           },
         },
-        required: ["name", "days"],
+        required: ["name"],
       },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "cleanup_marketing_records",
+      description:
+        "Scan HubSpot contacts and companies created in the last 24 hours, classify logged emails/activity as marketing junk, and post a summary plus an Approve/Discard card per record. Never archives without approval. A daily 8am job also posts this automatically.",
+      parameters: { type: "object", properties: {} },
     },
   },
   {
@@ -334,8 +495,11 @@ async function runUpdateNotes(
 ): Promise<string> {
   const result = await findNoteRecords(name);
   if (Array.isArray(result)) {
-    const options = result.map(formatMatch).join("\n");
-    return `Multiple records matched "${name}". Ask the user which one:\n${options}`;
+    return pickPrompt(
+      "Pick a record:",
+      result.map(formatMatch).join("\n"),
+      `update_notes name=<chosen>`,
+    );
   }
 
   const pending = savePendingNoteUpdate({
@@ -355,7 +519,7 @@ async function runUpdateNotes(
     buildNoteUpdatePreviewBlocks(result, note, pending.id),
   );
 
-  return `Posted an approval card to append a note to ${result.type} "${result.name}". Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 async function runUpdateLeadStatus(
@@ -394,13 +558,16 @@ async function runUpdateLeadStatus(
       return `No contact found named "${name}".`;
     }
     if (matches.length > 1) {
-      const options = matches
-        .map(
-          (m, i) =>
-            `${i + 1}. ${m.name}${m.email ? ` — ${m.email}` : " — (no email)"}${m.company ? ` @ ${m.company}` : ""} (contact_id: ${m.id})`,
-        )
-        .join("\n");
-      return `Multiple contacts match "${name}". Show the user this NUMBERED list (do not show the contact_id) and ask them to reply with just the number. When they pick one, call update_lead_status again with that contact_id and status "${statusLabel}". Do not ask for any other confirmation.\n${options}`;
+      return pickPrompt(
+        "Pick a contact:",
+        matches
+          .map(
+            (m, i) =>
+              `${i + 1}. ${m.name}${m.email ? ` — ${m.email}` : ""}${m.company ? ` @ ${m.company}` : ""}`,
+          )
+          .join("\n"),
+        `update_lead_status contact_id=<id> status="${statusLabel}"`,
+      );
     }
     contact = matches[0];
   }
@@ -427,12 +594,13 @@ async function runUpdateLeadStatus(
     ),
   );
 
-  return `Posted an approval card to set ${contact.name}'s lead status to "${statusLabel}". Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
-async function runAddProspect(
+async function runAddPerson(
   ctx: ToolContext,
   args: Record<string, unknown>,
+  createDeal: boolean,
 ): Promise<string> {
   const firstName = String(args.first_name ?? "").trim();
   if (!firstName) {
@@ -460,24 +628,124 @@ async function runAddProspect(
   }
 
   const displayName = `${firstName} ${lastName}`.trim();
+
+  // Dedupe contact by email (strongest) then by name.
+  if (fields.email) {
+    const existingByEmail = await findContactByEmail(fields.email);
+    if (existingByEmail) {
+      const url = hubspotRecordUrl("contact", existingByEmail.id);
+      return `Contact exists: <${url}|${existingByEmail.name}> (${fields.email}). Deal? → create_company_deal.`;
+    }
+  }
+
+  const nameMatches = await findContactsByName(displayName);
+  const sameName = nameMatches.filter(
+    (m) => m.name.toLowerCase() === displayName.toLowerCase(),
+  );
+  if (sameName.length > 0) {
+    const lines = sameName
+      .map((m) => {
+        const url = hubspotRecordUrl("contact", m.id);
+        const bits = [m.email, m.company].filter(Boolean).join(" · ");
+        return `• <${url}|${m.name}>${bits ? ` — ${bits}` : ""}`;
+      })
+      .join("\n");
+    return `Contact exists:\n${lines}\n→ User: link + ask update notes or skip.`;
+  }
+
+  let companyReuseNote: string | undefined;
+  if (companyName) {
+    const companies = await findCompaniesByName(companyName);
+    const exact = companies.find(
+      (c) => c.name.toLowerCase() === companyName.toLowerCase(),
+    );
+    if (exact) {
+      const url = hubspotRecordUrl("company", exact.id);
+      companyReuseNote = `Company already exists — will reuse <${url}|${exact.name}> (not create a new company).`;
+
+      if (createDeal) {
+        const status = await getCompanyStatus(exact.id);
+        if (status.deals.length > 0) {
+          const dealLines = status.deals
+            .map((d) => {
+              const dealUrl = hubspotRecordUrl("deal", d.id);
+              return `• <${dealUrl}|${d.name}> — ${d.stage}`;
+            })
+            .join("\n");
+          return `${exact.name} has deal(s):\n${dealLines}\n→ add_contact for person only, or create_company_deal force=true.`;
+        }
+      }
+    } else if (companies.length > 0) {
+      return pickPrompt(
+        "Pick a company:",
+        companies
+          .map(
+            (c, i) =>
+              `${i + 1}. ${c.name}${c.domain ? ` — ${c.domain}` : ""}`,
+          )
+          .join("\n"),
+        `reuse chosen company or create "${companyName}"`,
+      );
+    }
+  }
+
   const pending = savePendingProspect({
     firstName,
     lastName,
     ...(companyName ? { companyName } : {}),
     displayName,
     fields,
+    createDeal,
     createdBy: ctx.userId,
     channelId: ctx.channel,
     threadTs: ctx.threadTs,
   });
 
+  const cardLabel = createDeal ? "Prospect" : "Contact";
   await postCard(
     ctx,
-    `Prospect ready for ${displayName}`,
-    buildProspectPreviewBlocks(displayName, companyName, fields, pending.id),
+    `${cardLabel} ready for ${displayName}`,
+    buildProspectPreviewBlocks(
+      displayName,
+      companyName,
+      fields,
+      pending.id,
+      createDeal,
+      companyReuseNote,
+    ),
   );
 
-  return `Posted an approval card to add ${displayName}${companyName ? ` at ${companyName}` : ""} as a prospect. Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
+}
+
+async function runAddProspect(
+  ctx: ToolContext,
+  args: Record<string, unknown>,
+): Promise<string> {
+  return runAddPerson(ctx, args, true);
+}
+
+async function runAddContact(
+  ctx: ToolContext,
+  args: Record<string, unknown>,
+): Promise<string> {
+  return runAddPerson(ctx, args, false);
+}
+
+async function runCreateCompanyDeal(
+  ctx: ToolContext,
+  args: Record<string, unknown>,
+): Promise<string> {
+  const companyName = String(args.company_name ?? "").trim();
+  if (!companyName) {
+    return "Missing company_name.";
+  }
+
+  return startDealCreate(ctx, {
+    companyName,
+    ...(args.company_id ? { companyId: String(args.company_id).trim() } : {}),
+    force: args.force === true,
+  });
 }
 
 async function runMoveDealStage(
@@ -489,46 +757,61 @@ async function runMoveDealStage(
     return "Missing target_stage.";
   }
 
-  const pipeline = await getPipelineMeta();
-  const stage = pipeline.stageByLabel.get(targetStage.toLowerCase());
-  if (!stage) {
-    const valid = pipeline.stages.map((s) => s.label).join(", ");
-    return `"${targetStage}" is not a valid stage. Valid stages: ${valid}.`;
-  }
-
   const companyName = args.company_name
     ? String(args.company_name).trim()
     : undefined;
   const dealName = args.deal_name ? String(args.deal_name).trim() : undefined;
+  const contactName = args.contact_name
+    ? String(args.contact_name).trim()
+    : undefined;
 
-  if (!companyName && !dealName) {
-    return "Provide a company_name and/or deal_name to identify the deal.";
+  if (!companyName && !dealName && !contactName) {
+    return "Provide a company_name, deal_name, and/or contact_name to identify the deal.";
   }
 
   const { ambiguousCompanies, deals } = await resolveDealsForStageMove({
     ...(companyName ? { companyName } : {}),
     ...(dealName ? { dealName } : {}),
+    ...(contactName ? { contactName } : {}),
   });
 
   if (ambiguousCompanies && ambiguousCompanies.length > 0) {
-    const options = ambiguousCompanies
-      .map((c, i) => `${i + 1}. ${c.name}${c.domain ? ` (${c.domain})` : ""}`)
-      .join("\n");
-    return `Multiple companies matched. Ask the user which one:\n${options}`;
+    return pickPrompt(
+      "Pick a company:",
+      ambiguousCompanies
+        .map((c, i) => `${i + 1}. ${c.name}${c.domain ? ` (${c.domain})` : ""}`)
+        .join("\n"),
+      `move_deal_stage company_name=<chosen>`,
+    );
   }
 
   if (deals.length === 0) {
-    return `No deal found for ${companyName ?? dealName}.`;
+    return `No deal for ${contactName ?? companyName ?? dealName}. New deal? → create_company_deal.`;
   }
 
   if (deals.length > 1) {
-    const options = deals
-      .map((d, i) => `${i + 1}. ${d.name} — ${d.currentStageLabel}`)
-      .join("\n");
-    return `Multiple deals matched. Ask the user which one (pass deal_name):\n${options}`;
+    return pickPrompt(
+      "Pick a deal:",
+      deals
+        .map(
+          (d, i) =>
+            `${i + 1}. ${d.name} — ${d.pipelineLabel} / ${d.currentStageLabel}`,
+        )
+        .join("\n"),
+      `move_deal_stage deal_name=<chosen>`,
+    );
   }
 
   const deal = deals[0];
+  const pipeline = await getPipelineMeta(
+    deal.pipelineId || process.env.HUBSPOT_PIPELINE_ID,
+  );
+  const stage = pipeline.stageByLabel.get(targetStage.toLowerCase());
+  if (!stage) {
+    const valid = pipeline.stages.map((s) => s.label).join(", ");
+    return `"${targetStage}" is not a valid stage in the *${pipeline.label}* pipeline (deal: ${deal.name}). Choose from: ${valid}.`;
+  }
+
   if (deal.currentStageId === stage.id) {
     return `Deal "${deal.name}" is already in ${stage.label}.`;
   }
@@ -553,10 +836,11 @@ async function runMoveDealStage(
       deal.currentStageLabel,
       stage.label,
       pending.id,
+      deal.pipelineLabel || pipeline.label,
     ),
   );
 
-  return `Posted an approval card to move "${deal.name}" from ${deal.currentStageLabel} to ${stage.label}. Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 async function runDraftEmail(
@@ -569,13 +853,16 @@ async function runDraftEmail(
     return `No HubSpot contact matching "${contactName}".`;
   }
   if (contacts.length > 1) {
-    const options = contacts
-      .map(
-        (c, i) =>
-          `${i + 1}. ${c.name}${c.company ? ` (${c.company})` : ""}${c.email ? ` — ${c.email}` : ""}`,
-      )
-      .join("\n");
-    return `Multiple contacts matched "${contactName}". Ask the user which one:\n${options}`;
+    return pickPrompt(
+      "Pick a contact:",
+      contacts
+        .map(
+          (c, i) =>
+            `${i + 1}. ${c.name}${c.company ? ` (${c.company})` : ""}${c.email ? ` — ${c.email}` : ""}`,
+        )
+        .join("\n"),
+      `draft_email contact_name=<chosen>`,
+    );
   }
 
   const preview = await createDraftByContactId(
@@ -599,7 +886,7 @@ async function runDraftEmail(
     ),
   );
 
-  return `Posted an approval card for a ${template} email to ${preview.context.fullName} (${preview.draft.to}). Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 async function runDraftCustomEmail(
@@ -644,35 +931,94 @@ async function runDraftCustomEmail(
     ),
   );
 
-  return `Posted an approval card for a custom email to ${to}. Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
+}
+
+function resolveReminderDelay(args: Record<string, unknown>): {
+  dueMs: number;
+  delayLabel: string;
+  days: number;
+} {
+  const minutes = Number(args.minutes);
+  const hours = Number(args.hours);
+  const days = Number(args.days);
+
+  if (Number.isFinite(minutes) && minutes > 0) {
+    const m = Math.max(1, Math.round(minutes));
+    return {
+      dueMs: Date.now() + m * 60_000,
+      delayLabel: m === 1 ? "1 minute" : `${m} minutes`,
+      days: m / (24 * 60),
+    };
+  }
+  if (Number.isFinite(hours) && hours > 0) {
+    const h = Math.max(1, Math.round(hours));
+    return {
+      dueMs: Date.now() + h * 3_600_000,
+      delayLabel: h === 1 ? "1 hour" : `${h} hours`,
+      days: h / 24,
+    };
+  }
+  if (Number.isFinite(days) && days > 0) {
+    // Support fractional days from the model, but never round short delays to 0.
+    const ms = Math.max(60_000, Math.round(days * 86_400_000));
+    const whole = Math.round(days);
+    const delayLabel =
+      whole >= 1 && Math.abs(days - whole) < 0.05
+        ? whole === 1
+          ? "1 day"
+          : `${whole} days`
+        : `${days} day(s)`;
+    return {
+      dueMs: Date.now() + ms,
+      delayLabel,
+      days,
+    };
+  }
+
+  // Default: 1 day if the model forgot a delay.
+  return {
+    dueMs: Date.now() + 86_400_000,
+    delayLabel: "1 day",
+    days: 1,
+  };
 }
 
 async function runScheduleFollowUp(
   ctx: ToolContext,
-  name: string,
-  days: number,
-  note: string,
+  args: Record<string, unknown>,
 ): Promise<string> {
-  const result = await findNoteRecords(name);
-  if (Array.isArray(result)) {
-    const options = result.map(formatMatch).join("\n");
-    return `Multiple records matched "${name}". Ask the user which one:\n${options}`;
+  const name = String(args.name ?? "").trim();
+  if (!name) {
+    return "Missing name.";
   }
 
-  const safeDays = Number.isFinite(days) && days > 0 ? Math.round(days) : 1;
-  const dueMs = Date.now() + safeDays * 86_400_000;
-  const dueLabel = new Date(dueMs).toLocaleDateString("en-US", {
+  const result = await findNoteRecords(name);
+  if (Array.isArray(result)) {
+    return pickPrompt(
+      "Pick a record:",
+      result.map(formatMatch).join("\n"),
+      `schedule_follow_up name=<chosen>`,
+    );
+  }
+
+  const { dueMs, delayLabel, days } = resolveReminderDelay(args);
+  const dueLabel = new Date(dueMs).toLocaleString("en-US", {
     timeZone: "America/Los_Angeles",
     month: "short",
     day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
   });
+  const note = args.note ? String(args.note).trim() : "";
 
   const pending = savePendingReminder({
     recordType: result.type,
     recordId: result.id,
     recordName: result.name,
     note,
-    days: safeDays,
+    delayLabel,
+    days,
     dueMs,
     createdBy: ctx.userId,
     channelId: ctx.channel,
@@ -686,13 +1032,13 @@ async function runScheduleFollowUp(
       result.name,
       result.type,
       dueLabel,
-      safeDays,
+      delayLabel,
       note,
       pending.id,
     ),
   );
 
-  return `Posted an approval card to remind about ${result.type} "${result.name}" in ${safeDays} day(s) (due ${dueLabel}). Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
 }
 
 async function runSummarizeEmailToNotes(
@@ -705,10 +1051,13 @@ async function runSummarizeEmailToNotes(
     return `No HubSpot contact matching "${contactName}".`;
   }
   if (contacts.length > 1) {
-    const options = contacts
-      .map((c, i) => `${i + 1}. ${c.name}${c.company ? ` (${c.company})` : ""}`)
-      .join("\n");
-    return `Multiple contacts matched "${contactName}". Ask the user which one:\n${options}`;
+    return pickPrompt(
+      "Pick a contact:",
+      contacts
+        .map((c, i) => `${i + 1}. ${c.name}${c.company ? ` (${c.company})` : ""}`)
+        .join("\n"),
+      `summarize_email_to_notes contact_name=<chosen>`,
+    );
   }
 
   const contact = contacts[0];
@@ -736,7 +1085,6 @@ async function runSummarizeEmailToNotes(
     buildNoteUpdatePreviewBlocks(contactMatch, summary, contactPending.id),
   );
 
-  let companyLine = "";
   if (company) {
     const companyMatch: NoteRecordMatch = {
       type: "company",
@@ -759,10 +1107,22 @@ async function runSummarizeEmailToNotes(
       `Email summary ready for ${company.name}`,
       buildNoteUpdatePreviewBlocks(companyMatch, summary, companyPending.id),
     );
-    companyLine = ` and its company "${company.name}"`;
   }
 
-  return `Posted approval card(s) to attach the summary to ${contact.name}${companyLine}. Waiting for the user to Approve or Discard.`;
+  return CARD_READY;
+}
+
+/** Scan last-24h records' email activity and post per-item approval cards. */
+export async function runCleanupMarketing(ctx: ToolContext): Promise<string> {
+  const lookbackHours = Number(process.env.CLEANUP_LOOKBACK_HOURS ?? 24) || 24;
+  const posted = await postRecentMarketingCleanup(ctx);
+  if (posted.contacts === 0 && posted.companies === 0) {
+    if (posted.skippedExistingCompany > 0) {
+      return `No marketing junk to review in the last ${lookbackHours} hours — ${posted.skippedExistingCompany} contact(s) were on companies you already have.`;
+    }
+    return `No marketing/auto-created junk contacts or companies found in the last ${lookbackHours} hours.`;
+  }
+  return CARD_READY;
 }
 
 export async function executeTool(
@@ -772,13 +1132,27 @@ export async function executeTool(
 ): Promise<string> {
   switch (name) {
     case "get_pipeline_stages": {
-      const pipeline = await getPipelineMeta();
-      return pipeline.stages
-        .map(
-          (s, i) =>
-            `${i + 1}. ${s.label} (${Math.round(s.probability * 100)}% win)`,
-        )
-        .join("\n");
+      const pipelines = await listDealPipelines();
+      if (pipelines.length === 0) {
+        return "No deal pipelines found in HubSpot.";
+      }
+      const sections: string[] = [];
+      for (const p of pipelines) {
+        const meta = await getPipelineMeta(p.id);
+        const stages = meta.stages
+          .map(
+            (s, i) =>
+              `${i + 1}. ${s.label} (${Math.round(s.probability * 100)}% win)`,
+          )
+          .join("\n");
+        sections.push(
+          `*${meta.label}* (pipeline_id: ${meta.id})\n${stages}`,
+        );
+      }
+      return (
+        sections.join("\n\n") +
+        "\n\n(For .env: set HUBSPOT_PIPELINE_ID to the Sales pipeline_id, HUBSPOT_PARTNERSHIP_PIPELINE_ID to the Partnerships pipeline_id.)"
+      );
     }
 
     case "get_lead_statuses": {
@@ -787,6 +1161,31 @@ export async function executeTool(
       return labels.length > 0
         ? labels.join(", ")
         : "No lead statuses configured.";
+    }
+
+    case "get_company_lifecycle_stages": {
+      const options = await getCompanyLifecycleStageOptions();
+      return options.length > 0
+        ? options.map((o) => o.label).join(", ")
+        : "No company lifecycle stages configured.";
+    }
+
+    case "list_companies_by_lifecycle_stage": {
+      const stage = String(args.stage ?? "").trim();
+      if (!stage) {
+        return "Missing lifecycle stage.";
+      }
+      const companies = await listCompaniesByLifecycleStage(stage);
+      if (companies.length === 0) {
+        return `No companies found in lifecycle stage "${stage}".`;
+      }
+      const lines = companies.map((c, i) => {
+        const domain = c.domain ? ` — ${c.domain}` : "";
+        return `${i + 1}. ${c.name}${domain}`;
+      });
+      const suffix =
+        companies.length >= 50 ? "\n(first 50 — ask to narrow)" : "";
+      return `Companies in *${stage}* (${companies.length}):\n${lines.join("\n")}${suffix}`;
     }
 
     case "search_records": {
@@ -808,12 +1207,16 @@ export async function executeTool(
         return `No HubSpot company matching "${companyName}".`;
       }
       if (matches.length > 1) {
-        const options = matches
-          .map(
-            (m, i) => `${i + 1}. ${m.name}${m.domain ? ` — ${m.domain}` : ""}`,
-          )
-          .join("\n");
-        return `Multiple companies matched "${companyName}". Ask the user which one:\n${options}`;
+        return pickPrompt(
+          "Pick a company:",
+          matches
+            .map(
+              (m, i) =>
+                `${i + 1}. ${m.name}${m.domain ? ` — ${m.domain}` : ""}`,
+            )
+            .join("\n"),
+          `get_company_status company_name=<chosen>`,
+        );
       }
       const status = await getCompanyStatus(matches[0].id);
       await postCard(
@@ -821,7 +1224,11 @@ export async function executeTool(
         `Current status for ${status.name}`,
         buildCompanyStatusBlocks(status),
       );
-      return `Posted a status card for ${status.name}: ${status.deals.length} deal(s), ${status.contacts.length} contact(s), last activity ${status.lastActivity ?? "unknown"}.`;
+      const dealHint =
+        status.deals.length === 0
+          ? " [no deals — create_company_deal if user wants pipeline]"
+          : "";
+      return `[status card posted] ${status.name}: ${status.deals.length} deal(s), ${status.contacts.length} contact(s).${dealHint} User reply: one short line or silence — card has detail.`;
     }
 
     case "post_digest": {
@@ -849,19 +1256,23 @@ export async function executeTool(
         args.contact_id ? String(args.contact_id) : "",
       );
 
+    case "add_contact":
+      return runAddContact(ctx, args);
+
     case "add_prospect":
       return runAddProspect(ctx, args);
+
+    case "create_company_deal":
+      return runCreateCompanyDeal(ctx, args);
 
     case "move_deal_stage":
       return runMoveDealStage(ctx, args);
 
     case "schedule_follow_up":
-      return runScheduleFollowUp(
-        ctx,
-        String(args.name ?? ""),
-        typeof args.days === "number" ? args.days : Number(args.days ?? 0),
-        args.note ? String(args.note) : "",
-      );
+      return runScheduleFollowUp(ctx, args);
+
+    case "cleanup_marketing_records":
+      return runCleanupMarketing(ctx);
 
     case "draft_email":
       return runDraftEmail(

@@ -13,6 +13,7 @@ Flare requires this setup to exist in HubSpot before launch (PRD sections 7.1 an
    - `crm.schemas.deals.read` (pipelines)
    - `crm.objects.owners.read` (optional — may not appear on Service Keys)
    - `crm.objects.tasks.read` (for `/digest` overdue tasks)
+   - `crm.objects.notes.write` (native notes — this is what updates **Last Activity Date**)
 4. Copy the service key into `HUBSPOT_ACCESS_TOKEN` in `.env`.
 
 `HUBSPOT_ACCESS_TOKEN` holds the service key — use it as a Bearer token in API requests, same as a legacy private-app token.
@@ -69,6 +70,7 @@ Create these if they don't already exist:
 | Contract type | `contract_type` | Dropdown (set by team during sales process) |
 | Company Notes | `company_notes` | Multi-line text |
 | Last Activity Date | `notes_last_updated` | Date |
+| Relationship type | `relationship_type` | Dropdown: Referral, Partner, Investor, Advisor (Partnership pipeline only) |
 
 ### Deal properties
 
@@ -82,12 +84,61 @@ Create these if they don't already exist:
 
 `/digest` watches deal `notes_last_updated` for stalled deals and contact `last_contact_date` for follow-ups (including empty dates). `/update-notes` appends to the notes field and sets the matching date to today.
 
-## 4. Verify
+## 4. Pipeline IDs (Sales + Partnerships)
 
-Run a quick check from the repo once `.env` is filled in:
+Find each pipeline’s internal id (needed when you have more than one deal pipeline):
+
+**Option A — ask the bot:** `@FlairX GTM Bot what are the sales pipeline stages?`  
+The reply includes `(pipeline_id: …)` under each pipeline name.
+
+**Option B — HubSpot UI:** Settings → Objects → Deals → Pipelines → open **Partnerships** (or Sales).  
+The URL often looks like:
+`…/sales-products-settings/*/pipelines/deals/{PIPELINE_ID}`  
+Copy `{PIPELINE_ID}`.
+
+**Option C — API** (from the repo with `.env` loaded):
 
 ```bash
-node -e "fetch('https://api.hubapi.com/crm/v3/pipelines/deals', {headers:{Authorization:'Bearer '+process.env.HUBSPOT_ACCESS_TOKEN}}).then(r=>r.json()).then(d=>console.log(d.results.map(p=>({id:p.id,stages:p.stages.map(s=>s.label)}))))" --env-file=.env
+node -e "fetch('https://api.hubapi.com/crm/v3/pipelines/deals', {headers:{Authorization:'Bearer '+process.env.HUBSPOT_ACCESS_TOKEN}}).then(r=>r.json()).then(d=>console.log(d.results.map(p=>({id:p.id,label:p.label,stages:p.stages.map(s=>s.label)}))))" --env-file=.env
 ```
 
-You should see the 8 stage labels above. If your pipeline isn't the `default` one, set its `id` as `HUBSPOT_PIPELINE_ID`.
+Put the ids in `.env`:
+
+```bash
+HUBSPOT_PIPELINE_ID=<sales-pipeline-id>
+HUBSPOT_PARTNERSHIP_PIPELINE_ID=<partnerships-pipeline-id>
+```
+
+Partnerships stages should match HubSpot (e.g. New, Engaged, Active Relationship, …). If the bot shows different stages, the wrong pipeline id is selected — set `HUBSPOT_PARTNERSHIP_PIPELINE_ID`.
+
+## 5. Verify
+
+Run the same API one-liner above and confirm Sales and Partnerships labels + stage lists match the HubSpot UI.
+
+## 6. Marketing cleanup (daily + `cleanup`)
+
+Every day at **8:00** (`CLEANUP_TZ`, default `America/Los_Angeles`) the bot:
+
+1. **Unnamed companies (auto):** finds companies with a blank/missing name from the last 24 hours, **archives** them and their associated contacts (skips any with deals), and adds those emails/domains to the **Never Log** (`data/never-log.json`) so email auto-logging never writes notes for them. Posts a short FYI to Slack.
+2. **Marketing junk (Approve per record):** scans contacts and companies created in the last 24 hours, reads logged emails/notes, and flags marketing/cold-outreach. Posts a Slack **summary** plus an **Approve/Discard card for each** contact and company. Anyone can approve a daily card.
+
+You can also run the marketing-junk scan on demand: `@FlairX GTM Bot cleanup` (same 24h window).
+
+Requires existing scopes: `crm.objects.contacts.write` and `crm.objects.companies.write`. Invite the bot to the target Slack channel.
+
+Optional `.env`:
+
+```bash
+# Never archive contacts on these domains (comma-separated)
+INTERNAL_EMAIL_DOMAINS=flairx.ai
+
+# Daily scheduler (on by default when DIGEST_CHANNEL or CLEANUP_CHANNEL is set)
+#CLEANUP_ENABLED=false
+#CLEANUP_CHANNEL=C0123456789
+#CLEANUP_HOUR=8
+#CLEANUP_TZ=America/Los_Angeles
+#CLEANUP_LOOKBACK_HOURS=24
+#NEVER_LOG_PATH=data/never-log.json
+```
+
+Defaults to the domain of `GMAIL_SENDER_EMAIL`, or `flairx.ai` if unset.
